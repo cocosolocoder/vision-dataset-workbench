@@ -68,34 +68,44 @@ class DatasetStore:
         self._recover_if_needed()
 
     def initialize(self) -> None:
-        self.state_directory.mkdir(parents=True, exist_ok=True)
-        if not self.manifest_path.exists():
-            self._write({"schema_version": 1, "items": []})
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            self._ensure_initialized_locked()
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
-        self.initialize()
         file_path = source.resolve(strict=True)
         if not file_path.is_file():
             raise ValueError(f"Not a regular file: {source}")
         digest = self._digest(file_path)
-        manifest = self._read()
-        if any(item["sha256"] == digest for item in manifest["items"]):
-            return ImportResult(digest=digest, added=False)
-        manifest["items"].append(
-            {
-                "sha256": digest,
-                "source": str(file_path),
-                "size": file_path.stat().st_size,
-                "label": label,
-            }
-        )
-        manifest["items"].sort(key=lambda item: item["sha256"])
-        self._write(manifest)
+        with self._workspace_lock():
+            # Finish a transaction a crashed process left behind before
+            # observing or updating the manifest; otherwise the install
+            # would later overwrite the sample we are about to write.
+            self._recover_transaction_locked()
+            self._ensure_initialized_locked()
+            manifest = self._read()
+            if any(item["sha256"] == digest for item in manifest["items"]):
+                # A concurrent importer (or an earlier run) already
+                # registered this content.  Keep the recorded source and
+                # the current label untouched.
+                return ImportResult(digest=digest, added=False)
+            manifest["items"].append(
+                {
+                    "sha256": digest,
+                    "source": str(file_path),
+                    "size": file_path.stat().st_size,
+                    "label": label,
+                }
+            )
+            manifest["items"].sort(key=lambda item: item["sha256"])
+            self._write_json_atomic(self.manifest_path, manifest)
         return ImportResult(digest=digest, added=True)
 
     def summary(self) -> dict[str, Any]:
-        self.initialize()
-        items = self._read()["items"]
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            self._ensure_initialized_locked()
+            items = self._read()["items"]
         labels = Counter(item["label"] or "unlabeled" for item in items)
         return {
             "items": len(items),
@@ -112,8 +122,9 @@ class DatasetStore:
 
         ``None`` means unlabeled (the manifest may store ``null`` or ``""``).
         """
-        self._recover_if_needed()
-        manifest = self._read()
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            manifest = self._read()
         for item in manifest["items"]:
             if item["sha256"] == digest:
                 return {"sha256": digest, "label": normalize_label(item.get("label"))}
@@ -265,8 +276,9 @@ class DatasetStore:
 
     def history(self) -> list[dict[str, Any]]:
         """Return successful batch entries in submission order."""
-        self._recover_if_needed()
-        return self._read_history()["batches"]
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            return self._read_history()["batches"]
 
     @staticmethod
     def _replay_result(entry: dict[str, Any]) -> dict[str, Any]:
@@ -292,9 +304,11 @@ class DatasetStore:
     def _workspace_lock(self):
         """Exclusive workspace lock for check-and-write transactions.
 
-        ``flock`` is advisory but sufficient for local processes: concurrent
-        submitters serialize, so a batch always observes the labels left by
-        the previous one.
+        ``flock`` is advisory but sufficient for local processes: every
+        operation that reads or mutates the manifest, history or split
+        plans holds it for its whole check-and-write, so concurrent
+        importers, batch submitters, undoers and plan creators serialize
+        into some sequential order and no successful work is lost.
         """
         self.state_directory.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -306,6 +320,19 @@ class DatasetStore:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
+
+    def _ensure_initialized_locked(self) -> None:
+        """Create the state directory and an empty manifest if missing.
+
+        Caller holds the workspace lock.  The manifest is only written when
+        absent, so a concurrent first import that already wrote one is never
+        rolled back to an empty dataset.
+        """
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        if not self.manifest_path.exists():
+            self._write_json_atomic(
+                self.manifest_path, {"schema_version": 1, "items": []}
+            )
 
     def _recover_if_needed(self) -> None:
         """Finish a prepared transaction left by a crashed process."""
@@ -376,33 +403,38 @@ class DatasetStore:
             raise SplitError(f"Seed must be an integer, got {seed!r}")
         fraction_ratios = validate_ratios(ratios)
 
-        self.initialize()
-        items = self._read()["items"]
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            self._ensure_initialized_locked()
+            # One locked read gives a single complete dataset state: the
+            # sample identities and their labels cannot come from two
+            # different states of a batch commit.
+            items = self._read()["items"]
 
-        # assign() validates identities and performs the stratification.
-        assignment = assign(items, fraction_ratios, seed)
+            # assign() validates identities and performs the stratification.
+            assignment = assign(items, fraction_ratios, seed)
 
-        snapshot = [
-            {
-                "sha256": item["sha256"],
-                "label": item.get("label"),
-                "source": item.get("source"),
-            }
-            for item in sorted(items, key=lambda item: item["sha256"])
-        ]
-        plan_payload = self._build_plan(name, seed, fraction_ratios, snapshot, assignment)
+            snapshot = [
+                {
+                    "sha256": item["sha256"],
+                    "label": item.get("label"),
+                    "source": item.get("source"),
+                }
+                for item in sorted(items, key=lambda item: item["sha256"])
+            ]
+            plan_payload = self._build_plan(name, seed, fraction_ratios, snapshot, assignment)
 
-        plan_path = self._split_path(name)
-        if plan_path.exists():
-            existing = self._read_split(plan_path)
-            if self._same_inputs(existing, seed, fraction_ratios, snapshot):
-                return SplitPlanResult(name=name, created=False, plan=existing)
-            raise SplitError(
-                f"Split plan {name!r} already exists with different seed, "
-                "ratios or samples; choose another name"
-            )
+            plan_path = self._split_path(name)
+            if plan_path.exists():
+                existing = self._read_split(plan_path)
+                if self._same_inputs(existing, seed, fraction_ratios, snapshot):
+                    return SplitPlanResult(name=name, created=False, plan=existing)
+                raise SplitError(
+                    f"Split plan {name!r} already exists with different seed, "
+                    "ratios or samples; choose another name"
+                )
 
-        self._write_json_atomic(plan_path, plan_payload)
+            self._write_json_atomic(plan_path, plan_payload)
         return SplitPlanResult(name=name, created=True, plan=plan_payload)
 
     def get_split(self, name: str) -> dict[str, Any]:
@@ -629,14 +661,6 @@ class DatasetStore:
         if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
             raise ValueError("Unsupported dataset manifest")
         return data
-
-    def _write(self, data: dict[str, Any]) -> None:
-        temporary = self.manifest_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.manifest_path)
 
     @staticmethod
     def _digest(path: Path) -> str:
