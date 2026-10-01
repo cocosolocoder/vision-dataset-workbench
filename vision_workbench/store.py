@@ -60,6 +60,9 @@ class DatasetStore:
             "labels": dict(sorted(labels.items())),
         }
 
+    def items(self) -> list[dict[str, Any]]:
+        return self._read()["items"]
+
     def _read(self) -> dict[str, Any]:
         try:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
