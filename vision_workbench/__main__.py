@@ -23,6 +23,25 @@ def parser() -> argparse.ArgumentParser:
     summary = commands.add_parser("summary", help="show dataset statistics")
     summary.add_argument("workspace", type=Path)
 
+    label = commands.add_parser("label", help="show a sample's current label by digest")
+    label.add_argument("workspace", type=Path)
+    label.add_argument("digest", help="full SHA-256 digest of the sample")
+
+    batch = commands.add_parser(
+        "batch", help="submit a UTF-8 JSON file of batch label updates"
+    )
+    batch.add_argument("workspace", type=Path)
+    batch.add_argument("file", type=Path, help="batch file (*.json)")
+
+    history = commands.add_parser(
+        "history", help="show successful batch submissions in order"
+    )
+    history.add_argument("workspace", type=Path)
+
+    undo = commands.add_parser("undo", help="undo a successful batch by its number")
+    undo.add_argument("workspace", type=Path)
+    undo.add_argument("batch_number")
+
     split = commands.add_parser(
         "split", help="create and inspect train/validation/test plans"
     )
@@ -60,6 +79,34 @@ def main() -> int:
             print(f"{status}: {result.digest}")
         elif args.command == "summary":
             print(json.dumps(store.summary(), ensure_ascii=False, sort_keys=True))
+        elif args.command == "label":
+            print(
+                json.dumps(
+                    store.lookup_label(args.digest), ensure_ascii=False, sort_keys=True
+                )
+            )
+        elif args.command == "batch":
+            print(
+                json.dumps(
+                    store.submit_batch_file(args.file),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "history":
+            print(
+                json.dumps(
+                    {"batches": store.history()}, ensure_ascii=False, sort_keys=True
+                )
+            )
+        elif args.command == "undo":
+            print(
+                json.dumps(
+                    store.undo_batch(args.batch_number),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
         else:
             print("视觉数据集工作台")
             print("本地 CPU 模式：可用")

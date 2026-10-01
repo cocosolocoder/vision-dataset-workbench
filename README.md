@@ -50,3 +50,63 @@ python3 -m vision_workbench split show ./workspace baseline
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+## Batch label updates
+
+Labels of already-imported samples can be changed in batches. A batch is a
+UTF-8 JSON file:
+
+```json
+{
+  "batch": "renumber-2026-01",
+  "changes": [
+    {"sha256": "<full SHA-256 digest>", "old": "cat", "new": "kitten"},
+    {"sha256": "<full SHA-256 digest>", "old": "dog", "new": null}
+  ]
+}
+```
+
+- `batch` must be a non-empty string.
+- `old` is the expected current label; `new` is the target label. Both may
+  be a string or `null`; `null` and the empty string both mean *unlabeled*,
+  any other string is taken literally (including Chinese text and a class
+  named `unlabeled`).
+- The whole batch is verified before anything is written: an unknown
+  digest, a sample listed twice, a non-string/non-null label, a malformed
+  file, or any sample whose current label differs from its expected old
+  label rejects the entire batch with the offending record identified.
+- Records whose target equals the current label are no-ops; if every
+  record is a no-op, the batch reports `no-changes`, occupies no batch
+  number and writes no history.
+
+```bash
+python3 -m vision_workbench label ./workspace <digest>      # current label
+python3 -m vision_workbench batch ./workspace changes.json   # submit a batch
+python3 -m vision_workbench history ./workspace              # successful batches
+python3 -m vision_workbench undo ./workspace <batch-number>  # undo a batch
+```
+
+Submitting the same number with the same content again returns the
+original result without re-modifying anything (list order and the
+`null`/`""` spelling do not change the content), even if labels were
+changed in the meantime. The same number with different content is a
+conflict.
+
+`history` lists successful batches in submission order: the samples
+involved, their before/after labels, and the number of samples actually
+changed. Failed batches never enter history.
+
+`undo` restores the old labels of a batch, but only for samples the batch
+actually changed and only when none of them was modified afterwards (even
+if the label was changed back). Other samples' later changes do not block
+the undo. Undo leaves a queryable record; repeating it reports
+`already-undone`.
+
+Batch writes and undos are crash-safe: a write-ahead journal installs the
+manifest and the history together, so reopening after an interruption
+shows either the old state or the complete new state with its history.
+Concurrent submissions are serialized by a workspace lock, so no
+successful batch is lost and two batches modifying the same sample from
+the same old label cannot both win. Saved split plans are never touched
+by label changes; plans created afterwards use the current labels, and
+the same-name reuse/conflict rules still apply.

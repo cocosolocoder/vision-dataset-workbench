@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from .batches import (
+    BatchError,
+    content_key,
+    empty_history,
+    normalize_label,
+    parse_batch_file,
+    render_label,
+    validate_history,
+)
 from .splits import (
     SET_NAMES,
     SplitError,
@@ -23,6 +35,9 @@ from .splits import (
 STATE_DIRECTORY = ".vision-workbench"
 MANIFEST_NAME = "manifest.json"
 SPLITS_DIRECTORY = "splits"
+BATCHES_NAME = "batches.json"
+LOCK_NAME = ".lock"
+TRANSACTION_NAME = ".txn.json"
 SPLIT_SCHEMA_VERSION = 1
 
 
@@ -45,6 +60,12 @@ class DatasetStore:
         self.state_directory = self.root / STATE_DIRECTORY
         self.manifest_path = self.state_directory / MANIFEST_NAME
         self.splits_directory = self.state_directory / SPLITS_DIRECTORY
+        self.batches_path = self.state_directory / BATCHES_NAME
+        self.lock_path = self.state_directory / LOCK_NAME
+        self.transaction_path = self.state_directory / TRANSACTION_NAME
+        # A crash mid-commit can leave a prepared transaction; finish it
+        # before any operation observes the workspace.
+        self._recover_if_needed()
 
     def initialize(self) -> None:
         self.state_directory.mkdir(parents=True, exist_ok=True)
@@ -81,6 +102,261 @@ class DatasetStore:
             "bytes": sum(item["size"] for item in items),
             "labels": dict(sorted(labels.items())),
         }
+
+    # ------------------------------------------------------------------
+    # Batch label updates
+    # ------------------------------------------------------------------
+
+    def lookup_label(self, digest: str) -> dict[str, Any]:
+        """Return ``{"sha256": digest, "label": str | None}`` for a sample.
+
+        ``None`` means unlabeled (the manifest may store ``null`` or ``""``).
+        """
+        self._recover_if_needed()
+        manifest = self._read()
+        for item in manifest["items"]:
+            if item["sha256"] == digest:
+                return {"sha256": digest, "label": normalize_label(item.get("label"))}
+        raise BatchError(f"sample not found: {digest}")
+
+    def submit_batch_file(self, path: Path) -> dict[str, Any]:
+        """Submit a batch from a UTF-8 JSON file."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise BatchError(f"cannot read batch file: {error}") from error
+        return self.submit_batch(data)
+
+    def submit_batch(self, data: Any) -> dict[str, Any]:
+        """Validate and apply a batch label update.
+
+        The whole batch is verified against the current manifest before any
+        change is written: missing digests, duplicate records, bad label
+        types and old-label mismatches reject the batch with no changes.
+        A successful batch is recorded in history; re-submitting the same
+        number with the same content returns the original result without
+        touching anything.
+        """
+        number, records = parse_batch_file(data)
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            manifest = self._read()
+            history = self._read_history()
+            items = {item["sha256"]: item for item in manifest["items"]}
+
+            for record in records:
+                if record["sha256"] not in items:
+                    raise BatchError(f"sample not found: {record['sha256']}")
+
+            existing = next(
+                (entry for entry in history["batches"] if entry["batch"] == number),
+                None,
+            )
+            if existing is not None:
+                if content_key(existing["records"]) == content_key(records):
+                    return self._replay_result(existing)
+                raise BatchError(
+                    f"batch number {number!r} is already used with different content"
+                )
+
+            for record in records:
+                current = normalize_label(items[record["sha256"]].get("label"))
+                if current != record["old"]:
+                    raise BatchError(
+                        f"change for {record['sha256']}: expected old label "
+                        f"{render_label(record['old'])!r} but current label is "
+                        f"{render_label(current)!r}"
+                    )
+
+            applied_records: list[dict[str, Any]] = []
+            changed_count = 0
+            for record in records:
+                item = items[record["sha256"]]
+                current = normalize_label(item.get("label"))
+                changed = current != record["new"]
+                revision = self._revision(item)
+                if changed:
+                    item["label"] = record["new"]
+                    revision += 1
+                    item["rev"] = revision
+                    changed_count += 1
+                applied_records.append(
+                    {**record, "changed": changed, "rev": revision}
+                )
+
+            if changed_count == 0:
+                # No-op batches occupy no number and write no history.
+                return {
+                    "batch": number,
+                    "status": "no-changes",
+                    "changed": 0,
+                    "unchanged": len(records),
+                    "total": len(records),
+                }
+
+            entry = {
+                "batch": number,
+                "records": applied_records,
+                "changed_count": changed_count,
+                "undone": False,
+                "undone_at": None,
+            }
+            history["batches"].append(entry)
+            self._commit(manifest, history)
+            return {
+                "batch": number,
+                "status": "applied",
+                "changed": changed_count,
+                "unchanged": len(records) - changed_count,
+                "total": len(records),
+            }
+
+    def undo_batch(self, number: str) -> dict[str, Any]:
+        """Undo a successful batch by number.
+
+        Only samples the batch actually changed are checked: each must have
+        the same label revision it had right after the batch (no later
+        modification, even one that restored the same label).  Repeated
+        undos are idempotent and do not add history.
+        """
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            manifest = self._read()
+            history = self._read_history()
+            entry = next(
+                (entry for entry in history["batches"] if entry["batch"] == number),
+                None,
+            )
+            if entry is None:
+                raise BatchError(f"unknown batch number: {number!r}")
+            if entry["undone"]:
+                return {"batch": number, "status": "already-undone", "restored": 0}
+
+            items = {item["sha256"]: item for item in manifest["items"]}
+            for record in entry["records"]:
+                if not record["changed"]:
+                    continue
+                item = items.get(record["sha256"])
+                if item is None:
+                    raise BatchError(
+                        f"cannot undo batch {number!r}: sample {record['sha256']} "
+                        "is no longer in the manifest"
+                    )
+                current = normalize_label(item.get("label"))
+                if self._revision(item) != record["rev"] or current != record["new"]:
+                    raise BatchError(
+                        f"cannot undo batch {number!r}: sample {record['sha256']} "
+                        "was modified after the batch"
+                    )
+
+            restored = 0
+            for record in entry["records"]:
+                if not record["changed"]:
+                    continue
+                item = items[record["sha256"]]
+                item["label"] = record["old"]
+                item["rev"] = self._revision(item) + 1
+                restored += 1
+
+            entry["undone"] = True
+            entry["undone_at"] = datetime.now(timezone.utc).isoformat()
+            self._commit(manifest, history)
+            return {"batch": number, "status": "undone", "restored": restored}
+
+    def history(self) -> list[dict[str, Any]]:
+        """Return successful batch entries in submission order."""
+        self._recover_if_needed()
+        return self._read_history()["batches"]
+
+    @staticmethod
+    def _replay_result(entry: dict[str, Any]) -> dict[str, Any]:
+        changed = sum(1 for record in entry["records"] if record["changed"])
+        return {
+            "batch": entry["batch"],
+            "status": "already-applied",
+            "changed": changed,
+            "unchanged": len(entry["records"]) - changed,
+            "total": len(entry["records"]),
+        }
+
+    @staticmethod
+    def _revision(item: dict[str, Any]) -> int:
+        value = item.get("rev", 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    # ------------------------------------------------------------------
+    # Workspace locking and transactional commits
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _workspace_lock(self):
+        """Exclusive workspace lock for check-and-write transactions.
+
+        ``flock`` is advisory but sufficient for local processes: concurrent
+        submitters serialize, so a batch always observes the labels left by
+        the previous one.
+        """
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _recover_if_needed(self) -> None:
+        """Finish a prepared transaction left by a crashed process."""
+        if not self.transaction_path.exists():
+            return
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+
+    def _recover_transaction_locked(self) -> None:
+        if not self.transaction_path.exists():
+            return
+        try:
+            journal = json.loads(self.transaction_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise BatchError(f"cannot recover interrupted transaction: {error}") from error
+        manifest = journal.get("manifest")
+        history = journal.get("batches")
+        if not isinstance(manifest, dict) or not isinstance(history, dict):
+            raise BatchError("cannot recover interrupted transaction: journal is malformed")
+        # Idempotent installs: both files end up at the journal's version.
+        self._write_json_atomic(self.manifest_path, manifest)
+        self._write_json_atomic(self.batches_path, history)
+        try:
+            self.transaction_path.unlink()
+        except OSError:
+            pass
+
+    def _commit(self, manifest: dict[str, Any], history: dict[str, Any]) -> None:
+        """Atomically install the new manifest and history together.
+
+        A write-ahead journal holding both full payloads is written and
+        fsynced first; a crash at any point leaves enough to redo the
+        missing install on the next open, so the two files never disagree.
+        """
+        journal = {"manifest": manifest, "batches": history}
+        self._write_json_atomic(self.transaction_path, journal)
+        self._write_json_atomic(self.manifest_path, manifest)
+        self._write_json_atomic(self.batches_path, history)
+        try:
+            self.transaction_path.unlink()
+        except OSError:
+            pass
+
+    def _read_history(self) -> dict[str, Any]:
+        if not self.batches_path.exists():
+            return empty_history()
+        try:
+            data = json.loads(self.batches_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise BatchError(f"cannot read batch history: {error}") from error
+        return validate_history(data)
 
     # ------------------------------------------------------------------
     # Split plans
