@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .batches import BatchError
 from .store import DatasetStore
 
 
@@ -40,6 +41,32 @@ def parser() -> argparse.ArgumentParser:
     show.add_argument("workspace", type=Path)
     show.add_argument("name", help="plan name")
 
+    label = commands.add_parser(
+        "label", help="inspect and batch-modify classification labels"
+    )
+    label_commands = label.add_subparsers(dest="label_command", required=True)
+
+    apply_parser = label_commands.add_parser(
+        "apply", help="apply a batch of label changes from a UTF-8 JSON file"
+    )
+    apply_parser.add_argument("workspace", type=Path)
+    apply_parser.add_argument("batch_file", type=Path, help="UTF-8 JSON batch file")
+
+    label_show = label_commands.add_parser(
+        "show", help="show the current label of one sample"
+    )
+    label_show.add_argument("workspace", type=Path)
+    label_show.add_argument("sha256", help="full SHA-256 digest of the sample")
+
+    history = label_commands.add_parser(
+        "history", help="list successfully applied label batches"
+    )
+    history.add_argument("workspace", type=Path)
+
+    undo = label_commands.add_parser("undo", help="undo a successful label batch")
+    undo.add_argument("workspace", type=Path)
+    undo.add_argument("batch_id", help="id of the batch to undo")
+
     demo = commands.add_parser("demo", help="show a read-only product demonstration")
     demo.add_argument("--workspace", type=Path, default=Path("."))
     return value
@@ -50,6 +77,8 @@ def main() -> int:
     try:
         if args.command == "split":
             return _run_split(args)
+        if args.command == "label":
+            return _run_label(args)
         store = DatasetStore(args.workspace)
         if args.command == "init":
             store.initialize()
@@ -66,9 +95,19 @@ def main() -> int:
             print("当前数据集摘要：")
             print(json.dumps(store.summary(), ensure_ascii=False, sort_keys=True))
         return 0
+    except BatchError as error:
+        _print_batch_error(error)
+        return 1
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+
+
+def _print_batch_error(error: BatchError) -> None:
+    payload = {"error": str(error), "code": error.code}
+    if error.records:
+        payload["records"] = error.records
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
 
 
 def _run_split(args: argparse.Namespace) -> int:
@@ -96,6 +135,45 @@ def _run_split(args: argparse.Namespace) -> int:
         }
     else:
         output = store.get_split(args.name)
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _run_label(args: argparse.Namespace) -> int:
+    store = DatasetStore(args.workspace)
+    if args.label_command == "apply":
+        try:
+            text = args.batch_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise BatchError(
+                f"Batch file is not valid UTF-8: {error}", code="invalid_document"
+            ) from None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise BatchError(
+                f"Batch file is not valid JSON: {error}", code="invalid_document"
+            ) from None
+        result = store.apply_batch(payload)
+        output = {
+            "batch_id": result.batch_id,
+            "status": result.status,
+            "changed": result.changed,
+            "total": result.total,
+            "changes": list(result.changes),
+        }
+    elif args.label_command == "show":
+        digest = args.sha256
+        output = {"sha256": digest, "label": store.get_label(digest)}
+    elif args.label_command == "history":
+        output = {"batches": store.batch_history()}
+    else:
+        result = store.undo_batch(args.batch_id)
+        output = {
+            "batch_id": result.batch_id,
+            "status": result.status,
+            "restored": result.restored,
+        }
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     return 0
 

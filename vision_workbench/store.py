@@ -4,11 +4,22 @@ import hashlib
 import json
 import os
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import fcntl
+
+from .batches import (
+    LABEL_SCHEMA_VERSION,
+    BatchError,
+    content_fingerprint,
+    labels_equal,
+    normalize_label,
+    parse_batch_document,
+)
 from .splits import (
     SET_NAMES,
     SplitError,
@@ -22,8 +33,10 @@ from .splits import (
 
 STATE_DIRECTORY = ".vision-workbench"
 MANIFEST_NAME = "manifest.json"
+LOCK_NAME = ".lock"
 SPLITS_DIRECTORY = "splits"
 SPLIT_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = LABEL_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -39,17 +52,58 @@ class SplitPlanResult:
     plan: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class BatchApplyResult:
+    batch_id: str
+    status: str  # "applied" | "unchanged" | "duplicate"
+    changed: int
+    total: int
+    changes: tuple[dict[str, Any], ...]
+    reused: bool = False
+
+
+@dataclass(frozen=True)
+class BatchUndoResult:
+    batch_id: str
+    status: str  # "undone" | "already_undone"
+    restored: int
+
+
 class DatasetStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.state_directory = self.root / STATE_DIRECTORY
         self.manifest_path = self.state_directory / MANIFEST_NAME
+        self.lock_path = self.state_directory / LOCK_NAME
         self.splits_directory = self.state_directory / SPLITS_DIRECTORY
 
     def initialize(self) -> None:
         self.state_directory.mkdir(parents=True, exist_ok=True)
         if not self.manifest_path.exists():
-            self._write({"schema_version": 1, "items": []})
+            self._write(
+                {
+                    "schema_version": MANIFEST_SCHEMA_VERSION,
+                    "items": [],
+                    "label_batches": [],
+                }
+            )
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold an exclusive cross-process lock for a read-modify-write.
+
+        A plain lock file inside the state directory serializes two local
+        processes; combined with atomic manifest replacement, neither
+        successful batch can be lost and conflicting batches cannot both
+        commit.
+        """
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+") as lock_stream:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
         self.initialize()
@@ -57,19 +111,20 @@ class DatasetStore:
         if not file_path.is_file():
             raise ValueError(f"Not a regular file: {source}")
         digest = self._digest(file_path)
-        manifest = self._read()
-        if any(item["sha256"] == digest for item in manifest["items"]):
-            return ImportResult(digest=digest, added=False)
-        manifest["items"].append(
-            {
-                "sha256": digest,
-                "source": str(file_path),
-                "size": file_path.stat().st_size,
-                "label": label,
-            }
-        )
-        manifest["items"].sort(key=lambda item: item["sha256"])
-        self._write(manifest)
+        with self._locked():
+            manifest = self._read()
+            if any(item["sha256"] == digest for item in manifest["items"]):
+                return ImportResult(digest=digest, added=False)
+            manifest["items"].append(
+                {
+                    "sha256": digest,
+                    "source": str(file_path),
+                    "size": file_path.stat().st_size,
+                    "label": normalize_label(label),
+                }
+            )
+            manifest["items"].sort(key=lambda item: item["sha256"])
+            self._write(manifest)
         return ImportResult(digest=digest, added=True)
 
     def summary(self) -> dict[str, Any]:
@@ -81,6 +136,223 @@ class DatasetStore:
             "bytes": sum(item["size"] for item in items),
             "labels": dict(sorted(labels.items())),
         }
+
+    def get_label(self, digest: str) -> str | None:
+        """Return the current label of one sample (``None`` if unlabeled)."""
+        self.initialize()
+        items = self._read()["items"]
+        for item in items:
+            if item["sha256"] == digest:
+                return normalize_label(item.get("label"))
+        raise BatchError(
+            f"Sample not found: {digest}",
+            code="unknown_digest",
+            records=[{"sha256": digest}],
+        )
+
+    # ------------------------------------------------------------------
+    # Batch label changes
+    # ------------------------------------------------------------------
+
+    def apply_batch(self, payload: Any) -> BatchApplyResult:
+        """Validate and apply one label-change batch, all or nothing.
+
+        Structural validation runs before any state is touched; semantic
+        checks (existing digests, expected labels) and the commit run under
+        an exclusive lock so two local processes serialize.  A batch id
+        that has already succeeded replays its original result when the
+        content matches (order and null/"" spelling do not matter), and
+        conflicts otherwise.
+        """
+        batch_id, changes = parse_batch_document(payload)
+        self.initialize()
+        with self._locked():
+            manifest = self._read()
+            history = manifest.setdefault("label_batches", [])
+
+            previous = self._find_history(history, batch_id)
+            if previous is not None:
+                return self._replay_previous(previous, changes)
+
+            items_by_digest = {item["sha256"]: item for item in manifest["items"]}
+            for index, change in enumerate(changes):
+                location = {"index": index, "sha256": change["sha256"]}
+                item = items_by_digest.get(change["sha256"])
+                if item is None:
+                    raise BatchError(
+                        f"Sample not found: {change['sha256']}",
+                        code="unknown_digest",
+                        records=[location],
+                    )
+                if not labels_equal(item.get("label"), change["old_label"]):
+                    raise BatchError(
+                        "Current label does not match expected old label for "
+                        f"{change['sha256']}: found "
+                        f"{normalize_label(item.get('label'))!r}, expected "
+                        f"{change['old_label']!r}",
+                        code="label_mismatch",
+                        records=[location],
+                    )
+
+            applied_changes: list[dict[str, Any]] = []
+            changed_digests: list[str] = []
+            for change in changes:
+                item = items_by_digest[change["sha256"]]
+                current = normalize_label(item.get("label"))
+                target = change["new_label"]
+                applied_changes.append(
+                    {
+                        "sha256": change["sha256"],
+                        "old_label": current,
+                        "new_label": target,
+                        "changed": current != target,
+                    }
+                )
+                if current != target:
+                    changed_digests.append(change["sha256"])
+
+            if not changed_digests:
+                # No-op batches are reported but consume neither history
+                # nor the batch id.
+                return BatchApplyResult(
+                    batch_id=batch_id,
+                    status="unchanged",
+                    changed=0,
+                    total=len(changes),
+                    changes=tuple(applied_changes),
+                )
+
+            for change in changes:
+                item = items_by_digest[change["sha256"]]
+                target = change["new_label"]
+                if normalize_label(item.get("label")) != target:
+                    item["label"] = target
+                    # Stamp every actually changed sample: only a later
+                    # label touch clears this, which is what gates undo.
+                    item["labels_last_batch"] = batch_id
+
+            record = {
+                "batch_id": batch_id,
+                "fingerprint": content_fingerprint(changes),
+                "changed_count": len(changed_digests),
+                "changes": applied_changes,
+                "undo": {"status": "active", "restored": None},
+            }
+            history.append(record)
+            self._write(manifest)
+            return BatchApplyResult(
+                batch_id=batch_id,
+                status="applied",
+                changed=len(changed_digests),
+                total=len(changes),
+                changes=tuple(applied_changes),
+            )
+
+    def undo_batch(self, batch_id: str) -> BatchUndoResult:
+        """Restore the labels of one successful batch.
+
+        Succeeds only when every sample the batch really changed is still
+        stamped with this batch id, i.e. none of them was modified
+        afterwards (even if it was changed back to the same label).  Later
+        changes to other samples do not block the undo.  Repeating an
+        undo reports the prior undo without writing again; an unknown id
+        is an explicit error.
+        """
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise BatchError(
+                "Batch id must be a non-empty string", code="invalid_batch_id"
+            )
+        self.initialize()
+        with self._locked():
+            manifest = self._read()
+            history = manifest.setdefault("label_batches", [])
+            record = self._find_history(history, batch_id)
+            if record is None:
+                raise BatchError(
+                    f"Unknown batch id: {batch_id}", code="unknown_batch"
+                )
+            undo = record.setdefault("undo", {})
+            if undo.get("status") == "undone":
+                return BatchUndoResult(
+                    batch_id=batch_id,
+                    status="already_undone",
+                    restored=0,
+                )
+
+            items_by_digest = {item["sha256"]: item for item in manifest["items"]}
+            touched_after: list[dict[str, Any]] = []
+            for change in record["changes"]:
+                if not change["changed"]:
+                    continue
+                digest = change["sha256"]
+                item = items_by_digest.get(digest)
+                if item is None or item.get("labels_last_batch") != batch_id:
+                    touched_after.append({"sha256": digest})
+            if touched_after:
+                raise BatchError(
+                    "Cannot undo batch: at least one changed sample was "
+                    "modified afterwards",
+                    code="sample_modified_after_batch",
+                    records=touched_after,
+                )
+
+            for change in record["changes"]:
+                if not change["changed"]:
+                    continue
+                items_by_digest[change["sha256"]]["label"] = change["old_label"]
+                # The restoration itself is a later touch for undo-gating
+                # purposes; re-undo returns "already_undone".
+                items_by_digest[change["sha256"]]["labels_last_batch"] = None
+            undo["status"] = "undone"
+            undo["restored"] = record["changed_count"]
+            self._write(manifest)
+            return BatchUndoResult(
+                batch_id=batch_id,
+                status="undone",
+                restored=record["changed_count"],
+            )
+
+    def batch_history(self) -> list[dict[str, Any]]:
+        """Successful batches in submission order, undo state included."""
+        self.initialize()
+        history = self._read().setdefault("label_batches", [])
+        return [
+            {
+                "batch_id": record["batch_id"],
+                "changed_count": record["changed_count"],
+                "changes": [dict(change) for change in record["changes"]],
+                "undo": dict(record.get("undo", {"status": "active"})),
+            }
+            for record in history
+        ]
+
+    @staticmethod
+    def _find_history(
+        history: list[dict[str, Any]], batch_id: str
+    ) -> dict[str, Any] | None:
+        for record in history:
+            if record["batch_id"] == batch_id:
+                return record
+        return None
+
+    def _replay_previous(
+        self, record: dict[str, Any], changes: list[dict[str, Any]]
+    ) -> BatchApplyResult:
+        """Return the original result for a resubmitted successful batch."""
+        if record.get("fingerprint") != content_fingerprint(changes):
+            raise BatchError(
+                f"Batch id {record['batch_id']!r} was already used with "
+                "different changes",
+                code="batch_id_conflict",
+            )
+        return BatchApplyResult(
+            batch_id=record["batch_id"],
+            status="duplicate",
+            changed=record["changed_count"],
+            total=len(record["changes"]),
+            changes=tuple(dict(change) for change in record["changes"]),
+            reused=True,
+        )
 
     # ------------------------------------------------------------------
     # Split plans
@@ -350,17 +622,22 @@ class DatasetStore:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Cannot read dataset manifest: {error}") from error
-        if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
+        if (
+            not isinstance(data, dict)
+            or data.get("schema_version") not in (1, MANIFEST_SCHEMA_VERSION)
+            or not isinstance(data.get("items"), list)
+        ):
+            raise ValueError("Unsupported dataset manifest")
+        # Older workspaces predate label-batch history; they upgrade on
+        # the next write without requiring a re-import.
+        data.setdefault("label_batches", [])
+        if not isinstance(data["label_batches"], list):
             raise ValueError("Unsupported dataset manifest")
         return data
 
     def _write(self, data: dict[str, Any]) -> None:
-        temporary = self.manifest_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.manifest_path)
+        data["schema_version"] = MANIFEST_SCHEMA_VERSION
+        self._write_json_atomic(self.manifest_path, data)
 
     @staticmethod
     def _digest(path: Path) -> str:
