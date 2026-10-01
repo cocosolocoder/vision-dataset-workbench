@@ -21,6 +21,7 @@ from .batches import (
     render_label,
     validate_history,
 )
+from .exporting import export_package, parse_saved_plan
 from .splits import (
     SET_NAMES,
     SplitError,
@@ -412,6 +413,25 @@ class DatasetStore:
         if not plan_path.exists():
             raise SplitError(f"Split plan not found: {name}")
         return self._read_split(plan_path)
+
+    def export_plan(
+        self, name: str, target: Path, *, skip_unlabeled: bool = False
+    ) -> dict[str, Any]:
+        """Export a saved plan to an offline classification ZIP package.
+
+        Only the saved plan's own samples, labels and set assignments are
+        used; nothing in the workspace is read besides the plan file or
+        modified.  Missing or damaged plans, unlabeled samples (unless
+        skipped), missing/non-regular/unreadable sources and digest
+        mismatches fail the whole export with no target file produced.
+        """
+        validate_name(name)
+        plan_path = self._split_path(name)
+        if not plan_path.exists():
+            raise SplitError(f"Split plan not found: {name}")
+        saved = self._read_split(plan_path)
+        plan = parse_saved_plan(saved)
+        return export_package(plan, target, skip_unlabeled=skip_unlabeled)
 
     def _split_path(self, name: str) -> Path:
         # validate_name() has already ruled out path separators and "..".

@@ -51,6 +51,54 @@ python3 -m vision_workbench split show ./workspace baseline
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
+## Offline export
+
+A saved plan can be exported into a self-contained ZIP data package that is
+trivial to carry around or feed to an ImageFolder loader:
+
+```bash
+python3 -m vision_workbench export ./workspace baseline ./baseline.zip
+python3 -m vision_workbench export ./workspace baseline ./baseline.zip --skip-unlabeled
+```
+
+- The ZIP contains `train/`, `validation/` and `test/` directories, each
+  organized as `<set>/<category>/<sha256><ext>`; every set uses the same
+  set of category directories (and numeric class indices), including
+  categories that have no sample in that set.  File names are the full
+  content digest with the source file's extension, and every file stays
+  inside its own set directory.
+- A UTF-8 `manifest.json` records the plan name, seed, ratios, the mapping
+  from original labels to category directories, and each sample's digest,
+  set and package-relative path.  No machine-specific absolute path is
+  written into the package.
+- Chinese labels, labels containing path separators and labels that differ
+  only in case each keep their own identity; category directories are
+  sanitized and disambiguated deterministically so they never collide.
+- Empty labels mean *unlabeled* (the literal class name `unlabeled` is a
+  normal category).  By default a single unlabeled sample rejects the whole
+  export and names its digest; `--skip-unlabeled` skips them instead and
+  reports the skipped count per set both in the command output and in the
+  manifest.  Skipping never reassigns the remaining samples.  An empty plan
+  still exports all three directories and an empty sample manifest.
+- Sources are read from the paths stored in the saved plan, re-hashed while
+  streaming, and a missing, non-regular or unreadable file — or any byte
+  sequence that does not match the saved digest, including a change while
+  reading — fails the entire export, naming the offending digest.  Later
+  imports, batch relabels and undos never change an older plan's export, and
+  export never modifies the workspace.
+- The same plan, options and source contents always produce byte-identical
+  ZIPs regardless of time, workspace location, target path or source
+  modification time.  Media is streamed in fixed-size chunks, so memory use
+  does not grow with the total media size.
+- An existing target is refused and left untouched; concurrent exports to
+  the same target leave at most one file in place, and a failed or
+  interrupted write never leaves a partial target (a re-run once the target
+  is absent works normally).
+
+On success the command prints JSON naming the plan, the total number of
+samples exported, the per-set category distribution and the per-set skip
+counts.
+
 ## Batch label updates
 
 Labels of already-imported samples can be changed in batches. A batch is a
