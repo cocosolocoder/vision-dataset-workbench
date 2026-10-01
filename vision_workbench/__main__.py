@@ -59,6 +59,18 @@ def parser() -> argparse.ArgumentParser:
     show.add_argument("workspace", type=Path)
     show.add_argument("name", help="plan name")
 
+    export = commands.add_parser(
+        "export", help="export a saved split plan as an offline ZIP package"
+    )
+    export.add_argument("workspace", type=Path)
+    export.add_argument("plan", help="saved split plan name")
+    export.add_argument("target", type=Path, help="destination ZIP path (must not exist)")
+    export.add_argument(
+        "--skip-unlabeled",
+        action="store_true",
+        help="skip samples with no label instead of rejecting the whole export",
+    )
+
     demo = commands.add_parser("demo", help="show a read-only product demonstration")
     demo.add_argument("--workspace", type=Path, default=Path("."))
     return value
@@ -107,6 +119,16 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
+        elif args.command == "export":
+            from .exporter import export_split
+
+            result = export_split(
+                store,
+                args.plan,
+                args.target,
+                skip_unlabeled=args.skip_unlabeled,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             print("视觉数据集工作台")
             print("本地 CPU 模式：可用")

@@ -45,6 +45,44 @@ python3 -m vision_workbench split show ./workspace baseline
   ratios, sample identities and labels all match; otherwise it reports a
   name conflict and leaves the original untouched.
 
+## Exporting a split plan
+
+A saved split plan can be exported as a portable, offline ZIP package:
+
+```bash
+python3 -m vision_workbench export ./workspace baseline ./baseline.zip
+```
+
+- The package contains `train/`, `validation/` and `test/` directories,
+  each with the same numbered ImageFolder class directories (`class_01`,
+  `class_02`, ...), plus a UTF-8 `manifest.json`. Samples are stored as
+  `<set>/<class>/<full-sha256><source-extension>`.
+- The export uses only the saved plan: its samples, labels, set
+  assignments and recorded source paths. Later imports, batch label
+  changes or undos never alter an exported package, and exporting never
+  writes to the workspace.
+- All sets share one class directory numbering, even when a class has no
+  samples in a set. Chinese labels, labels containing path separators and
+  labels differing only in case each keep a distinct identity in the
+  manifest's label-to-directory mapping; no machine-specific absolute
+  paths are written.
+- An empty plan exports the three set directories and an empty manifest.
+- Samples with no label are unlabeled. By default the whole export is
+  rejected and the offending digest is reported; `--skip-unlabeled` skips
+  them instead, listing the per-set skip counts in both the result and the
+  manifest. Skipping never redistributes other samples. A real class
+  literally named `unlabeled` is exported normally.
+- Source files are streamed and verified against the saved content digest
+  while copying: a missing, non-regular, unreadable or changed source
+  fails the whole export with the sample digest and reason.
+- The target must not already exist; it is written atomically, so a failure
+  or interruption leaves no incomplete file. Concurrent exports to the
+  same path are serialized and at most one succeeds.
+- Package bytes are deterministic for a given plan, options and source
+  content: exporting at a different time, from a copied workspace or to a
+  different path yields byte-identical ZIPs, and source modification times
+  do not matter.
+
 ## Tests
 
 ```bash
