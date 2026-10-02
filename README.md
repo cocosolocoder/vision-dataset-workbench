@@ -15,7 +15,7 @@ python3 -m vision_workbench add ./workspace ./examples/cat.jpg --label cat
 python3 -m vision_workbench summary ./workspace
 ```
 
-The manifest is written to `.vision-workbench/manifest.json`. Importing the same file twice is idempotent because records are keyed by the file content hash.
+The manifest is written to `.vision-workbench/manifest.json`. Importing the same file twice is idempotent because records are keyed by the file content hash. Imports, batch writes, undos and plan creation are serialized by a single workspace lock and committed through the same write-ahead journal, so several local processes can operate on one workspace at once: every successful operation survives, concurrent imports of different content all land, and duplicate imports report `already present` once while keeping the first registration's source and label.
 
 ## Split plans
 
@@ -43,7 +43,13 @@ python3 -m vision_workbench split show ./workspace baseline
   `unlabeled` is kept separate.
 - Creating under an existing name reuses the plan only when the seed,
   ratios, sample identities and labels all match; otherwise it reports a
-  name conflict and leaves the original untouched.
+  name conflict and leaves the original untouched. Sample identities and
+  labels are snapshotted from one complete manifest state, so a batch that
+  changes several labels is seen wholly before or wholly after the plan,
+  never half-applied. Concurrent creation of one name is atomic: exactly
+  one request creates it, identical requests reuse it and differing
+  requests conflict; plans with different names all save, and a plan is
+  only ever read whole or reported as not found.
 
 ## Exporting a split plan
 
@@ -140,11 +146,18 @@ if the label was changed back). Other samples' later changes do not block
 the undo. Undo leaves a queryable record; repeating it reports
 `already-undone`.
 
-Batch writes and undos are crash-safe: a write-ahead journal installs the
-manifest and the history together, so reopening after an interruption
-shows either the old state or the complete new state with its history.
-Concurrent submissions are serialized by a workspace lock, so no
-successful batch is lost and two batches modifying the same sample from
-the same old label cannot both win. Saved split plans are never touched
-by label changes; plans created afterwards use the current labels, and
-the same-name reuse/conflict rules still apply.
+Imports, batch writes and undos are crash-safe: a write-ahead journal
+installs the manifest and the history together, so after an interruption
+the workspace shows either the old state or the complete new state with
+its history — labels and their history never straddle the two. Recovery
+runs under the workspace lock at the start of every operation, so a
+process that already has the workspace open also completes a peer's
+prepared transaction without reopening; a sample imported successfully
+afterwards is never rolled back by that recovery. Concurrent operations
+are serialized by the lock, so no successful import or batch is lost and
+two batches modifying the same sample from the same old label cannot both
+win. Summary, label and history queries each observe one complete state
+and never report corruption from an in-flight write. Saved split plans are
+never touched by imports, label changes or undos; plans created afterwards
+use the current labels, and the same-name reuse/conflict rules still
+apply.

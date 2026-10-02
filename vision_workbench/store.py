@@ -68,34 +68,48 @@ class DatasetStore:
         self._recover_if_needed()
 
     def initialize(self) -> None:
-        self.state_directory.mkdir(parents=True, exist_ok=True)
-        if not self.manifest_path.exists():
-            self._write({"schema_version": 1, "items": []})
+        # The empty-manifest decision is made under the workspace lock so a
+        # concurrent first import cannot have its sample replaced by an empty
+        # dataset created from a stale "manifest missing" observation.
+        with self._locked(create=True):
+            if not self.manifest_path.exists():
+                self._write_json_atomic(
+                    self.manifest_path, {"schema_version": 1, "items": []}
+                )
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
         self.initialize()
         file_path = source.resolve(strict=True)
         if not file_path.is_file():
             raise ValueError(f"Not a regular file: {source}")
+        # Hashing is pure I/O on the source file; do it before taking the
+        # workspace lock so concurrent imports of different files hash in
+        # parallel and only serialize for the manifest check-and-commit.
         digest = self._digest(file_path)
-        manifest = self._read()
-        if any(item["sha256"] == digest for item in manifest["items"]):
-            return ImportResult(digest=digest, added=False)
-        manifest["items"].append(
-            {
-                "sha256": digest,
-                "source": str(file_path),
-                "size": file_path.stat().st_size,
-                "label": label,
-            }
-        )
-        manifest["items"].sort(key=lambda item: item["sha256"])
-        self._write(manifest)
-        return ImportResult(digest=digest, added=True)
+        with self._locked(create=True):
+            manifest = self._read()
+            if any(item["sha256"] == digest for item in manifest["items"]):
+                # Re-import never overwrites the registered source, label or
+                # revision: the first report of a digest owns its metadata.
+                return ImportResult(digest=digest, added=False)
+            manifest["items"].append(
+                {
+                    "sha256": digest,
+                    "source": str(file_path),
+                    "size": file_path.stat().st_size,
+                    "label": label,
+                }
+            )
+            manifest["items"].sort(key=lambda item: item["sha256"])
+            # Commit through the same journal as batches so the import is
+            # crash-safe and cannot clobber a batch committed concurrently.
+            self._commit(manifest, self._read_history())
+            return ImportResult(digest=digest, added=True)
 
     def summary(self) -> dict[str, Any]:
         self.initialize()
-        items = self._read()["items"]
+        with self._locked():
+            items = self._read()["items"]
         labels = Counter(item["label"] or "unlabeled" for item in items)
         return {
             "items": len(items),
@@ -112,11 +126,11 @@ class DatasetStore:
 
         ``None`` means unlabeled (the manifest may store ``null`` or ``""``).
         """
-        self._recover_if_needed()
-        manifest = self._read()
-        for item in manifest["items"]:
-            if item["sha256"] == digest:
-                return {"sha256": digest, "label": normalize_label(item.get("label"))}
+        with self._locked():
+            manifest = self._read()
+            for item in manifest["items"]:
+                if item["sha256"] == digest:
+                    return {"sha256": digest, "label": normalize_label(item.get("label"))}
         raise BatchError(f"sample not found: {digest}")
 
     def submit_batch_file(self, path: Path) -> dict[str, Any]:
@@ -138,8 +152,7 @@ class DatasetStore:
         touching anything.
         """
         number, records = parse_batch_file(data)
-        with self._workspace_lock():
-            self._recover_transaction_locked()
+        with self._locked(create=True):
             manifest = self._read()
             history = self._read_history()
             items = {item["sha256"]: item for item in manifest["items"]}
@@ -219,8 +232,7 @@ class DatasetStore:
         modification, even one that restored the same label).  Repeated
         undos are idempotent and do not add history.
         """
-        with self._workspace_lock():
-            self._recover_transaction_locked()
+        with self._locked(create=True):
             manifest = self._read()
             history = self._read_history()
             entry = next(
@@ -265,8 +277,8 @@ class DatasetStore:
 
     def history(self) -> list[dict[str, Any]]:
         """Return successful batch entries in submission order."""
-        self._recover_if_needed()
-        return self._read_history()["batches"]
+        with self._locked():
+            return self._read_history()["batches"]
 
     @staticmethod
     def _replay_result(entry: dict[str, Any]) -> dict[str, Any]:
@@ -292,9 +304,9 @@ class DatasetStore:
     def _workspace_lock(self):
         """Exclusive workspace lock for check-and-write transactions.
 
-        ``flock`` is advisory but sufficient for local processes: concurrent
-        submitters serialize, so a batch always observes the labels left by
-        the previous one.
+        ``flock`` is advisory but sufficient for local processes: holders
+        serialize, so every read-modify-write observes the state left by the
+        previous completed operation.
         """
         self.state_directory.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -307,12 +319,33 @@ class DatasetStore:
             finally:
                 os.close(descriptor)
 
+    @contextmanager
+    def _locked(self, *, create: bool = False):
+        """Hold the workspace lock and finish any leftover prepared journal.
+
+        Recovery runs once the lock is held, so a long-lived process that
+        only imports, queries or creates plans still installs the prepared
+        transaction of a process that crashed on this machine, without
+        needing to reopen the workspace.
+
+        Read callers leave ``create`` false: on a workspace whose state
+        directory does not yet exist there is no journal to finish and
+        nothing for a writer to hold, so the query proceeds (and fails or
+        reports empty exactly as before) without materializing one.
+        """
+        if not create and not self.state_directory.exists():
+            yield
+            return
+        with self._workspace_lock():
+            self._recover_transaction_locked()
+            yield
+
     def _recover_if_needed(self) -> None:
         """Finish a prepared transaction left by a crashed process."""
         if not self.transaction_path.exists():
             return
-        with self._workspace_lock():
-            self._recover_transaction_locked()
+        with self._locked():
+            pass
 
     def _recover_transaction_locked(self) -> None:
         if not self.transaction_path.exists():
@@ -325,6 +358,15 @@ class DatasetStore:
         history = journal.get("batches")
         if not isinstance(manifest, dict) or not isinstance(history, dict):
             raise BatchError("cannot recover interrupted transaction: journal is malformed")
+        # Only install a coherent pair, so recovery can never leave the
+        # manifest and the history in two different states.
+        if manifest.get("schema_version") != 1 or not isinstance(
+            manifest.get("items"), list
+        ):
+            raise BatchError(
+                "cannot recover interrupted transaction: journal manifest is malformed"
+            )
+        validate_history(history)
         # Idempotent installs: both files end up at the journal's version.
         self._write_json_atomic(self.manifest_path, manifest)
         self._write_json_atomic(self.batches_path, history)
@@ -377,33 +419,42 @@ class DatasetStore:
         fraction_ratios = validate_ratios(ratios)
 
         self.initialize()
-        items = self._read()["items"]
-
-        # assign() validates identities and performs the stratification.
-        assignment = assign(items, fraction_ratios, seed)
-
-        snapshot = [
-            {
-                "sha256": item["sha256"],
-                "label": item.get("label"),
-                "source": item.get("source"),
-            }
-            for item in sorted(items, key=lambda item: item["sha256"])
-        ]
-        plan_payload = self._build_plan(name, seed, fraction_ratios, snapshot, assignment)
-
         plan_path = self._split_path(name)
-        if plan_path.exists():
-            existing = self._read_split(plan_path)
-            if self._same_inputs(existing, seed, fraction_ratios, snapshot):
-                return SplitPlanResult(name=name, created=False, plan=existing)
-            raise SplitError(
-                f"Split plan {name!r} already exists with different seed, "
-                "ratios or samples; choose another name"
+
+        with self._locked(create=True):
+            # Sample identities and labels are read from one complete
+            # manifest state, so a batch committing concurrently is observed
+            # either entirely (all its label changes) or not at all.
+            items = self._read()["items"]
+            # assign() validates identities and performs the stratification.
+            assignment = assign(items, fraction_ratios, seed)
+
+            snapshot = [
+                {
+                    "sha256": item["sha256"],
+                    "label": item.get("label"),
+                    "source": item.get("source"),
+                }
+                for item in sorted(items, key=lambda item: item["sha256"])
+            ]
+            plan_payload = self._build_plan(
+                name, seed, fraction_ratios, snapshot, assignment
             )
 
-        self._write_json_atomic(plan_path, plan_payload)
-        return SplitPlanResult(name=name, created=True, plan=plan_payload)
+            # The check-and-create is atomic under the same lock, so among
+            # concurrent creations of one name exactly one reports success;
+            # matching requests reuse it and differing ones conflict.
+            if plan_path.exists():
+                existing = self._read_split(plan_path)
+                if self._same_inputs(existing, seed, fraction_ratios, snapshot):
+                    return SplitPlanResult(name=name, created=False, plan=existing)
+                raise SplitError(
+                    f"Split plan {name!r} already exists with different seed, "
+                    "ratios or samples; choose another name"
+                )
+
+            self._write_json_atomic(plan_path, plan_payload)
+            return SplitPlanResult(name=name, created=True, plan=plan_payload)
 
     def get_split(self, name: str) -> dict[str, Any]:
         """Return the stored plan payload, or raise if it does not exist."""
@@ -629,14 +680,6 @@ class DatasetStore:
         if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
             raise ValueError("Unsupported dataset manifest")
         return data
-
-    def _write(self, data: dict[str, Any]) -> None:
-        temporary = self.manifest_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.manifest_path)
 
     @staticmethod
     def _digest(path: Path) -> str:
