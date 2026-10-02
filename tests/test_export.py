@@ -425,6 +425,285 @@ class CliTest(ExportHarness):
         self.assertEqual(body["skipped"], {"train": 1, "validation": 0, "test": 0})
 
 
+class SourceDirExportTest(ExportHarness):
+    def setUp(self) -> None:
+        super().setUp()
+        self.moved = Path(self.temp.name) / "moved"
+
+    def move_sources(self, renames: dict[str, str] | None = None) -> Path:
+        """Move every recorded source into self.moved, optionally renaming."""
+        plan = self.store.get_split("baseline")
+        sources = []
+        for set_name in SET_NAMES:
+            for member in plan["sets"][set_name]["members"]:
+                sources.append(member["source"])
+        for index, source in enumerate(sources):
+            old = Path(source)
+            new_name = (renames or {}).get(old.name, old.name)
+            new_path = self.moved / new_name
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            old.replace(new_path)
+        return self.moved
+
+    def test_export_from_moved_tree_byte_identical(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.add_sample("dog", b"dog-one")
+        self.create_plan()
+        baseline = self.root.parent / "baseline.zip"
+        export_split(self.store, "baseline", baseline)
+
+        moved = self.move_sources()
+        target = self.root.parent / "out.zip"
+        result = export_split(
+            self.store, "baseline", target, source_dir=moved
+        )
+        self.assertEqual(result["exported"], 2)
+        self.assertEqual(target.read_bytes(), baseline.read_bytes())
+
+    def test_renamed_files_match_by_content_and_keep_plan_extension(self) -> None:
+        d = self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        baseline = self.root.parent / "baseline.zip"
+        export_split(self.store, "baseline", baseline)
+
+        moved = self.move_sources(renames={"sample-1.jpg": "nested/renamed.bin"})
+        target = self.root.parent / "out.zip"
+        export_split(self.store, "baseline", target, source_dir=moved)
+        self.assertEqual(target.read_bytes(), baseline.read_bytes())
+        with self.read_zip(target) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            entry = [s for s in manifest["samples"] if s["sha256"] == d][0]
+            # Extension still comes from the plan, not the new file name.
+            self.assertTrue(entry["path"].endswith(".jpg"), entry["path"])
+            self.assertNotIn(str(moved), json.dumps(manifest))
+
+    def test_duplicate_copies_pick_first_relative_path(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        # Extra copies of the same content; the export must not change.
+        (moved / "aaa").mkdir()
+        (moved / "aaa" / "copy.dat").write_bytes(b"cat-one")
+        (moved / "zzz").mkdir()
+        (moved / "zzz" / "copy.dat").write_bytes(b"cat-one")
+        first = self.root.parent / "first.zip"
+        export_split(self.store, "baseline", first, source_dir=moved)
+
+        # Only the lexicographically first copy is read: corrupting the
+        # others after a fresh scan must not matter, and the bytes are
+        # identical to a copy-free export.
+        (moved / "zzz" / "copy.dat").write_bytes(b"corrupted")
+        (moved / "aaa" / "copy.dat").replace(moved / "sole.dat")
+        import shutil
+        shutil.rmtree(moved / "aaa")
+        shutil.rmtree(moved / "zzz")
+        second = self.root.parent / "second.zip"
+        export_split(self.store, "baseline", second, source_dir=moved)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_unrelated_files_not_exported(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        (moved / "stray.txt").write_bytes(b"not in the plan")
+        target = self.root.parent / "out.zip"
+        result = export_split(self.store, "baseline", target, source_dir=moved)
+        self.assertEqual(result["exported"], 1)
+        with self.read_zip(target) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(len(manifest["samples"]), 1)
+
+    def test_missing_sample_in_source_dir_fails_with_digest(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.add_sample("dog", b"dog-one")
+        self.create_plan()
+        moved = self.move_sources()
+        # Remove the dog sample's file from the new tree.
+        for path in moved.rglob("*"):
+            if path.is_file() and path.read_bytes() == b"dog-one":
+                path.unlink()
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target, source_dir=moved)
+        message = str(caught.exception)
+        self.assertFalse(target.exists())
+        # Exactly the missing sample's digest must be named.
+        plan = self.store.get_split("baseline")
+        digests = [
+            m["sha256"]
+            for s in SET_NAMES
+            for m in plan["sets"][s]["members"]
+        ]
+        named = [digest for digest in digests if digest in message]
+        self.assertEqual(len(named), 1, message)
+
+    def test_same_name_different_content_does_not_substitute(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        # Replace the moved file with different content under the same name.
+        for path in moved.rglob("*"):
+            if path.is_file():
+                path.write_bytes(b"cat-one-but-not-really")
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError):
+            export_split(self.store, "baseline", target, source_dir=moved)
+        self.assertFalse(target.exists())
+
+    def test_original_path_not_used_as_fallback(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        # Copy (not move) so the recorded source path still works.
+        plan = self.store.get_split("baseline")
+        source = Path(plan["sets"]["train"]["members"][0]["source"])
+        self.moved.mkdir()
+        (self.moved / "unrelated.dat").write_bytes(b"other content")
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target, source_dir=self.moved)
+        self.assertTrue(source.exists())  # original still available, unused
+        self.assertFalse(target.exists())
+
+    def test_symlinks_are_skipped(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        real_files = [p for p in moved.rglob("*") if p.is_file()]
+        self.assertEqual(len(real_files), 1)
+        real = real_files[0]
+        hidden = Path(self.temp.name) / "hidden"
+        hidden.mkdir()
+        real.replace(hidden / "real.jpg")
+        os.symlink(hidden / "real.jpg", moved / "link.jpg")
+        os.symlink(hidden, moved / "linkdir")
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError):
+            export_split(self.store, "baseline", target, source_dir=moved)
+        self.assertFalse(target.exists())
+
+    def test_source_dir_must_exist_and_be_a_directory(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        target = self.root.parent / "out.zip"
+        missing = Path(self.temp.name) / "nope"
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target, source_dir=missing)
+        self.assertIn(str(missing), str(caught.exception))
+        not_dir = Path(self.temp.name) / "a-file"
+        not_dir.write_bytes(b"x")
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target, source_dir=not_dir)
+        self.assertIn(str(not_dir), str(caught.exception))
+        self.assertFalse(target.exists())
+
+    def test_empty_plan_only_checks_source_dir_exists(self) -> None:
+        self.create_plan("empty")
+        self.moved.mkdir()
+        (self.moved / "anything.dat").write_bytes(b"irrelevant")
+        target = self.root.parent / "out.zip"
+        result = export_split(self.store, "empty", target, source_dir=self.moved)
+        self.assertEqual(result["exported"], 0)
+        with self.read_zip(target) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["samples"], [])
+
+        missing_target = self.root.parent / "other.zip"
+        with self.assertRaises(ExportError):
+            export_split(
+                self.store, "empty", missing_target,
+                source_dir=Path(self.temp.name) / "nope",
+            )
+        self.assertFalse(missing_target.exists())
+
+    def test_all_skipped_only_checks_source_dir_exists(self) -> None:
+        self.add_sample(None, b"unlabeled")
+        self.create_plan(ratios=["1", "0", "0"])
+        self.moved.mkdir()
+        target = self.root.parent / "out.zip"
+        result = export_split(
+            self.store, "baseline", target,
+            skip_unlabeled=True, source_dir=self.moved,
+        )
+        self.assertEqual(result["exported"], 0)
+        self.assertEqual(result["skipped"], {"train": 1, "validation": 0, "test": 0})
+
+    def test_skip_unlabeled_needs_no_source_for_skipped(self) -> None:
+        self.add_sample("cat", b"labeled")
+        self.add_sample(None, b"unlabeled")
+        self.create_plan(ratios=["1", "0", "0"])
+        moved = self.move_sources()
+        # Remove the unlabeled sample's file; only the labeled one remains.
+        for path in moved.rglob("*"):
+            if path.is_file() and path.read_bytes() == b"unlabeled":
+                path.unlink()
+        target = self.root.parent / "out.zip"
+        result = export_split(
+            self.store, "baseline", target,
+            skip_unlabeled=True, source_dir=moved,
+        )
+        self.assertEqual(result["exported"], 1)
+        self.assertEqual(result["skipped"], {"train": 1, "validation": 0, "test": 0})
+
+    def test_selected_file_replaced_before_copy_fails(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+
+        import vision_workbench.exporter as exporter
+
+        original_hash = exporter._hash_file
+
+        def corrupting_hash(path: Path) -> str:
+            digest = original_hash(path)
+            # Replace the file after it has been indexed, before the copy.
+            Path(path).write_bytes(b"swapped-after-scan")
+            return digest
+
+        exporter._hash_file = corrupting_hash
+        try:
+            target = self.root.parent / "out.zip"
+            with self.assertRaises(ExportError) as caught:
+                export_split(self.store, "baseline", target, source_dir=moved)
+            self.assertIn("digest", str(caught.exception))
+            self.assertFalse(target.exists())
+        finally:
+            exporter._hash_file = original_hash
+
+    def test_source_dir_does_not_write_to_workspace(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        manifest_before = self.store.manifest_path.read_bytes()
+        plans_before = {
+            p.name: p.read_bytes() for p in self.store.splits_directory.iterdir()
+        }
+        export_split(
+            self.store, "baseline", self.root.parent / "out.zip",
+            source_dir=moved,
+        )
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in self.store.splits_directory.iterdir()},
+            plans_before,
+        )
+
+    def test_cli_export_with_source_dir(self) -> None:
+        self.add_sample("cat", b"cat-one")
+        self.create_plan()
+        moved = self.move_sources()
+        target = self.root.parent / "cli.zip"
+        result = subprocess.run(
+            [sys.executable, "-m", "vision_workbench", "export",
+             str(self.root), "baseline", str(target),
+             "--source-dir", str(moved)],
+            cwd=REPO_ROOT, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(result.stdout)
+        self.assertEqual(body["exported"], 1)
+        self.assertTrue(target.exists())
+
+
 def shutil_copytree(src: Path, dst: Path) -> None:
     import shutil
 

@@ -8,7 +8,11 @@ stored under ``<set>/<class>/<full-sha256><source-extension>``.
 The export is driven solely by the saved plan: its sample identities,
 labels, set assignments and recorded source paths.  Later imports, label
 changes or undos never affect an exported package, and exporting never
-writes to the workspace.
+writes to the workspace.  With ``source_dir``, sample content is read
+from the files found under that directory (matched by content digest)
+instead of the recorded source paths — useful after the original files
+were moved or renamed — while everything the plan decides (identities,
+labels, sets, package-internal names) stays unchanged.
 
 ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
@@ -51,8 +55,14 @@ def export_split(
     plan_name: str,
     target: Path,
     skip_unlabeled: bool = False,
+    source_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Export a saved split plan to a new ZIP at ``target``.
+
+    When ``source_dir`` is given, sample content is read from the files
+    found under that directory (matched by content digest) instead of the
+    source paths recorded in the plan; the plan still decides sample
+    identities, labels, set assignments and package-internal names.
 
     Returns a result payload describing the plan, the number of samples
     actually exported, the class distribution per set and the per-set skip
@@ -74,6 +84,19 @@ def export_split(
     skipped_counts = {set_name: 0 for set_name in SET_NAMES}
     for member in unlabeled:
         skipped_counts[member["set"]] += 1
+
+    if source_dir is not None:
+        root = _check_source_dir(Path(source_dir))
+        if exported:
+            index = _index_source_dir(root)
+            for member in exported:
+                found = index.get(member["sha256"])
+                if found is None:
+                    raise ExportError(
+                        f"sample {member['sha256']}: no file with matching "
+                        f"content found under source directory {root}"
+                    )
+                member["read_from"] = found
 
     classes = _build_classes(exported)
     manifest = _build_manifest(plan, classes, exported, skipped_counts)
@@ -131,6 +154,83 @@ def _collect_members(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     return members
+
+
+def _check_source_dir(root: Path) -> Path:
+    """Validate the ``--source-dir`` argument; return it unchanged."""
+    try:
+        stat_result = os.stat(root)
+    except OSError as error:
+        raise ExportError(
+            f"cannot access source directory {root}: {error}"
+        ) from error
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise ExportError(f"source directory {root}: not a directory")
+    return root
+
+
+def _index_source_dir(root: Path) -> dict[str, Path]:
+    """Map content digest to one file per digest found under ``root``.
+
+    Every regular file in the directory tree is hashed; symlinks and other
+    non-regular files are skipped and symlinked directories are never
+    entered.  When several files share a digest, the one whose path
+    relative to ``root`` (with ``/`` separators) sorts first by Unicode
+    code point wins, so the choice does not depend on file names beyond
+    that ordering.  Any directory that cannot be scanned or any regular
+    file that cannot be read in full fails the whole export.
+    """
+    index: dict[str, Path] = {}
+    relative: dict[str, str] = {}
+
+    def visit(directory: Path) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                entry_list = list(entries)
+        except OSError as error:
+            raise ExportError(
+                f"cannot scan source directory {directory}: {error}"
+            ) from error
+        for entry in entry_list:
+            entry_path = Path(entry.path)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ExportError(
+                    f"cannot scan source directory {directory}: "
+                    f"cannot stat {entry_path}: {error}"
+                ) from error
+            if stat.S_ISLNK(entry_stat.st_mode):
+                continue
+            if stat.S_ISDIR(entry_stat.st_mode):
+                visit(entry_path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                digest = _hash_file(entry_path)
+                rel = entry_path.relative_to(root).as_posix()
+                if digest not in relative or rel < relative[digest]:
+                    relative[digest] = rel
+                    index[digest] = entry_path
+            # Anything else (devices, sockets, ...) is skipped.
+
+    visit(root)
+    return index
+
+
+def _hash_file(path: Path) -> str:
+    """Full SHA-256 of a regular file; any read failure aborts the export."""
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except OSError as error:
+        raise ExportError(
+            f"cannot read file {path} under source directory: {error}"
+        ) from error
+    return hasher.hexdigest()
 
 
 def _build_classes(members: list[dict[str, Any]]) -> dict[str, str]:
@@ -292,7 +392,7 @@ def _directory_entries(classes: dict[str, str]) -> set[str]:
 def _write_sample(
     archive: zipfile.ZipFile, arc_name: str, member: dict[str, Any]
 ) -> None:
-    source = Path(member["source"])
+    source = Path(member.get("read_from") or member["source"])
     digest = member["sha256"]
     try:
         stat_result = os.stat(source)
