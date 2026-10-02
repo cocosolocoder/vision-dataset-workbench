@@ -17,6 +17,55 @@ python3 -m vision_workbench summary ./workspace
 
 The manifest is written to `.vision-workbench/manifest.json`. Importing the same file twice is idempotent because records are keyed by the file content hash. Imports, batch writes, undos and plan creation are serialized by a single workspace lock and committed through the same write-ahead journal, so several local processes can operate on one workspace at once: every successful operation survives, concurrent imports of different content all land, and duplicate imports report `already present` once while keeping the first registration's source and label.
 
+## Importing a whole directory
+
+A directory import registers many image files at once and optionally gives
+every newly added sample the same label:
+
+```bash
+python3 -m vision_workbench import-dir ./workspace ./examples --label cat
+python3 -m vision_workbench import-dir ./workspace ./examples --recursive
+python3 -m vision_workbench add-dir ./workspace ./examples   # equivalent alias
+```
+
+- Only the source directory's own layer is scanned by default; `--recursive`
+  (`-r`) also descends into subdirectories. Symbolic links are never
+  imported and symlinked directories are never entered, even recursively.
+- Candidates are ordinary files whose extension is `.jpg`, `.jpeg`,
+  `.png`, `.bmp`, `.gif` or `.webp` (case insensitive). Other entry types
+  and any other extension are ignored.
+- Candidates are ordered by their path relative to the source directory,
+  always using `/` as the separator, compared by Unicode code point. Files
+  that appear after the scan has finished are picked up by a later import.
+- Samples are still identified by their full SHA-256 digest. Identical
+  content in several candidates registers only once, using the
+  earliest-sorted candidate as its source and reporting the rest as
+  duplicates; any digest already present in the workspace is likewise
+  reported as a duplicate and keeps its original source, label and undo
+  eligibility. The `--label` applies only to genuinely new samples and can
+  never overwrite an existing record.
+- With no `--label`, or with `--label ""`, new samples stay unlabeled; any
+  other label text is kept verbatim.
+- The new samples take effect as one batch. A source that is missing or
+  not a directory, a directory that cannot be scanned, a candidate that
+  cannot be fully read, or a candidate whose identity, size or
+  modification time changes while it is read fails the entire import: the
+  error names the path and reason, and no sample from that import is
+  registered. After an interruption the workspace shows either the state
+  before the import or the fully imported state, and re-submitting the
+  same directory never creates duplicate records.
+- On success the command prints JSON with the candidate count, the number
+  added and the number of duplicates, followed by every candidate in scan
+  order with its relative path, full digest and `added`/`duplicate`
+  status. An empty directory and an all-duplicate directory both succeed
+  with zero additions. Directory imports serialize against single-file
+  imports, batch label updates and undos through the same lock and
+  journal, so concurrent successful operations all survive and duplicate
+  decisions reflect the workspace state at commit time; summaries and
+  split-plan creation observe either the whole pre-import or whole
+  post-import sample set.
+
+
 ## Split plans
 
 A split plan divides every sample currently in the manifest into a

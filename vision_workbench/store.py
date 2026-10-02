@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,11 +41,29 @@ LOCK_NAME = ".lock"
 TRANSACTION_NAME = ".txn.json"
 SPLIT_SCHEMA_VERSION = 1
 
+# Ordinary image files accepted by a directory import; compared case
+# insensitively against the final path suffix.
+IMAGE_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+)
+# Identity fields checked before and after reading so a file that is
+# replaced, truncated or touched mid-scan fails the whole import.
+_FILE_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+
 
 @dataclass(frozen=True)
 class ImportResult:
     digest: str
     added: bool
+
+
+@dataclass(frozen=True)
+class DirectoryCandidate:
+    """One scanned image file: its source path and ``/``-separated relative
+    path as presented in the import result."""
+
+    path: Path
+    relative: str
 
 
 @dataclass(frozen=True)
@@ -105,6 +124,232 @@ class DatasetStore:
             # crash-safe and cannot clobber a batch committed concurrently.
             self._commit(manifest, self._read_history())
             return ImportResult(digest=digest, added=True)
+
+    def import_directory(
+        self,
+        source: Path,
+        label: str | None = None,
+        *,
+        recursive: bool = False,
+    ) -> dict[str, Any]:
+        """Register every image file in ``source`` in one atomic batch.
+
+        Only regular, non-symlink entries with an image extension
+        (``.jpg``/``.jpeg``/``.png``/``.bmp``/``.gif``/``.webp``, case
+        insensitive) are candidates; symlink directories are never entered
+        and recursion is opt-in. Candidates are sorted by their ``/``-joined
+        path relative to ``source`` using Unicode code points, so the order
+        is stable and independent of the local directory order.
+
+        Files appearing after the scan completes are left for a later
+        import. Several candidates with identical content register once,
+        sourced from the earliest candidate; every other candidate reports
+        as a duplicate, as do candidates whose digest is already in the
+        workspace. The given label applies only to genuinely new samples;
+        it never overrides an existing record. ``None`` and ``""`` both
+        mean unlabeled.
+
+        The new samples commit together through the write-ahead journal:
+        a missing/non-directory source, an unscannable directory, an
+        unreadable candidate or a file whose identity, size or modification
+        time changes while being read fails the whole import without
+        touching the manifest or history.
+        """
+        normalized_label = normalize_label(label)
+        source_root = Path(source)
+        self._validate_source_directory(source_root)
+        candidates = self._scan_candidates(source_root, recursive=recursive)
+
+        # Hashing is pure I/O on the source tree; do it before taking the
+        # workspace lock, exactly like a single-file add, so concurrent
+        # imports hash in parallel. Reading each candidate is bracketed by
+        # identity/size/mtime checks, so a changed file fails the batch
+        # before anything could be committed.
+        scanned: list[dict[str, Any]] = []
+        for candidate in candidates:
+            digest, size, file_path = self._read_candidate(candidate)
+            scanned.append(
+                {
+                    "relative": candidate.relative,
+                    "path": file_path,
+                    "digest": digest,
+                    "size": size,
+                }
+            )
+
+        self.initialize()
+        with self._locked(create=True):
+            # Duplicate decisions are made against the workspace state at
+            # the moment the batch takes effect, so concurrent commits are
+            # never clobbered and never double-registered.
+            manifest = self._read()
+            known = {item["sha256"] for item in manifest["items"]}
+
+            outcomes: list[dict[str, Any]] = []
+            chosen: dict[str, dict[str, Any]] = {}
+            batch_digests: set[str] = set()
+            for entry in scanned:
+                digest = entry["digest"]
+                if digest in known or digest in batch_digests:
+                    status = "duplicate"
+                else:
+                    status = "added"
+                    batch_digests.add(digest)
+                    chosen[digest] = entry
+                outcomes.append(
+                    {
+                        "path": entry["relative"],
+                        "sha256": digest,
+                        "status": status,
+                    }
+                )
+
+            for digest in sorted(chosen):
+                entry = chosen[digest]
+                manifest["items"].append(
+                    {
+                        "sha256": digest,
+                        "source": str(entry["path"]),
+                        "size": entry["size"],
+                        "label": normalized_label,
+                    }
+                )
+            manifest["items"].sort(key=lambda item: item["sha256"])
+
+            # One journal commit installs the whole set together; on
+            # interruption recovery shows either the old manifest or the
+            # complete new one, never a partial import.
+            if chosen:
+                self._commit(manifest, self._read_history())
+
+        added = sum(1 for outcome in outcomes if outcome["status"] == "added")
+        return {
+            "candidates": len(outcomes),
+            "added": added,
+            "duplicates": len(outcomes) - added,
+            "results": outcomes,
+        }
+
+    # Backwards-friendly alias mirroring the single-file ``add`` name.
+    def add_directory(
+        self,
+        source: Path,
+        label: str | None = None,
+        *,
+        recursive: bool = False,
+    ) -> dict[str, Any]:
+        return self.import_directory(source, label, recursive=recursive)
+
+    @staticmethod
+    def _validate_source_directory(source: Path) -> None:
+        try:
+            stat_result = source.stat()
+        except OSError as error:
+            raise ValueError(f"source directory cannot be accessed: {source}: {error}") from error
+        if not stat.S_ISDIR(stat_result.st_mode):
+            raise ValueError(f"source is not a directory: {source}")
+
+    @staticmethod
+    def _scan_candidates(source: Path, *, recursive: bool) -> list[DirectoryCandidate]:
+        """Return all importable files under ``source`` in display order.
+
+        Only the source layer is read by default; ``recursive`` also
+        descends into real subdirectories but never into symlinked ones.
+        Symlinks and other non-regular entries are skipped, including
+        image-named symlinks.
+        """
+        found: list[DirectoryCandidate] = []
+
+        def visit(directory: Path, prefix: str) -> None:
+            try:
+                with os.scandir(directory) as entries:
+                    current = list(entries)
+            except OSError as error:
+                raise ValueError(
+                    f"source directory cannot be scanned: {directory}: {error}"
+                ) from error
+            for entry in current:
+                relative = (
+                    entry.name if not prefix else f"{prefix}/{entry.name}"
+                )
+                try:
+                    is_symlink = entry.is_symlink()
+                except OSError as error:
+                    raise ValueError(
+                        f"source entry cannot be inspected: {directory / entry.name}: {error}"
+                    ) from error
+                if is_symlink:
+                    continue
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError as error:
+                    raise ValueError(
+                        f"source entry cannot be inspected: {directory / entry.name}: {error}"
+                    ) from error
+                if is_directory:
+                    if recursive:
+                        visit(Path(entry.path), relative)
+                    continue
+                if is_file and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                    found.append(
+                        DirectoryCandidate(
+                            path=Path(entry.path), relative=relative
+                        )
+                    )
+
+        visit(source, "")
+        found.sort(key=lambda candidate: candidate.relative)
+        return found
+
+    @staticmethod
+    def _read_candidate(candidate: DirectoryCandidate) -> tuple[str, int, Path]:
+        """Hash one candidate, failing unless it stays identical across the read.
+
+        Returns ``(digest, size, resolved path)``. A non-regular entry, an
+        unreadable file, or any change in device/inode/size/mtime between
+        the pre-read and post-read stat raises, which aborts the whole
+        import.
+        """
+        path = candidate.path
+        try:
+            # lstat (not stat): a regular file swapped for a symlink while
+            # the batch runs must abort rather than silently read through
+            # the link.
+            before = path.lstat()
+        except OSError as error:
+            raise ValueError(
+                f"candidate cannot be read: {candidate.relative}: {error}"
+            ) from error
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(
+                f"candidate is not a regular file: {candidate.relative}"
+            )
+
+        hasher = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+        except OSError as error:
+            raise ValueError(
+                f"candidate cannot be read: {candidate.relative}: {error}"
+            ) from error
+
+        try:
+            after = path.lstat()
+        except OSError as error:
+            raise ValueError(
+                f"candidate changed during import: {candidate.relative}: {error}"
+            ) from error
+        changed = tuple(getattr(after, field) for field in _FILE_IDENTITY_FIELDS)
+        expected = tuple(getattr(before, field) for field in _FILE_IDENTITY_FIELDS)
+        if changed != expected:
+            raise ValueError(
+                f"candidate changed during import: {candidate.relative}: "
+                "file identity, size or modification time differs"
+            )
+        return hasher.hexdigest(), before.st_size, path.resolve()
 
     def summary(self) -> dict[str, Any]:
         self.initialize()
