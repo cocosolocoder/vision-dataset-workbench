@@ -121,6 +121,28 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
 - Source files are streamed and verified against the saved content digest
   while copying: a missing, non-regular, unreadable or changed source
   fails the whole export with the sample digest and reason.
+- `--source-dir` reads sample files from a directory tree instead of the
+  recorded source paths, which is useful after moving the dataset:
+  ```bash
+  python3 -m vision_workbench export ./workspace baseline ./baseline.zip \
+      --source-dir ./moved-dataset
+  ```
+  Every regular file under the directory and its subdirectories is
+  considered (no extension filter, since files may have been renamed);
+  symlinks and other non-regular entries are skipped and symlinked
+  directories are never descended. Each exported sample must be matched
+  to a file whose full SHA-256 matches the plan — a same-named file with
+  different content does not qualify. When several files share content,
+  the one whose `/`-separated relative path sorts first by Unicode code
+  point is used. Files unrelated to the plan are read (an unreadable file
+  anywhere fails the export) but never included. The plan still decides
+  sample identities, labels, set assignments and package file extensions;
+  the lookup is used for this export only and is never written back. A
+  missing or non-directory source, an unreadable directory or file, or a
+  sample with no matching content fails the whole export with the path
+  and reason; the package is byte-identical to a normal export of the
+  same plan, options and content. For an empty plan (or when every sample
+  is skipped) the directory only has to exist and be a directory.
 - The target must not already exist; it is written atomically, so a failure
   or interruption leaves no incomplete file. Concurrent exports to the
   same path are serialized and at most one succeeds.

@@ -10,6 +10,16 @@ labels, set assignments and recorded source paths.  Later imports, label
 changes or undos never affect an exported package, and exporting never
 writes to the workspace.
 
+When ``source_dir`` is given, files are read from that directory tree
+instead of the recorded source paths: every regular file under the
+directory (no extension filter; symlinks and other non-regular entries
+are skipped and symlinked directories are never descended) is read in
+full and identified by content digest, and each exported sample is
+matched to a file whose full SHA-256 matches the plan.  The new
+directory only changes where bytes are read from; sample identities,
+labels, set assignments and package file extensions remain the plan's.
+The lookup is used for this one export only and is never written back.
+
 ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
 source modification times are never consulted.
@@ -51,6 +61,7 @@ def export_split(
     plan_name: str,
     target: Path,
     skip_unlabeled: bool = False,
+    source_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Export a saved split plan to a new ZIP at ``target``.
 
@@ -58,6 +69,14 @@ def export_split(
     actually exported, the class distribution per set and the per-set skip
     counts.  Raises :class:`ExportError` (a ``ValueError``) on any failure;
     the target path is never created in that case.
+
+    When ``source_dir`` is given, sample bytes are read from that directory
+    tree instead of the plan's recorded source paths: the directory is
+    walked (regular files only, no extension filter, never through
+    symlinks), every regular file is hashed in full, and each exported
+    sample is matched to a file with the same full SHA-256 digest.  The
+    plan still decides identities, labels, set assignments and package
+    file extensions; the lookup is used for this export only.
     """
     plan = store.get_split(plan_name)
     members = _collect_members(plan)
@@ -79,7 +98,27 @@ def export_split(
     manifest = _build_manifest(plan, classes, exported, skipped_counts)
     distributions = _distributions(exported)
 
-    _write_package(target, classes, exported, manifest)
+    resolver = None
+    if source_dir is not None:
+        source_dir = Path(source_dir)
+        if not source_dir.exists():
+            raise ExportError(f"source directory does not exist: {source_dir}")
+        if not source_dir.is_dir():
+            raise ExportError(f"source is not a directory: {source_dir}")
+        # An empty plan (or every sample skipped) needs no files at all;
+        # the directory still has to exist and be one.
+        if exported:
+            resolver = _scan_source_directory(source_dir.resolve())
+            for member in exported:
+                if member["sha256"] not in resolver:
+                    raise ExportError(
+                        f"sample {member['sha256']} in set {member['set']}: "
+                        f"no file with matching content (full SHA-256 "
+                        f"{member['sha256']}) found under source directory "
+                        f"{source_dir}"
+                    )
+
+    _write_package(target, classes, exported, manifest, resolver)
 
     return {
         "plan": plan["name"],
@@ -202,11 +241,101 @@ def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return result
 
 
+# A resolver maps a full SHA-256 digest to the absolute path of the
+# sorted-first regular file carrying that content, plus the file's
+# identity (device, inode) captured during the lookup so a swap before
+# the copy is detected.
+Resolver = dict[str, tuple[Path, int, int]]
+
+
+def _scan_source_directory(root: Path) -> Resolver:
+    """Walk ``root`` and map every digest to the sorted-first copy.
+
+    The directory and all its subdirectories are searched for regular
+    files only: there is no extension filter, symlinks and other
+    non-regular entries are skipped, and recursion never descends through
+    symlinked directories.  Every regular file found is read in full and
+    identified by its content digest; when several files share content,
+    the one whose slash-separated path relative to ``root`` sorts first
+    by Unicode code point owns the digest.  A directory that cannot be
+    scanned, an entry that cannot be inspected or a file that cannot be
+    read in full fails the export with the path and reason.
+    """
+    found: dict[str, tuple[str, Path, int, int]] = {}
+
+    def walk(directory: Path) -> None:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise ExportError(f"cannot scan directory {directory}: {error}") from error
+        for entry in entries:
+            try:
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError as error:
+                raise ExportError(
+                    f"cannot inspect entry {entry.path}: {error}"
+                ) from error
+            if is_file:
+                rel = os.path.relpath(entry.path, root).replace(os.sep, "/")
+                digest, device, inode = _hash_regular_file(Path(entry.path))
+                current = found.get(digest)
+                if current is None or rel < current[0]:
+                    found[digest] = (rel, Path(entry.path), device, inode)
+            else:
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError as error:
+                    raise ExportError(
+                        f"cannot inspect entry {entry.path}: {error}"
+                    ) from error
+                if is_dir:
+                    walk(Path(entry.path))
+
+    walk(root)
+    return {
+        digest: (path, device, inode)
+        for digest, (_, path, device, inode) in found.items()
+    }
+
+
+def _hash_regular_file(path: Path) -> tuple[str, int, int]:
+    """Read one file in full, returning ``(digest, device, inode)``.
+
+    The bytes are read with ``O_NOFOLLOW`` so a symlink swapped in after
+    the lookup cannot redirect the read; any failure raises with the path
+    and reason.
+    """
+    try:
+        stat_result = os.lstat(path)
+    except OSError as error:
+        raise ExportError(f"cannot read source file {path}: {error}") from error
+    if not stat.S_ISREG(stat_result.st_mode):
+        raise ExportError(f"cannot read source file {path}: not a regular file")
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as error:
+        raise ExportError(f"cannot read source file {path}: {error}") from error
+    try:
+        hasher = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as stream:
+            while True:
+                chunk = stream.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except OSError as error:
+        raise ExportError(f"cannot read source file {path}: {error}") from error
+    return hasher.hexdigest(), stat_result.st_dev, stat_result.st_ino
+
+
 def _write_package(
     target: Path,
     classes: dict[str, str],
     members: list[dict[str, Any]],
     manifest: dict[str, Any],
+    resolver: dict[str, tuple[Path, int, int]] | None = None,
 ) -> None:
     """Write the ZIP atomically: lock the target name, stream to a temp file.
 
@@ -241,7 +370,7 @@ def _write_package(
         temp_path = Path(temp_name)
         try:
             with os.fdopen(fd, "wb") as stream:
-                _write_zip(stream, classes, members, manifest)
+                _write_zip(stream, classes, members, manifest, resolver)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp_path, target)
@@ -265,6 +394,7 @@ def _write_zip(
     classes: dict[str, str],
     members: list[dict[str, Any]],
     manifest: dict[str, Any],
+    resolver: Resolver | None = None,
 ) -> None:
     """Stream the package into ``stream`` without holding media in memory."""
     directory_entries = _directory_entries(classes)
@@ -277,7 +407,7 @@ def _write_zip(
         for name in sorted(directory_entries):
             archive.writestr(_directory_info(name), b"")
         for arc_name, member in file_entries:
-            _write_sample(archive, arc_name, member)
+            _write_sample(archive, arc_name, member, resolver)
         archive.writestr(_file_info("manifest.json"), _manifest_bytes(manifest))
 
 
@@ -290,16 +420,41 @@ def _directory_entries(classes: dict[str, str]) -> set[str]:
 
 
 def _write_sample(
-    archive: zipfile.ZipFile, arc_name: str, member: dict[str, Any]
+    archive: zipfile.ZipFile,
+    arc_name: str,
+    member: dict[str, Any],
+    resolver: Resolver | None = None,
 ) -> None:
-    source = Path(member["source"])
     digest = member["sha256"]
+    if resolver is not None:
+        # Source-directory export: read from the matched copy only.  The
+        # plan's recorded source path is deliberately not consulted, so a
+        # still-usable original location cannot paper over a missing
+        # match.  The identity captured at lookup time detects a swap
+        # before the copy starts.
+        try:
+            source, expected_device, expected_inode = resolver[digest]
+        except KeyError:
+            raise ExportError(
+                f"sample {digest} in set {member['set']}: no file with "
+                f"matching content found under the source directory"
+            ) from None
+    else:
+        source = Path(member["source"])
+        expected_device = None
+        expected_inode = None
     try:
         stat_result = os.stat(source)
     except OSError as error:
         raise ExportError(f"sample {digest}: cannot stat source file {source}: {error}") from error
     if not stat.S_ISREG(stat_result.st_mode):
         raise ExportError(f"sample {digest}: source is not a regular file: {source}")
+    if expected_device is not None and (
+        stat_result.st_dev != expected_device or stat_result.st_ino != expected_inode
+    ):
+        raise ExportError(
+            f"sample {digest}: source file was replaced after lookup: {source}"
+        )
 
     info = _file_info(arc_name)
     hasher = hashlib.sha256()

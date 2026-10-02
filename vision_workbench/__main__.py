@@ -86,6 +86,15 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip samples with no label instead of rejecting the whole export",
     )
+    export.add_argument(
+        "--source-dir",
+        type=Path,
+        help=(
+            "read sample files from this directory tree instead of the "
+            "recorded source paths; every regular file is matched by "
+            "content digest, ignoring file names and extensions"
+        ),
+    )
 
     demo = commands.add_parser("demo", help="show a read-only product demonstration")
     demo.add_argument("--workspace", type=Path, default=Path("."))
@@ -148,6 +157,7 @@ def main() -> int:
                 args.plan,
                 args.target,
                 skip_unlabeled=args.skip_unlabeled,
+                source_dir=args.source_dir,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
