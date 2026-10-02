@@ -20,6 +20,22 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("source", type=Path)
     add.add_argument("--label")
 
+    import_directory = commands.add_parser(
+        "import-dir",
+        aliases=["import"],
+        help="import all image files in a source directory in one batch",
+    )
+    import_directory.add_argument("workspace", type=Path)
+    import_directory.add_argument("source", type=Path, help="source directory")
+    import_directory.add_argument(
+        "--label", help="label applied to the newly imported samples"
+    )
+    import_directory.add_argument(
+        "--recursive",
+        action="store_true",
+        help="also import images in subdirectories (never through symlinks)",
+    )
+
     summary = commands.add_parser("summary", help="show dataset statistics")
     summary.add_argument("workspace", type=Path)
 
@@ -89,6 +105,11 @@ def main() -> int:
             result = store.add(args.source, args.label)
             status = "added" if result.added else "already present"
             print(f"{status}: {result.digest}")
+        elif args.command in ("import-dir", "import"):
+            result = store.import_directory(
+                args.source, args.label, args.recursive
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.command == "summary":
             print(json.dumps(store.summary(), ensure_ascii=False, sort_keys=True))
         elif args.command == "label":

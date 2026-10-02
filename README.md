@@ -17,6 +17,46 @@ python3 -m vision_workbench summary ./workspace
 
 The manifest is written to `.vision-workbench/manifest.json`. Importing the same file twice is idempotent because records are keyed by the file content hash. Imports, batch writes, undos and plan creation are serialized by a single workspace lock and committed through the same write-ahead journal, so several local processes can operate on one workspace at once: every successful operation survives, concurrent imports of different content all land, and duplicate imports report `already present` once while keeping the first registration's source and label.
 
+## Importing a directory
+
+A whole directory of images can be registered in one batch:
+
+```bash
+python3 -m vision_workbench import-dir ./workspace ./examples --label cat
+python3 -m vision_workbench import-dir ./workspace ./examples --recursive
+```
+
+(The shorter `import` alias is equivalent.)
+
+- Only regular files with an extension of `.jpg`, `.jpeg`, `.png`, `.bmp`,
+  `.gif` or `.webp` (matched case-insensitively) are candidates. Symlinks
+  and other entry types never qualify; recursion stays on the top level
+  unless `--recursive` is given and never descends through symlinked
+  directories. Files that appear after the scan are left for the next
+  import.
+- Candidates are ordered by their path relative to the source directory,
+  with `/` separators, compared by Unicode code point.
+- Samples are identified by their full SHA-256 digest. When several
+  candidates share content that the workspace does not yet know, only the
+  sorted-first candidate is added; the rest report `duplicate`. Digests
+  already in the workspace always report `duplicate` and keep their
+  original source, label and revision history — the batch label never
+  overwrites an existing record.
+- `--label` applies only to genuinely new samples. Omitting it leaves
+  them unlabeled; the empty string also means unlabeled; any other string
+  is kept literally.
+- The result is JSON: the candidate count, the number added, the number
+  of duplicates, and every candidate's relative path, full digest and
+  `added`/`duplicate` status in scan order. Empty directories and
+  all-duplicate imports succeed with zero added.
+- The batch is all-or-nothing: a missing or non-directory source, a
+  directory that cannot be scanned, a candidate that cannot be read in
+  full, or a candidate whose identity, size or modification time changes
+  while it is read fails the whole import with the path and reason and
+  leaves no new samples. The batch commits through the same journal as
+  single-file imports, so an interruption shows either the old state or
+  the complete batch, and concurrent label batches are never lost.
+
 ## Split plans
 
 A split plan divides every sample currently in the manifest into a

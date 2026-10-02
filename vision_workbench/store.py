@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,6 +40,9 @@ BATCHES_NAME = "batches.json"
 LOCK_NAME = ".lock"
 TRANSACTION_NAME = ".txn.json"
 SPLIT_SCHEMA_VERSION = 1
+
+# Image extensions accepted by whole-directory import, matched case-insensitively.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,180 @@ class DatasetStore:
             # crash-safe and cannot clobber a batch committed concurrently.
             self._commit(manifest, self._read_history())
             return ImportResult(digest=digest, added=True)
+
+    def import_directory(
+        self, source: Path, label: str | None = None, recursive: bool = False
+    ) -> dict[str, Any]:
+        """Import every accepted image file under a source directory at once.
+
+        Candidates are regular files (never symlinks or other entry types)
+        whose lower-cased extension is one of :data:`IMAGE_EXTENSIONS`;
+        recursion stays on the top level unless ``recursive`` is set and
+        never descends through symlinked directories.  They are ordered by
+        path relative to the source directory, with ``/`` separators,
+        compared by Unicode code point.
+
+        Every candidate is read in full and identified by its full
+        SHA-256 digest.  A digest already in the workspace, or first seen
+        on an earlier candidate in this same import, is reported as a
+        duplicate: the earliest sorted candidate owns the registration and
+        later paths never overwrite its source or label.  The supplied
+        label is attached only to genuinely new samples; ``None`` and the
+        empty string both mean unlabeled.
+
+        The whole batch commits as one journal transaction.  The import
+        fails entirely (no new samples) when the source is missing or not
+        a directory, a directory that should be visited cannot be scanned,
+        a candidate cannot be read in full, or a candidate's identity,
+        size or modification time changes while it is being read.
+        """
+        self.initialize()
+        source_path = Path(source)
+        if not source_path.exists():
+            raise ValueError(f"source directory does not exist: {source}")
+        if not source_path.is_dir():
+            raise ValueError(f"source is not a directory: {source}")
+        root = source_path.resolve()
+
+        rel_paths = self._scan_image_files(root, recursive)
+        # Read (and re-stat) every candidate before taking the workspace
+        # lock: I/O overlaps with peers, and a file that changes mid-read
+        # fails the whole batch before anything is committed.
+        candidates = [
+            self._read_candidate(root / rel_path, rel_path) for rel_path in rel_paths
+        ]
+
+        with self._locked(create=True):
+            manifest = self._read()
+            history = self._read_history()
+            known = {item["sha256"] for item in manifest["items"]}
+
+            results: list[dict[str, Any]] = []
+            new_items: list[dict[str, Any]] = []
+            for rel_path, abs_path, digest, size in candidates:
+                if digest in known:
+                    status = "duplicate"
+                else:
+                    status = "added"
+                    known.add(digest)
+                    new_items.append(
+                        {
+                            "sha256": digest,
+                            "source": str(abs_path.resolve()),
+                            "size": size,
+                            "label": label,
+                        }
+                    )
+                results.append(
+                    {"path": rel_path, "sha256": digest, "status": status}
+                )
+
+            if new_items:
+                manifest["items"].extend(new_items)
+                manifest["items"].sort(key=lambda item: item["sha256"])
+                # One journal commit for the whole batch: an interruption
+                # leaves either the old state or every new sample together.
+                self._commit(manifest, history)
+
+        added = sum(1 for result in results if result["status"] == "added")
+        duplicates = len(results) - added
+        return {
+            "directory": str(root),
+            "recursive": recursive,
+            "label": label,
+            "candidate_count": len(results),
+            "added": added,
+            "duplicates": duplicates,
+            "candidates": results,
+        }
+
+    def _scan_image_files(self, root: Path, recursive: bool) -> list[str]:
+        """Return accepted files as ``/``-separated paths relative to root.
+
+        Only real regular files qualify; symlinks and other entry types are
+        skipped, and recursion never follows symlinked directories.  Any
+        directory that should be visited but cannot be scanned fails the
+        whole import with the path and reason.
+        """
+        rel_paths: list[str] = []
+
+        def walk(directory: Path) -> None:
+            try:
+                entries = list(os.scandir(directory))
+            except OSError as error:
+                raise ValueError(
+                    f"cannot scan directory {directory}: {error}"
+                ) from error
+            for entry in entries:
+                try:
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError as error:
+                    raise ValueError(
+                        f"cannot inspect entry {entry.path}: {error}"
+                    ) from error
+                if is_file:
+                    if Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
+                        rel_paths.append(
+                            os.path.relpath(entry.path, root).replace(os.sep, "/")
+                        )
+                elif recursive:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError as error:
+                        raise ValueError(
+                            f"cannot inspect entry {entry.path}: {error}"
+                        ) from error
+                    if is_dir:
+                        walk(Path(entry.path))
+
+        walk(root)
+        # Unicode code point order on the slash-separated relative path.
+        rel_paths.sort()
+        return rel_paths
+
+    def _read_candidate(
+        self, path: Path, rel_path: str
+    ) -> tuple[str, Path, str, int]:
+        """Read one candidate in full, verifying identity/size/mtime around it.
+
+        Returns ``(rel_path, absolute_path, digest, size)``.  A mismatch or
+        read failure raises before the batch is committed.
+        """
+        try:
+            before = os.lstat(path)
+        except OSError as error:
+            raise ValueError(f"cannot read {rel_path}: {error}") from error
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"cannot read {rel_path}: not a regular file")
+        try:
+            # O_NOFOLLOW guarantees the bytes come from the inode just
+            # lstat()ed, even if the path is swapped for a symlink meanwhile.
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except OSError as error:
+            raise ValueError(f"cannot read {rel_path}: {error}") from error
+        try:
+            hasher = hashlib.sha256()
+            with os.fdopen(descriptor, "rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+        except OSError as error:
+            raise ValueError(f"cannot read {rel_path}: {error}") from error
+        try:
+            after = os.lstat(path)
+        except OSError as error:
+            raise ValueError(f"cannot read {rel_path}: {error}") from error
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError(
+                f"file changed during import: {rel_path} "
+                "(identity, size or modification time changed)"
+            )
+        return rel_path, path, hasher.hexdigest(), before.st_size
 
     def summary(self) -> dict[str, Any]:
         self.initialize()
