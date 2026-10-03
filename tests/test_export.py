@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -300,6 +302,91 @@ class DeterminismTest(ExportHarness):
         self.assertEqual(
             sorted(p.name for p in self.store.splits_directory.iterdir()), plans_before
         )
+
+
+class LargeSampleExportTest(ExportHarness):
+    def write_large_sample(self, path: Path, size: int) -> str:
+        """Write ``size`` zero bytes, returning the content's SHA-256."""
+        hasher = hashlib.sha256()
+        chunk = b"\0" * (1024 * 1024)
+        with path.open("wb") as stream:
+            remaining = size
+            while remaining > 0:
+                piece = chunk[: min(len(chunk), remaining)]
+                stream.write(piece)
+                hasher.update(piece)
+                remaining -= len(piece)
+        return hasher.hexdigest()
+
+    def test_two_gib_sample_exports_complete_and_identical_across_sources(self) -> None:
+        # One byte past the classic ZIP limit: the entry needs ZIP64, while
+        # the highly compressible content keeps the package itself small.
+        size = zipfile.ZIP64_LIMIT + 1
+        big = self.root.parent / "big.jpg"
+        big_digest = self.write_large_sample(big, size)
+        small_digest = self.add_sample("cat", b"small")
+        add_result = self.store.add(big, "cat")
+        self.assertTrue(add_result.added)
+        self.assertEqual(add_result.digest, big_digest)
+        self.create_plan(ratios=["1", "0", "0"])
+
+        first = self.root.parent / "first.zip"
+        result = export_split(self.store, "baseline", first)
+        self.assertEqual(result["exported"], 2)
+        self.assertEqual(result["sets"]["train"]["samples"], 2)
+        self.assertEqual(result["sets"]["train"]["distribution"], {"cat": 2})
+
+        # Relocate every source and re-export by content lookup: the
+        # package bytes must not depend on where the content was read from.
+        moved = self.root.parent / "moved"
+        moved.mkdir()
+        for member in self.store.get_split("baseline")["sets"]["train"]["members"]:
+            source = Path(member["source"])
+            source.rename(moved / f"relocated-{source.name}")
+        second = self.root.parent / "second.zip"
+        export_split(self.store, "baseline", second, source_dir=moved)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+        with zipfile.ZipFile(first) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(len(manifest["samples"]), 2)
+            self.assertEqual(manifest["sets"]["train"]["samples"], 2)
+
+            entry = next(
+                s for s in manifest["samples"] if s["sha256"] == big_digest
+            )
+            self.assertEqual(entry["label"], "cat")
+            self.assertEqual(entry["set"], "train")
+            self.assertEqual(
+                entry["path"], f"train/class_01/{big_digest}.jpg"
+            )
+            info = archive.getinfo(entry["path"])
+            self.assertEqual(info.file_size, size)
+
+            # The entry really uses a ZIP64 local header: the classic
+            # 32-bit size fields carry the 0xFFFFFFFF marker.
+            with first.open("rb") as raw:
+                raw.seek(info.header_offset + 14)
+                _, compressed, uncompressed = struct.unpack("<LLL", raw.read(12))
+            self.assertEqual(compressed, 0xFFFFFFFF)
+            self.assertEqual(uncompressed, 0xFFFFFFFF)
+
+            # The extracted content matches the plan's full SHA-256,
+            # verified as a stream so the test never holds it in memory.
+            hasher = hashlib.sha256()
+            with archive.open(info) as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            self.assertEqual(hasher.hexdigest(), big_digest)
+
+            # The ordinary small sample in the same plan is intact.
+            small_entry = next(
+                s for s in manifest["samples"] if s["sha256"] == small_digest
+            )
+            self.assertEqual(archive.read(small_entry["path"]), b"small")
 
 
 class SourceFailureTest(ExportHarness):

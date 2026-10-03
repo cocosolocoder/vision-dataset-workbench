@@ -29,6 +29,12 @@ The lookup is used for this one export only and is never written back.
 ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
 source modification times are never consulted.
+
+A sample whose uncompressed size exceeds the classic ZIP limit is written
+with a ZIP64 local header so the package stays complete and extractable;
+the decision depends only on the source content's size, so identical
+content yields identical bytes, and smaller entries keep the plain header
+they always had.
 """
 
 from __future__ import annotations
@@ -473,7 +479,22 @@ def _write_sample(
                 f"sample {digest}: cannot read source file {source}: {error}"
             ) from error
     try:
-        with source_stream, archive.open(info, "w") as target_stream:
+        source_size = os.fstat(source_stream.fileno()).st_size
+    except OSError as error:
+        source_stream.close()
+        raise ExportError(
+            f"sample {digest}: cannot inspect source file {source}: {error}"
+        ) from error
+    # An entry whose uncompressed size exceeds the classic ZIP limit needs
+    # a ZIP64 local header; streaming writes cannot retro-fit one, so the
+    # opened file's size decides up front.  The size is a property of the
+    # content itself, keeping packages byte-identical across read
+    # locations, and smaller entries keep the plain header they always had.
+    force_zip64 = source_size > zipfile.ZIP64_LIMIT
+    try:
+        with source_stream, archive.open(
+            info, "w", force_zip64=force_zip64
+        ) as target_stream:
             while True:
                 chunk = source_stream.read(_CHUNK_SIZE)
                 if not chunk:
@@ -482,6 +503,12 @@ def _write_sample(
                 target_stream.write(chunk)
     except OSError as error:
         raise ExportError(f"sample {digest}: cannot read source file {source}: {error}") from error
+    except RuntimeError as error:
+        # zipfile raises RuntimeError when a streamed entry outgrows its
+        # header mid-copy (the source changed size after the fstat above).
+        raise ExportError(
+            f"sample {digest}: cannot archive source file {source}: {error}"
+        ) from error
 
     actual = hasher.hexdigest()
     if actual != digest:
