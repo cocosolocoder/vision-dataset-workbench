@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -43,6 +44,15 @@ SPLIT_SCHEMA_VERSION = 1
 
 # Image extensions accepted by whole-directory import, matched case-insensitively.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+# Flags for pinning a directory before scanning or reading through it:
+# O_DIRECTORY so only a real directory opens, O_NOFOLLOW so a symbolic
+# link swapped onto the path is refused instead of followed.
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 def _import_confirmation_error(
@@ -218,8 +228,11 @@ class DatasetStore:
         # fails the whole batch before anything is committed.  A confirmed
         # subdirectory swapped for a symlink is never read through: every
         # candidate's ancestor directories are re-checked before it is
-        # opened, and once more after all reads, so the link target's
-        # images cannot be imported or even reported as duplicates.
+        # opened, the open itself is pinned to the confirmed ancestor
+        # directories with O_NOFOLLOW descriptors, and the confirmed
+        # directories are checked once more after all reads, so the link
+        # target's images cannot be imported or even reported as
+        # duplicates.
         candidates = []
         for rel_path in rel_paths:
             ancestor = root
@@ -286,53 +299,119 @@ class DatasetStore:
         Only real regular files qualify; symlinks and other entry types are
         skipped, and recursion never follows symlinked directories.  Any
         directory that should be visited but cannot be scanned fails the
-        whole import with the path and reason.  A subdirectory is
-        re-checked with lstat() immediately before it is descended into,
-        and the confirmed list lets the caller re-verify it after the
-        candidate reads: a directory replaced by a symlink mid-import fails
-        the whole batch rather than following the link.
+        whole import with the path and reason.  Every confirmed
+        subdirectory is opened through its pinned parent directory with
+        ``O_DIRECTORY | O_NOFOLLOW`` and scanned through that descriptor,
+        so a subdirectory replaced by a symbolic link at any moment before
+        or during its scan fails the whole import instead of the link
+        target being scanned.  The confirmed list lets the caller
+        re-verify the directories once more after the candidate reads.
         """
         rel_paths: list[str] = []
         confirmed_dirs: list[Path] = []
 
-        def walk(directory: Path) -> None:
+        def classify(
+            directory: Path, fd_or_path: Any
+        ) -> list[tuple[str, bool, bool]]:
             try:
-                entries = list(os.scandir(directory))
+                entries = list(os.scandir(fd_or_path))
             except OSError as error:
                 raise ValueError(
                     f"cannot scan directory {directory}: {error}"
                 ) from error
+            found: list[tuple[str, bool, bool]] = []
             for entry in entries:
                 try:
                     is_file = entry.is_file(follow_symlinks=False)
+                    is_dir = (
+                        not is_file
+                        and recursive
+                        and entry.is_dir(follow_symlinks=False)
+                    )
                 except OSError as error:
                     raise ValueError(
-                        f"cannot inspect entry {entry.path}: {error}"
+                        f"cannot inspect entry {directory / entry.name}: {error}"
                     ) from error
+                found.append((entry.name, is_file, is_dir))
+            return found
+
+        def walk(
+            directory: Path,
+            rel_prefix: str,
+            parent_fd: int,
+            entries: list[tuple[str, bool, bool]],
+        ) -> None:
+            for name, is_file, is_dir in entries:
                 if is_file:
-                    if Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
-                        rel_paths.append(
-                            os.path.relpath(entry.path, root).replace(os.sep, "/")
-                        )
-                elif recursive:
+                    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                        rel_paths.append(rel_prefix + name)
+                elif is_dir:
+                    subdirectory = directory / name
+                    # Open the confirmed subdirectory through the pinned
+                    # parent with O_NOFOLLOW and scan the descriptor
+                    # itself: a symlink swapped onto the path by now fails
+                    # the whole import here, and the link target is never
+                    # scanned.
                     try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
+                        child_fd = self._open_real_directory(
+                            name, parent_fd, subdirectory
+                        )
                     except OSError as error:
                         raise ValueError(
-                            f"cannot inspect entry {entry.path}: {error}"
+                            f"cannot scan directory {subdirectory}: {error}"
                         ) from error
-                    if is_dir:
-                        subdirectory = Path(entry.path)
-                        # The entry may have been swapped for a symlink
-                        # since the check above; never descend through one.
-                        self._raise_if_now_symlink(subdirectory)
+                    try:
+                        child_entries = classify(subdirectory, child_fd)
                         confirmed_dirs.append(subdirectory)
-                        walk(subdirectory)
+                        walk(
+                            subdirectory,
+                            rel_prefix + name + "/",
+                            child_fd,
+                            child_entries,
+                        )
+                    finally:
+                        os.close(child_fd)
 
-        walk(root)
+        try:
+            root_fd = self._open_real_directory(str(root), None, root)
+        except OSError as error:
+            raise ValueError(f"cannot scan directory {root}: {error}") from error
+        try:
+            walk(root, "", root_fd, classify(root, root))
+        finally:
+            os.close(root_fd)
         # Unicode code point order on the slash-separated relative path.
         rel_paths.sort()
         return rel_paths, confirmed_dirs
+
+    @staticmethod
+    def _open_real_directory(name: str, dir_fd: int | None, path: Path) -> int:
+        """Open a confirmed directory, refusing a symlink swapped onto it.
+
+        The open uses ``O_DIRECTORY | O_NOFOLLOW`` — relative to the
+        pinned parent descriptor when ``dir_fd`` is given — so a symbolic
+        link (or any non-directory) that replaced the confirmed directory
+        is never descended through.  A symlink swap raises the import's
+        "directory changed" error naming the replaced path; any other
+        open failure propagates as the underlying :class:`OSError`.
+        """
+        try:
+            return os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=dir_fd)
+        except OSError as error:
+            # Linux reports a symlink opened with O_NOFOLLOW|O_DIRECTORY
+            # as ENOTDIR rather than ELOOP, so confirm via lstat() either
+            # way.
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                try:
+                    current = os.lstat(path)
+                except OSError:
+                    current = None
+                if current is not None and stat.S_ISLNK(current.st_mode):
+                    raise ValueError(
+                        f"directory changed during import: {path} "
+                        "is now a symbolic link"
+                    ) from error
+            raise
 
     @staticmethod
     def _raise_if_now_symlink(directory: Path) -> None:
@@ -360,12 +439,49 @@ class DatasetStore:
 
         Returns ``(rel_path, absolute_path, digest, size)``.  A mismatch or
         read failure raises before the batch is committed.
+
+        Every ancestor directory of the candidate is re-opened from the
+        source root with ``O_DIRECTORY | O_NOFOLLOW``, each relative to its
+        pinned parent, and the candidate itself is opened relative to its
+        pinned parent directory: a subdirectory replaced by a symbolic
+        link since the scan fails the whole import here, and the link
+        target's images are never opened — no matter when the swap lands.
         """
-        digest, size = self._read_stable(path, rel_path)
+        parts = Path(rel_path).parts
+        root = path
+        for _ in parts:
+            root = root.parent
+        try:
+            fd = self._open_real_directory(str(root), None, root)
+        except OSError as error:
+            raise ValueError(f"cannot read {rel_path}: {error}") from error
+        try:
+            ancestor = root
+            for part in parts[:-1]:
+                ancestor = ancestor / part
+                try:
+                    next_fd = self._open_real_directory(part, fd, ancestor)
+                except OSError as error:
+                    raise ValueError(
+                        f"cannot read {rel_path}: {error}"
+                    ) from error
+                os.close(fd)
+                fd = next_fd
+            digest, size = self._read_stable(
+                path, rel_path, dir_fd=fd, name=parts[-1]
+            )
+        finally:
+            os.close(fd)
         return rel_path, path, digest, size
 
     @staticmethod
-    def _read_stable(path: Path, display: str) -> tuple[str, int]:
+    def _read_stable(
+        path: Path,
+        display: str,
+        *,
+        dir_fd: int | None = None,
+        name: str | None = None,
+    ) -> tuple[str, int]:
         """Read one file in full and return ``(digest, size)`` for it.
 
         The digest and size are guaranteed to describe the same stable
@@ -384,9 +500,24 @@ class DatasetStore:
         and is shared with the source-directory export; only the
         post-read stability requirement and the import wording are
         specific to this entry point.
+
+        When ``dir_fd`` and ``name`` are given (whole-directory import),
+        the pre-open inspection and the post-read re-inspection stay on
+        the path, but the open itself is ``name`` relative to the pinned
+        parent directory descriptor: an ancestor directory replaced by a
+        symbolic link can never redirect the open into the link target.
         """
         try:
-            opened_file = confirmed.confirm_and_open_regular(path)
+            if dir_fd is None:
+                opened_file = confirmed.confirm_and_open_regular(path)
+            else:
+                confirmed_status = confirmed.inspect_regular(path)
+                descriptor = confirmed.open_without_follow(name, dir_fd=dir_fd)
+                opened_file = confirmed.ConfirmedOpen(
+                    descriptor,
+                    confirmed_status,
+                    confirmed.prove_opened_regular(descriptor, confirmed_status),
+                )
         except confirmed.ConfirmationError as failure:
             raise _import_confirmation_error(failure, display) from failure
         try:
