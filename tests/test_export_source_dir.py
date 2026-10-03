@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from vision_workbench.exporter import (
     ExportError,
@@ -17,6 +20,7 @@ from vision_workbench.exporter import (
     export_split,
 )
 from vision_workbench.store import DatasetStore
+import vision_workbench.exporter as exporter_mod
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -304,6 +308,203 @@ class SourceDirExportTest(SourceDirHarness):
             with self.assertRaises(ExportError) as caught:
                 _write_sample(archive, "train/class_01/x", member, resolver)
         self.assertIn("replaced after lookup", str(caught.exception))
+
+
+class ResolvedCopySwapTest(SourceDirHarness):
+    """The opened copy must be the regular file confirmed at lookup time.
+
+    These tests exercise the gap after the directory lookup has finished
+    and the selected copy is about to be opened: the selected path may be
+    occupied by a different regular file (even byte-identical) or by a
+    symlink before or while the actual open pins the confirmed inode.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.digest = self.add_sample("cat", b"abc")
+        self.create_plan()
+        self.moved = self.root.parent / "moved"
+        self.moved.mkdir()
+        self.selected = self.moved / "a.jpg"
+        self.selected.write_bytes(b"abc")
+        # A second same-content copy sorts after the selection, so it can
+        # never become the resolver's choice but is always available as a
+        # decoy that must not be used as a fallback.
+        self.other = self.moved / "b.jpg"
+        self.other.write_bytes(b"abc")
+        self.target = self.root.parent / "out.zip"
+
+    @contextmanager
+    def _post_scan_race(self, mutate, on_open: bool = False):
+        """Run ``mutate`` strictly after the directory lookup finishes.
+
+        With ``on_open`` False the mutation lands before the copy inspects
+        the selected path; with it True it lands inside the copy's open,
+        after the pre-open lstat has already passed.
+        """
+        real_scan = exporter_mod._scan_source_directory
+        state = {"scan_done": False, "fired": False}
+
+        def scan_wrapper(root):
+            resolver = real_scan(root)
+            state["scan_done"] = True
+            if not on_open:
+                state["fired"] = True
+                mutate()
+            return resolver
+
+        patches = [
+            patch.object(exporter_mod, "_scan_source_directory", side_effect=scan_wrapper)
+        ]
+        if on_open:
+            real_open = os.open
+
+            def racing_open(path, flags, *args, **kwargs):
+                if (
+                    state["scan_done"]
+                    and not state["fired"]
+                    and Path(os.fspath(path)) == self.selected
+                ):
+                    state["fired"] = True
+                    mutate()
+                return real_open(path, flags, *args, **kwargs)
+
+            patches.append(patch.object(exporter_mod.os, "open", side_effect=racing_open))
+        for patched in patches:
+            patched.start()
+        try:
+            yield state
+        finally:
+            for patched in patches:
+                patched.stop()
+
+    def _assert_failed_cleanly(self, caught: Exception) -> None:
+        message = str(caught.exception)
+        self.assertIn(self.digest, message)
+        self.assertIn(str(self.selected), message)
+        self.assertIn("replaced after lookup", message)
+        self.assertFalse(self.target.exists())
+
+    def _swap_identical_file(self) -> None:
+        replacement = self.moved / "swap.jpg"
+        replacement.write_bytes(b"abc")
+        os.replace(replacement, self.selected)
+
+    def test_identical_copy_replaced_before_open_fails(self) -> None:
+        with self._post_scan_race(self._swap_identical_file):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_failed_cleanly(caught)
+
+    def test_identical_copy_replaced_between_lstat_and_open_fails(self) -> None:
+        with self._post_scan_race(self._swap_identical_file, on_open=True):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_failed_cleanly(caught)
+
+    def test_symlink_before_open_fails_even_pointing_at_original(self) -> None:
+        original = self.moved / "original.jpg"
+        original.write_bytes(b"abc")
+
+        def make_symlink():
+            self.selected.unlink()
+            self.selected.symlink_to(original)
+
+        with self._post_scan_race(make_symlink):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_failed_cleanly(caught)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_symlink_between_lstat_and_open_fails_even_at_same_inode(self) -> None:
+        # The link target is the exact inode the lookup selected; the open
+        # must still refuse because the path itself became a symlink.
+        def make_symlink():
+            holder = self.moved / "holder.jpg"
+            os.link(self.selected, holder)  # hard link keeps the inode alive
+            self.selected.unlink()
+            self.selected.symlink_to(holder)
+
+        with self._post_scan_race(make_symlink, on_open=True):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_failed_cleanly(caught)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_symlink_to_other_same_content_copy_fails(self) -> None:
+        def make_symlink():
+            self.selected.unlink()
+            self.selected.symlink_to(self.other)
+
+        with self._post_scan_race(make_symlink, on_open=True):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_failed_cleanly(caught)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_no_fallback_to_other_copy_after_swap(self) -> None:
+        with self._post_scan_race(self._swap_identical_file):
+            with self.assertRaises(ExportError):
+                self.export(target=self.target, source_dir=self.moved)
+        # b.jpg still holds the matching content, but it must not be used.
+        self.assertFalse(self.target.exists())
+
+    def test_no_fallback_to_recorded_source_after_swap(self) -> None:
+        recorded = Path(
+            self.store.get_split("baseline")["sets"]["train"]["members"][0]["source"]
+        )
+        self.assertTrue(recorded.exists())  # the old recorded source still works
+        with self._post_scan_race(self._swap_identical_file):
+            with self.assertRaises(ExportError):
+                self.export(target=self.target, source_dir=self.moved)
+        self.assertFalse(self.target.exists())
+
+    def test_failure_leaves_workspace_plan_and_existing_target_untouched(self) -> None:
+        manifest_before = self.store.manifest_path.read_bytes()
+        plan_before = (self.store.splits_directory / "baseline.json").read_bytes()
+        existing = self.root.parent / "existing.zip"
+        existing.write_bytes(b"keep-me")
+        with self._post_scan_race(self._swap_identical_file):
+            with self.assertRaises(ExportError):
+                self.export(target=existing, source_dir=self.moved)
+        self.assertEqual(existing.read_bytes(), b"keep-me")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            (self.store.splits_directory / "baseline.json").read_bytes(), plan_before
+        )
+
+    def test_swap_after_open_still_reads_confirmed_inode(self) -> None:
+        # A replacement landing after the descriptor is open cannot change
+        # what is read: the descriptor pins the confirmed inode, so the
+        # export succeeds using the originally confirmed file.
+        replacement = self.moved / "swap.jpg"
+        replacement.write_bytes(b"abc")
+        real_fstat = os.fstat
+
+        def racing_fstat(descriptor, *args, **kwargs):
+            result = real_fstat(descriptor, *args, **kwargs)
+            if stat.S_ISREG(result.st_mode) and (result.st_dev, result.st_ino) == (
+                os.lstat(self.selected).st_dev,
+                os.lstat(self.selected).st_ino,
+            ):
+                if replacement.exists():
+                    os.replace(replacement, self.selected)
+            return result
+
+        with patch.object(exporter_mod.os, "fstat", side_effect=racing_fstat):
+            result, target = self.export(source_dir=self.moved)
+        self.assertEqual(result["exported"], 1)
+        with zipfile.ZipFile(target) as archive:
+            names = [n for n in archive.namelist() if n.endswith(".jpg")]
+            self.assertEqual(archive.read(names[0]), b"abc")
+
+    def test_no_swap_export_still_succeeds_byte_identically(self) -> None:
+        normal = self.root.parent / "normal.zip"
+        self.export(target=normal)
+        via_dir = self.root.parent / "via-dir.zip"
+        result, target = self.export(target=via_dir, source_dir=self.moved)
+        self.assertEqual(result["exported"], 1)
+        self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
 
 
 class SourceDirCliTest(SourceDirHarness):

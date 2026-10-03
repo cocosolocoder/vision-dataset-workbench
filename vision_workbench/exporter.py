@@ -15,7 +15,13 @@ instead of the recorded source paths: every regular file under the
 directory (no extension filter; symlinks and other non-regular entries
 are skipped and symlinked directories are never descended) is read in
 full and identified by content digest, and each exported sample is
-matched to a file whose full SHA-256 matches the plan.  The new
+matched to a file whose full SHA-256 matches the plan.  The selected
+copy is pinned through the open (lstat without symlink follow,
+``O_NOFOLLOW`` and an fstat of the descriptor), so the bytes read come
+from the exact regular file confirmed at lookup time; a replacement
+landing after the lookup — another regular file, even with identical
+content, or a symlink, even pointing at the original file — fails the
+export.  The new
 directory only changes where bytes are read from; sample identities,
 labels, set assignments and package file extensions remain the plan's.
 The lookup is used for this one export only and is never written back.
@@ -27,6 +33,7 @@ source modification times are never consulted.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -243,8 +250,10 @@ def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 # A resolver maps a full SHA-256 digest to the absolute path of the
 # sorted-first regular file carrying that content, plus the file's
-# identity (device, inode) captured during the lookup so a swap before
-# the copy is detected.
+# identity (device, inode) captured during the lookup.  The copy opens
+# that exact inode pinned through the open, so a swap after the lookup —
+# another regular file, even with identical content, or a symlink, even
+# one pointing at the original file — cannot be read in its place.
 Resolver = dict[str, tuple[Path, int, int]]
 
 
@@ -426,12 +435,15 @@ def _write_sample(
     resolver: Resolver | None = None,
 ) -> None:
     digest = member["sha256"]
+    info = _file_info(arc_name)
+    hasher = hashlib.sha256()
     if resolver is not None:
         # Source-directory export: read from the matched copy only.  The
         # plan's recorded source path is deliberately not consulted, so a
         # still-usable original location cannot paper over a missing
-        # match.  The identity captured at lookup time detects a swap
-        # before the copy starts.
+        # match.  The opened object is pinned to the regular inode
+        # confirmed at lookup time, so a swap after that confirmation
+        # cannot be copied in its place.
         try:
             source, expected_device, expected_inode = resolver[digest]
         except KeyError:
@@ -439,29 +451,27 @@ def _write_sample(
                 f"sample {digest} in set {member['set']}: no file with "
                 f"matching content found under the source directory"
             ) from None
+        source_stream = _open_resolved_source(
+            source, digest, expected_device, expected_inode
+        )
     else:
         source = Path(member["source"])
-        expected_device = None
-        expected_inode = None
-    try:
-        stat_result = os.stat(source)
-    except OSError as error:
-        raise ExportError(f"sample {digest}: cannot stat source file {source}: {error}") from error
-    if not stat.S_ISREG(stat_result.st_mode):
-        raise ExportError(f"sample {digest}: source is not a regular file: {source}")
-    if expected_device is not None and (
-        stat_result.st_dev != expected_device or stat_result.st_ino != expected_inode
-    ):
-        raise ExportError(
-            f"sample {digest}: source file was replaced after lookup: {source}"
-        )
-
-    info = _file_info(arc_name)
-    hasher = hashlib.sha256()
-    try:
-        source_stream = source.open("rb")
-    except OSError as error:
-        raise ExportError(f"sample {digest}: cannot read source file {source}: {error}") from error
+        try:
+            stat_result = os.stat(source)
+        except OSError as error:
+            raise ExportError(
+                f"sample {digest}: cannot stat source file {source}: {error}"
+            ) from error
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ExportError(
+                f"sample {digest}: source is not a regular file: {source}"
+            )
+        try:
+            source_stream = source.open("rb")
+        except OSError as error:
+            raise ExportError(
+                f"sample {digest}: cannot read source file {source}: {error}"
+            ) from error
     try:
         with source_stream, archive.open(info, "w") as target_stream:
             while True:
@@ -479,6 +489,84 @@ def _write_sample(
             f"sample {digest}: source file content changed or is corrupt: "
             f"expected digest {digest}, got {actual}"
         )
+
+
+def _open_resolved_source(
+    source: Path, digest: str, expected_device: int, expected_inode: int
+) -> Any:
+    """Open the lookup-confirmed copy, pinned to its confirmed inode.
+
+    The selected path can be remapped in the gap between the directory
+    lookup and this copy.  The path is lstat()ed without following
+    symlinks and is opened with ``O_NOFOLLOW``; the opened descriptor is
+    then fstat()ed, so the decision covers the object that is actually
+    read, not just one pre-open look at the path.  A stream is returned
+    only when that object is a regular file carrying the device/inode
+    confirmed at lookup time.
+
+    A different regular file renamed onto the path — even one with
+    identical content, size and modification time — or a symlink — even
+    one pointing at the original file — fails with the sample's full
+    digest, the selected source path and the reason.
+    """
+    try:
+        before = os.lstat(source)
+    except OSError as error:
+        raise ExportError(
+            f"sample {digest}: cannot stat source file {source}: {error}"
+        ) from error
+    if stat.S_ISLNK(before.st_mode):
+        raise ExportError(
+            f"sample {digest}: source file was replaced after lookup: "
+            f"{source} is now a symlink"
+        )
+    if not stat.S_ISREG(before.st_mode):
+        raise ExportError(
+            f"sample {digest}: source is not a regular file: {source}"
+        )
+    if (before.st_dev, before.st_ino) != (expected_device, expected_inode):
+        raise ExportError(
+            f"sample {digest}: source file was replaced after lookup: {source}"
+        )
+    try:
+        # O_NOFOLLOW makes the open fail instead of following a symlink
+        # swapped onto the path after the lstat() above.
+        descriptor = os.open(
+            source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ExportError(
+                f"sample {digest}: source file was replaced after lookup: "
+                f"{source} is now a symlink"
+            ) from error
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
+    # Prove the descriptor itself belongs to the confirmed regular inode:
+    # the path could have been remapped in the lstat()-to-open() gap.
+    if (opened.st_dev, opened.st_ino) != (
+        expected_device,
+        expected_inode,
+    ) or not stat.S_ISREG(opened.st_mode):
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: source file was replaced after lookup: {source}"
+        )
+    try:
+        return os.fdopen(descriptor, "rb")
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
 
 
 def _file_info(arc_name: str) -> zipfile.ZipInfo:
