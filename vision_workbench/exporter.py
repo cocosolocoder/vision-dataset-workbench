@@ -21,7 +21,12 @@ copy is pinned through the open (lstat without symlink follow,
 from the exact regular file confirmed at lookup time; a replacement
 landing after the lookup — another regular file, even with identical
 content, or a symlink, even pointing at the original file — fails the
-export.  The new
+export.  Directories are held to the same rule during the lookup: each
+directory is confirmed to be a real directory (not a symlink) right
+before it is scanned and re-confirmed after its entries have been
+processed, so a subdirectory swapped for a symlink mid-lookup — wherever
+the link points, even at the moved-away original tree — fails the whole
+export naming the directory instead of being searched through.  The new
 directory only changes where bytes are read from; sample identities,
 labels, set assignments and package file extensions remain the plan's.
 The lookup is used for this one export only and is never written back.
@@ -289,10 +294,18 @@ def _scan_source_directory(root: Path) -> Resolver:
     by Unicode code point owns the digest.  A directory that cannot be
     scanned, an entry that cannot be inspected or a file that cannot be
     read in full fails the export with the path and reason.
+
+    A directory confirmed as a real directory by its parent's listing is
+    re-checked without following symlinks right before it is scanned and
+    again after its entries have been processed: if it has been swapped
+    for a symlink in between — at any depth, wherever the link points —
+    the lookup fails naming the directory, so the link target is never
+    searched, matched or packaged in place of the confirmed tree.
     """
     found: dict[str, tuple[str, Path, int, int]] = {}
 
     def walk(directory: Path) -> None:
+        confirmed = _confirm_real_directory(directory)
         try:
             entries = list(os.scandir(directory))
         except OSError as error:
@@ -319,12 +332,67 @@ def _scan_source_directory(root: Path) -> Resolver:
                     ) from error
                 if is_dir:
                     walk(Path(entry.path))
+        _confirm_directory_unchanged(directory, confirmed)
 
     walk(root)
     return {
         digest: (path, device, inode)
         for digest, (_, path, device, inode) in found.items()
     }
+
+
+def _confirm_real_directory(directory: Path) -> tuple[int, int]:
+    """Confirm ``directory`` is still a real directory and pin its identity.
+
+    A subdirectory is confirmed as a real directory by its parent's
+    listing before it is descended into; if it has been swapped for a
+    symlink in the gap, descending would search the link target, which
+    the never-through-symlinks rule forbids, so the whole lookup fails
+    naming the directory and the symlink.  Returns the confirmed
+    ``(device, inode)`` so a later re-check can spot a swap landing
+    while the directory's entries are being processed.
+    """
+    try:
+        stat_result = os.lstat(directory)
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {directory}: {error}") from error
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise ExportError(
+            f"directory changed during lookup: {directory} is now a symlink"
+        )
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise ExportError(f"cannot scan directory {directory}: not a directory")
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _confirm_directory_unchanged(
+    directory: Path, confirmed: tuple[int, int]
+) -> None:
+    """Re-verify a scanned directory before its results are trusted.
+
+    The directory's entries were listed and its files read through the
+    path confirmed on entry; if the path has been swapped for a symlink
+    in the meantime — even one pointing at the moved-away original tree,
+    with byte-identical content — later opens through it would read the
+    link target, so the whole lookup (and the export) must fail naming
+    the directory and the reason.  A swap for a different real directory
+    is rejected the same way.
+    """
+    try:
+        stat_result = os.lstat(directory)
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {directory}: {error}") from error
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise ExportError(
+            f"directory changed during lookup: {directory} is now a symlink"
+        )
+    if not stat.S_ISDIR(stat_result.st_mode) or (
+        stat_result.st_dev,
+        stat_result.st_ino,
+    ) != confirmed:
+        raise ExportError(
+            f"directory changed during lookup: {directory} was replaced"
+        )
 
 
 def _hash_regular_file(path: Path) -> tuple[str, int, int]:

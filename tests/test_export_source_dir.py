@@ -507,6 +507,208 @@ class ResolvedCopySwapTest(SourceDirHarness):
         self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
 
 
+class DirectorySwapTest(SourceDirHarness):
+    """A real subdirectory swapped for a symlink mid-lookup fails the export.
+
+    The scan confirms each directory as real before descending and
+    re-confirms it after processing its entries.  These tests swap a
+    confirmed directory for a symlink — pointing outside the source
+    tree, inside it, or at the moved-away original — in each gap of the
+    lookup and require the whole export to fail naming the directory and
+    the symlink, never reading, matching or packaging through the link.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.digest = self.add_sample("cat", b"abc")
+        self.create_plan()
+        self.moved = self.root.parent / "moved"
+        self.photos = self.moved / "photos"
+        self.photos.mkdir(parents=True)
+        (self.photos / "cat.jpg").write_bytes(b"abc")
+        # The link target holds a same-content copy: even identical bytes
+        # must not be read, matched or packaged through the symlink.
+        self.decoy = self.root.parent / "decoy"
+        self.decoy.mkdir()
+        (self.decoy / "cat.jpg").write_bytes(b"abc")
+        self.target = self.root.parent / "out.zip"
+
+    def _replace_with_symlink(self, directory: Path, target: Path) -> None:
+        os.rename(directory, directory.with_name(directory.name + ".held"))
+        directory.symlink_to(target)
+
+    @contextmanager
+    def _swap_when_scanned(self, trigger: Path, mutate):
+        """Run ``mutate`` right after ``trigger``'s entries are listed.
+
+        The listing still reflects the confirmed real directory; the
+        mutation lands before its entries are processed or descended
+        into, exercising the confirmed-then-swapped gap.
+        """
+        real_scandir = os.scandir
+        state = {"fired": False}
+
+        def racing_scandir(path, *args, **kwargs):
+            entries = list(real_scandir(path, *args, **kwargs))
+            if not state["fired"] and Path(os.fspath(path)) == trigger:
+                state["fired"] = True
+                mutate()
+            return iter(entries)
+
+        with patch.object(exporter_mod.os, "scandir", side_effect=racing_scandir):
+            yield state
+
+    @contextmanager
+    def _swap_when_hashing(self, directory: Path, mutate):
+        """Run ``mutate`` right before the first file under ``directory`` is read."""
+        real_hash = exporter_mod._hash_regular_file
+        state = {"fired": False}
+
+        def racing_hash(path):
+            if not state["fired"] and Path(path).parent == directory:
+                state["fired"] = True
+                mutate()
+            return real_hash(path)
+
+        with patch.object(
+            exporter_mod, "_hash_regular_file", side_effect=racing_hash
+        ):
+            yield state
+
+    def _assert_directory_swap_failed(self, caught, directory: Path) -> None:
+        message = str(caught.exception)
+        self.assertIn(str(directory), message)
+        self.assertIn("symlink", message)
+        self.assertFalse(self.target.exists())
+        self.assertFalse(
+            list(self.target.parent.glob(f".{self.target.name}.*.tmp"))
+        )
+
+    def test_swap_before_descending_fails(self) -> None:
+        def mutate():
+            self._replace_with_symlink(self.photos, self.decoy)
+
+        with self._swap_when_scanned(self.photos, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, self.photos)
+
+    def test_swap_after_parent_listing_fails(self) -> None:
+        def mutate():
+            self._replace_with_symlink(self.photos, self.decoy)
+
+        with self._swap_when_scanned(self.moved, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, self.photos)
+
+    def test_swap_before_reading_files_under_it_fails(self) -> None:
+        def mutate():
+            self._replace_with_symlink(self.photos, self.decoy)
+
+        with self._swap_when_hashing(self.photos, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, self.photos)
+
+    def test_symlink_to_moved_original_tree_fails(self) -> None:
+        # The link points at the directory's own moved-away location,
+        # holding the very same files: still not a valid source.
+        relocated = self.root.parent / "relocated-photos"
+
+        def mutate():
+            os.rename(self.photos, relocated)
+            self.photos.symlink_to(relocated)
+
+        with self._swap_when_scanned(self.photos, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, self.photos)
+
+    def test_symlink_target_inside_source_tree_fails(self) -> None:
+        inside = self.moved / "elsewhere"
+        inside.mkdir()
+        (inside / "cat.jpg").write_bytes(b"abc")
+
+        def mutate():
+            self._replace_with_symlink(self.photos, inside)
+
+        with self._swap_when_scanned(self.photos, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, self.photos)
+
+    def test_nested_directory_swap_fails(self) -> None:
+        inner = self.moved / "a" / "b"
+        inner.mkdir(parents=True)
+        (inner / "cat.jpg").write_bytes(b"abc")
+
+        def mutate():
+            self._replace_with_symlink(inner, self.decoy)
+
+        with self._swap_when_scanned(inner, mutate):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self._assert_directory_swap_failed(caught, inner)
+
+    def test_no_fallback_to_other_copy_or_recorded_source(self) -> None:
+        # A normal same-content copy elsewhere in the tree and the plan's
+        # still-readable recorded source must not paper over the change.
+        (self.moved / "zz-copy.jpg").write_bytes(b"abc")
+        recorded = Path(
+            self.store.get_split("baseline")["sets"]["train"]["members"][0]["source"]
+        )
+        self.assertTrue(recorded.exists())
+
+        def mutate():
+            self._replace_with_symlink(self.photos, self.decoy)
+
+        with self._swap_when_scanned(self.photos, mutate):
+            with self.assertRaises(ExportError):
+                self.export(target=self.target, source_dir=self.moved)
+        self.assertFalse(self.target.exists())
+
+    def test_failure_leaves_workspace_plan_and_existing_target_untouched(self) -> None:
+        manifest_before = self.store.manifest_path.read_bytes()
+        plan_before = (self.store.splits_directory / "baseline.json").read_bytes()
+        existing = self.root.parent / "existing.zip"
+        existing.write_bytes(b"keep-me")
+
+        def mutate():
+            self._replace_with_symlink(self.photos, self.decoy)
+
+        with self._swap_when_scanned(self.photos, mutate):
+            with self.assertRaises(ExportError):
+                self.export(target=existing, source_dir=self.moved)
+        self.assertEqual(existing.read_bytes(), b"keep-me")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            (self.store.splits_directory / "baseline.json").read_bytes(), plan_before
+        )
+
+    def test_no_swap_nested_export_still_succeeds(self) -> None:
+        result, target = self.export(source_dir=self.moved)
+        self.assertEqual(result["exported"], 1)
+        with zipfile.ZipFile(target) as archive:
+            names = [n for n in archive.namelist() if n.endswith(".jpg")]
+            self.assertEqual(names, [f"train/class_01/{self.digest}.jpg"])
+            self.assertEqual(archive.read(names[0]), b"abc")
+
+    def test_cli_symlinked_directory_not_used(self) -> None:
+        # A directory that is already a symlink when first encountered is
+        # skipped by the standing convention: the export fails for lack of
+        # a match, with a non-zero exit, no success output and no target.
+        os.rename(self.photos, self.root.parent / "photos.held")
+        self.photos.symlink_to(self.decoy)
+        result = self.run_cli(
+            "export", str(self.root), "baseline", str(self.target),
+            "--source-dir", str(self.moved),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.target.exists())
+
+
 class SourceDirCliTest(SourceDirHarness):
     def test_cli_source_dir_flag(self) -> None:
         self.add_sample("cat", b"abc")
