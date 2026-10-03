@@ -22,6 +22,7 @@ from .batches import (
     render_label,
     validate_history,
 )
+from .fileio import ConfirmationPolicy, confirm_and_open
 from .splits import (
     SET_NAMES,
     SplitError,
@@ -306,54 +307,64 @@ class DatasetStore:
         return rel_path, path, digest, size
 
     @staticmethod
+    def _import_policy(display: str) -> ConfirmationPolicy:
+        """Confirmation wording for the two import entry points.
+
+        Import reports every stat/open failure as ``cannot read`` with
+        the source (or the candidate's plan-relative path), and every
+        proof that the confirmed file was swapped as ``file changed
+        during import``; the read-time identity/size/mtime re-check that
+        is specific to import stays in :meth:`_read_stable`.
+        """
+        def changed() -> ValueError:
+            return ValueError(
+                f"file changed during import: {display} "
+                "(identity, size or modification time changed)"
+            )
+
+        def cannot_read(error: OSError) -> ValueError:
+            return ValueError(f"cannot read {display}: {error}")
+
+        return ConfirmationPolicy(
+            stat_error=lambda _display, error: cannot_read(error),
+            open_error=lambda _display, error: cannot_read(error),
+            fstat_error=lambda _display, error: cannot_read(error),
+            not_regular_error=lambda _display: ValueError(
+                f"cannot read {display}: not a regular file"
+            ),
+            symlink_error=lambda _display: changed(),
+            identity_error=lambda _display: changed(),
+            opened_identity_error=lambda _display: changed(),
+        )
+
+    @staticmethod
     def _read_stable(path: Path, display: str) -> tuple[str, int]:
         """Read one file in full and return ``(digest, size)`` for it.
 
         The digest and size are guaranteed to describe the same stable
-        regular file: the path is lstat()ed before and after the read, the
-        open uses ``O_NOFOLLOW`` so a path swapped for a symlink cannot
-        redirect the read to another file, and the opened descriptor is
-        fstat()ed to prove it is the inode that was confirmed before the
-        read.  Any identity, size or modification-time change — in-place
-        rewrites, appends, truncation, delete-and-recreate, or replacing
-        the path with another file, even one with identical content, size
-        and mtime — fails with the path and reason, as do a vanishing
-        path, a non-regular file and any open or read error.
+        regular file.  Confirming the file, refusing a final symlink and
+        proving the opened descriptor belongs to the confirmed inode are
+        the shared rule in :func:`fileio.confirm_and_open`; import adds
+        its own re-lstat() after the read, so any identity, size or
+        modification-time change — in-place rewrites, appends,
+        truncation, delete-and-recreate, or replacing the path with
+        another file, even one with identical content, size and mtime —
+        fails with the path and reason, as do a vanishing path, a
+        non-regular file and any open or read error.
         """
+        policy = DatasetStore._import_policy(display)
         try:
-            before = os.lstat(path)
+            confirmed = confirm_and_open(path, policy)
         except OSError as error:
+            # Wrapping the proved descriptor as a Python stream failed;
+            # every stat/open/fstat failure was already worded above.
             raise ValueError(f"cannot read {display}: {error}") from error
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"cannot read {display}: not a regular file")
-        try:
-            # O_NOFOLLOW guarantees the bytes come from the inode just
-            # lstat()ed, even if the path is swapped for a symlink meanwhile.
-            descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
-        except OSError as error:
-            raise ValueError(f"cannot read {display}: {error}") from error
-        try:
-            opened = os.fstat(descriptor)
-        except OSError as error:
-            os.close(descriptor)
-            raise ValueError(f"cannot read {display}: {error}") from error
-        # The path may have been replaced by another regular file between
-        # the lstat() and the open(); the descriptor must belong to the
-        # inode that was confirmed, or the bytes read would not come from
-        # the file this import agreed to read.
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            os.close(descriptor)
-            raise ValueError(
-                f"file changed during import: {display} "
-                "(identity, size or modification time changed)"
-            )
+        before = confirmed.stat
         hasher = hashlib.sha256()
         try:
-            with os.fdopen(descriptor, "rb") as stream:
+            with confirmed.stream:
                 while True:
-                    chunk = stream.read(1024 * 1024)
+                    chunk = confirmed.stream.read(1024 * 1024)
                     if not chunk:
                         break
                     hasher.update(chunk)
