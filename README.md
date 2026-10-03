@@ -134,6 +134,17 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
 - Source files are streamed and verified against the saved content digest
   while copying: a missing, non-regular, unreadable or changed source
   fails the whole export with the sample digest and reason.
+- A single sample at or above 2 GiB (2,147,483,648 bytes of uncompressed
+  content) is written as a ZIP64 entry automatically; large and ordinary
+  samples may coexist in one plan and one package, and the large entry is
+  still streamed in fixed chunks, so exporting it never needs memory for
+  the whole file. This also covers multi-gigabyte content that compresses
+  well: the decision follows the uncompressed size, so a tiny resulting
+  package is not rejected. Plans containing only smaller samples keep
+  exactly the classic archive format, byte for byte — ZIP64 fields appear
+  only in the entries that require them. The manifest, the result counts
+  and the set/class layout are identical either way, and packages remain
+  extractable with standard ZIP64-aware tools.
 - `--source-dir` reads sample files from a directory tree instead of the
   recorded source paths, which is useful after moving the dataset:
   ```bash

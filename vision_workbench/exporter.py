@@ -29,6 +29,14 @@ The lookup is used for this one export only and is never written back.
 ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
 source modification times are never consulted.
+
+A single sample whose bytes reach the classic ZIP 32-bit size limit
+(2 GiB, or close enough that its deflated form could) is written as a
+ZIP64 entry: the local file header carries a ZIP64 extra field with the
+real sizes while the entry is streamed, so no sample has to fit in
+memory and highly compressible multi-gigabyte content is supported even
+when the resulting package stays small.  Plans containing only smaller
+samples use exactly the classic format they always did, byte for byte.
 """
 
 from __future__ import annotations
@@ -61,6 +69,18 @@ _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 class ExportError(ValueError):
     """An export cannot be produced."""
+
+
+def _entry_needs_zip64(file_size: int) -> bool:
+    """Whether one sample entry must use the ZIP64 local header.
+
+    Mirrors zipfile's own pre-streaming heuristic (the uncompressed size
+    plus a 5% margin, compared with the 32-bit size field limit): the
+    margin covers both a size landing at the exact limit and deflate
+    growth past it on incompressible content, while everything below it
+    keeps the classic header byte for byte.
+    """
+    return file_size * 21 > zipfile.ZIP64_LIMIT * 20
 
 
 def export_split(
@@ -435,7 +455,6 @@ def _write_sample(
     resolver: Resolver | None = None,
 ) -> None:
     digest = member["sha256"]
-    info = _file_info(arc_name)
     hasher = hashlib.sha256()
     if resolver is not None:
         # Source-directory export: read from the matched copy only.  The
@@ -451,7 +470,7 @@ def _write_sample(
                 f"sample {digest} in set {member['set']}: no file with "
                 f"matching content found under the source directory"
             ) from None
-        source_stream = _open_resolved_source(
+        source_stream, source_size = _open_resolved_source(
             source, digest, expected_device, expected_inode
         )
     else:
@@ -472,8 +491,21 @@ def _write_sample(
             raise ExportError(
                 f"sample {digest}: cannot read source file {source}: {error}"
             ) from error
+        source_size = stat_result.st_size
+
+    # Sizes are unknown to the ZIP layer until the entry has been streamed,
+    # and the classic local file header cannot describe a 2 GiB-or-larger
+    # entry, so decide the ZIP64 format up front from the confirmed file
+    # size (with the same 5% headroom zipfile itself uses, which also
+    # covers deflate growth on incompressible data).  Smaller entries open
+    # without ZIP64, keeping their archive bytes byte-identical to the
+    # classic format.  The size is only a format decision: the bytes
+    # actually read are always hash-verified below.
+    info = _file_info(arc_name)
+    info.file_size = source_size
+    force_zip64 = _entry_needs_zip64(source_size)
     try:
-        with source_stream, archive.open(info, "w") as target_stream:
+        with source_stream, archive.open(info, "w", force_zip64=force_zip64) as target_stream:
             while True:
                 chunk = source_stream.read(_CHUNK_SIZE)
                 if not chunk:
@@ -482,6 +514,16 @@ def _write_sample(
                 target_stream.write(chunk)
     except OSError as error:
         raise ExportError(f"sample {digest}: cannot read source file {source}: {error}") from error
+    except RuntimeError as error:
+        # The file grew past the 32-bit limit after the stat: the chosen
+        # header cannot describe it, so this package cannot be finished.
+        # Fail the whole export naming the sample instead of emitting a
+        # truncated entry.
+        raise ExportError(
+            f"sample {digest}: source file {source} changed while it was "
+            f"being read and is now too large to describe in the planned "
+            f"entry: {error}"
+        ) from error
 
     actual = hasher.hexdigest()
     if actual != digest:
@@ -493,7 +535,7 @@ def _write_sample(
 
 def _open_resolved_source(
     source: Path, digest: str, expected_device: int, expected_inode: int
-) -> Any:
+) -> tuple[Any, int]:
     """Open the lookup-confirmed copy, pinned to its confirmed inode.
 
     The selected path can be remapped in the gap between the directory
@@ -502,7 +544,7 @@ def _open_resolved_source(
     then fstat()ed, so the decision covers the object that is actually
     read, not just one pre-open look at the path.  A stream is returned
     only when that object is a regular file carrying the device/inode
-    confirmed at lookup time.
+    confirmed at lookup time, together with that confirmed file's size.
 
     A different regular file renamed onto the path — even one with
     identical content, size and modification time — or a symlink — even
@@ -561,7 +603,7 @@ def _open_resolved_source(
             f"sample {digest}: source file was replaced after lookup: {source}"
         )
     try:
-        return os.fdopen(descriptor, "rb")
+        return os.fdopen(descriptor, "rb"), opened.st_size
     except OSError as error:
         os.close(descriptor)
         raise ExportError(
