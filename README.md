@@ -150,7 +150,14 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   point is used. Files unrelated to the plan are read (an unreadable file
   anywhere fails the export) but never included. The plan still decides
   sample identities, labels, set assignments and package file extensions;
-  the lookup is used for this export only and is never written back. A
+  the lookup is used for this export only and is never written back. The
+  matched copy is opened pinned to the identity confirmed during the
+  lookup: if the selected path is replaced before it is read — even by a
+  regular file with identical content, size and modification time — or
+  becomes a symlink (even one pointing at the original file), the whole
+  export fails naming the sample's full digest, the selected path and the
+  reason, and neither another same-content copy nor the plan's recorded
+  source path is used instead. A
   missing or non-directory source, an unreadable directory or file, or a
   sample with no matching content fails the whole export with the path
   and reason; the package is byte-identical to a normal export of the

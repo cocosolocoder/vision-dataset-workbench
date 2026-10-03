@@ -305,6 +305,93 @@ class SourceDirExportTest(SourceDirHarness):
                 _write_sample(archive, "train/class_01/x", member, resolver)
         self.assertIn("replaced after lookup", str(caught.exception))
 
+    def test_replacement_with_identical_metadata_fails(self) -> None:
+        # A replacement with the same content, size and modification time
+        # is still a different file and must be rejected: the digest
+        # recheck alone cannot tell the two copies apart.
+        path = self.root.parent / "f.jpg"
+        path.write_bytes(b"abc")
+        digest = hashlib.sha256(b"abc").hexdigest()
+        stat_result = os.lstat(path)
+        resolver = {digest: (path, stat_result.st_dev, stat_result.st_ino)}
+        replacement = self.root.parent / "replacement.jpg"
+        replacement.write_bytes(b"abc")
+        os.utime(replacement, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        os.replace(replacement, path)
+        self.assertEqual(os.lstat(path).st_mtime_ns, stat_result.st_mtime_ns)
+        member = {
+            "sha256": digest,
+            "label": "cat",
+            "set": "train",
+            "source": str(path),
+        }
+        stream = __import__("io").BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            with self.assertRaises(ExportError) as caught:
+                _write_sample(archive, "train/class_01/x", member, resolver)
+        message = str(caught.exception)
+        self.assertIn(digest, message)
+        self.assertIn(str(path), message)
+        self.assertIn("replaced after lookup", message)
+
+    def test_symlink_at_selected_path_fails(self) -> None:
+        # Even a symlink pointing at the original, still-intact file is
+        # not the confirmed regular file and must be rejected.
+        original = self.root.parent / "original.jpg"
+        original.write_bytes(b"abc")
+        digest = hashlib.sha256(b"abc").hexdigest()
+        path = self.root.parent / "f.jpg"
+        path.write_bytes(b"abc")
+        stat_result = os.lstat(path)
+        resolver = {digest: (path, stat_result.st_dev, stat_result.st_ino)}
+        path.unlink()
+        path.symlink_to(original)
+        member = {
+            "sha256": digest,
+            "label": "cat",
+            "set": "train",
+            "source": str(path),
+        }
+        stream = __import__("io").BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            with self.assertRaises(ExportError) as caught:
+                _write_sample(archive, "train/class_01/x", member, resolver)
+        message = str(caught.exception)
+        self.assertIn(digest, message)
+        self.assertIn(str(path), message)
+        self.assertIn("replaced after lookup", message)
+
+    def test_export_fails_when_selected_copy_replaced_before_read(self) -> None:
+        # End to end: the sorted-first copy found by the directory scan is
+        # replaced by an identical-content file before the copy runs, so
+        # the whole export fails and leaves no target.
+        d = self.add_sample("cat", b"abc")
+        self.create_plan()
+        moved = self.root.parent / "moved"
+        moved.mkdir()
+        selected = moved / "a.jpg"
+        selected.write_bytes(b"abc")
+        resolver = _scan_source_directory(moved.resolve())
+        self.assertEqual(resolver[d][0], selected.resolve())
+        replacement = moved / "replacement.jpg"
+        replacement.write_bytes(b"abc")
+        os.replace(replacement, selected)
+        target = self.root.parent / "out.zip"
+        member = {
+            "sha256": d,
+            "label": "cat",
+            "set": "train",
+            "source": str(selected),
+        }
+        import io
+
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            with self.assertRaises(ExportError) as caught:
+                _write_sample(archive, "train/class_01/x", member, resolver)
+        self.assertIn(d, str(caught.exception))
+        self.assertFalse(target.exists())
+
 
 class SourceDirCliTest(SourceDirHarness):
     def test_cli_source_dir_flag(self) -> None:

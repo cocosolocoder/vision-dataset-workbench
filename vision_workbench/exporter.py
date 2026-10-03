@@ -244,7 +244,7 @@ def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 # A resolver maps a full SHA-256 digest to the absolute path of the
 # sorted-first regular file carrying that content, plus the file's
 # identity (device, inode) captured during the lookup so a swap before
-# the copy is detected.
+# the copy is detected on the file actually opened.
 Resolver = dict[str, tuple[Path, int, int]]
 
 
@@ -430,8 +430,9 @@ def _write_sample(
         # Source-directory export: read from the matched copy only.  The
         # plan's recorded source path is deliberately not consulted, so a
         # still-usable original location cannot paper over a missing
-        # match.  The identity captured at lookup time detects a swap
-        # before the copy starts.
+        # match.  The copy is opened pinned to the identity confirmed
+        # during the lookup, so a swap of the selected path in the gap
+        # before the open is caught on the object actually read.
         try:
             source, expected_device, expected_inode = resolver[digest]
         except KeyError:
@@ -439,29 +440,24 @@ def _write_sample(
                 f"sample {digest} in set {member['set']}: no file with "
                 f"matching content found under the source directory"
             ) from None
+        source_stream = _open_confirmed_copy(
+            digest, source, expected_device, expected_inode
+        )
     else:
         source = Path(member["source"])
-        expected_device = None
-        expected_inode = None
-    try:
-        stat_result = os.stat(source)
-    except OSError as error:
-        raise ExportError(f"sample {digest}: cannot stat source file {source}: {error}") from error
-    if not stat.S_ISREG(stat_result.st_mode):
-        raise ExportError(f"sample {digest}: source is not a regular file: {source}")
-    if expected_device is not None and (
-        stat_result.st_dev != expected_device or stat_result.st_ino != expected_inode
-    ):
-        raise ExportError(
-            f"sample {digest}: source file was replaced after lookup: {source}"
-        )
+        try:
+            stat_result = os.stat(source)
+        except OSError as error:
+            raise ExportError(f"sample {digest}: cannot stat source file {source}: {error}") from error
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ExportError(f"sample {digest}: source is not a regular file: {source}")
+        try:
+            source_stream = source.open("rb")
+        except OSError as error:
+            raise ExportError(f"sample {digest}: cannot read source file {source}: {error}") from error
 
     info = _file_info(arc_name)
     hasher = hashlib.sha256()
-    try:
-        source_stream = source.open("rb")
-    except OSError as error:
-        raise ExportError(f"sample {digest}: cannot read source file {source}: {error}") from error
     try:
         with source_stream, archive.open(info, "w") as target_stream:
             while True:
@@ -479,6 +475,38 @@ def _write_sample(
             f"sample {digest}: source file content changed or is corrupt: "
             f"expected digest {digest}, got {actual}"
         )
+
+
+def _open_confirmed_copy(
+    digest: str, source: Path, expected_device: int, expected_inode: int
+) -> Any:
+    """Open the lookup-confirmed copy, pinned to that exact regular file.
+
+    The path is opened with ``O_NOFOLLOW`` and the opened descriptor
+    itself — not the path beforehand — is verified against the device and
+    inode confirmed during the lookup, so a replacement in the gap between
+    the lookup and the open is caught on the object actually read: another
+    regular file at the same path fails even with identical content, size
+    and modification time, and a symlink fails even when its target has
+    the same content or is the original file.  Any failure names the
+    sample digest, the selected source path and the reason.
+    """
+    reason = f"sample {digest}: source file was replaced after lookup: {source}"
+    try:
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise ExportError(f"{reason} ({error})") from error
+    try:
+        stat_result = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(f"{reason} ({error})") from error
+    if not stat.S_ISREG(stat_result.st_mode) or (
+        stat_result.st_dev != expected_device or stat_result.st_ino != expected_inode
+    ):
+        os.close(descriptor)
+        raise ExportError(reason)
+    return os.fdopen(descriptor, "rb")
 
 
 def _file_info(arc_name: str) -> zipfile.ZipInfo:
