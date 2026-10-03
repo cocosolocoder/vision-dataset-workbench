@@ -502,26 +502,57 @@ def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
 
     The parent listed ``name`` as a real directory, so anything other
     than that same directory observed here means the path changed after
-    the listing.  The name is inspected with ``fstatat`` without
-    following symlinks and then opened with ``openat`` using
-    ``O_NOFOLLOW`` and ``O_DIRECTORY``; the descriptor is fstat()ed and
-    proved to be the directory the inspection named.  A symlink swapped
-    in at any point in this sequence fails the export identifying
-    ``display`` as a directory that changed into a symlink, and its
-    target — outside the tree, inside it, or the moved original — is
-    never touched.
+    the listing.  This is the first confirmation of the directory: no
+    identity was recorded yet, so the fresh inspection itself sets the
+    expectation the opened descriptor is then proved against.  A symlink
+    swapped in at any point fails the export identifying ``display`` as
+    a directory that changed into a symlink, and its target — outside
+    the tree, inside it, or the moved original — is never touched.
+    """
+    return _open_confirmed_directory(
+        parent_fd, name, display, expected=None, during_scan=True
+    )
+
+
+def _open_confirmed_directory(
+    parent_fd: int,
+    name: str,
+    display: Path,
+    expected: tuple[int, int] | None,
+    during_scan: bool,
+) -> int:
+    """Open ``name`` relative to ``parent_fd`` and pin the directory.
+
+    The single confirmation rule shared by the lookup and the package
+    copy: the name is inspected with ``fstatat`` without following
+    symlinks and then opened with ``openat`` using ``O_NOFOLLOW`` and
+    ``O_DIRECTORY``; the descriptor is fstat()ed and proved to be the
+    directory the inspection named.  ``expected`` carries the
+    ``(device, inode)`` the binding must match — the identity recorded
+    during the lookup when the copy re-checks an already confirmed
+    directory, or ``None`` when the lookup confirms a directory for the
+    first time and the fresh inspection itself is the expectation.
+
+    ``during_scan`` selects the phase the error messages report:
+    failures while walking the tree say "during scan" and "cannot scan",
+    failures while copying the package say "during export" and "cannot
+    inspect".  A symlink swapped in at any point in this sequence fails
+    the export identifying ``display`` and what it became; the link's
+    target is never touched.
     """
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
         raise ExportError(f"cannot inspect directory {display}: {error}") from error
-    if stat.S_ISLNK(before.st_mode):
-        raise ExportError(
-            f"directory changed during scan: {display} is now a symlink"
-        )
-    if not stat.S_ISDIR(before.st_mode):
-        raise ExportError(
-            f"directory changed during scan: {display} is no longer a directory"
+    if expected is None:
+        expected = (before.st_dev, before.st_ino)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISDIR(before.st_mode)
+        or (before.st_dev, before.st_ino) != expected
+    ):
+        raise _directory_changed_message(
+            display, before.st_mode, during_scan=during_scan
         )
     try:
         descriptor = os.open(
@@ -534,23 +565,31 @@ def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
             # The path changed between the fstatat and the open; inspect
             # it once more to report the concrete reason.
             raise _directory_changed_error(
-                parent_fd, name, display, during_scan=True
+                parent_fd, name, display, during_scan=during_scan
             ) from error
-        raise ExportError(f"cannot scan directory {display}: {error}") from error
+        raise _directory_access_error(display, error, during_scan) from error
     try:
         opened = os.fstat(descriptor)
     except OSError as error:
         os.close(descriptor)
-        raise ExportError(f"cannot scan directory {display}: {error}") from error
+        raise _directory_access_error(display, error, during_scan) from error
     if not stat.S_ISDIR(opened.st_mode) or (
         opened.st_dev,
         opened.st_ino,
-    ) != (before.st_dev, before.st_ino):
+    ) != expected:
         os.close(descriptor)
         raise _directory_changed_error(
-            parent_fd, name, display, during_scan=True
+            parent_fd, name, display, during_scan=during_scan
         )
     return descriptor
+
+
+def _directory_access_error(
+    display: Path, error: OSError, during_scan: bool
+) -> ExportError:
+    """Report a directory that cannot be entered, naming the phase."""
+    action = "scan" if during_scan else "inspect"
+    return ExportError(f"cannot {action} directory {display}: {error}")
 
 
 def _assert_still_same_directory(
@@ -715,51 +754,20 @@ class _SourceAnchor:
         expected_dev: int,
         expected_inode: int,
     ) -> int:
-        """Open one directory component, refusing any changed binding."""
-        try:
-            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError as error:
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
-        if (
-            stat.S_ISLNK(before.st_mode)
-            or not stat.S_ISDIR(before.st_mode)
-            or (before.st_dev, before.st_ino) != (expected_dev, expected_inode)
-        ):
-            raise _directory_changed_message(
-                display, before.st_mode, during_scan=False
-            )
-        try:
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
-                dir_fd=parent_fd,
-            )
-        except OSError as error:
-            if error.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise _directory_changed_error(
-                    parent_fd, name, display, during_scan=False
-                ) from error
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
-        try:
-            opened = os.fstat(descriptor)
-        except OSError as error:
-            os.close(descriptor)
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
-        if not stat.S_ISDIR(opened.st_mode) or (
-            opened.st_dev,
-            opened.st_ino,
-        ) != (expected_dev, expected_inode):
-            os.close(descriptor)
-            raise _directory_changed_error(
-                parent_fd, name, display, during_scan=False
-            )
-        return descriptor
+        """Open one directory component, refusing any changed binding.
+
+        This is the copy-phase half of the shared confirmation rule: the
+        directory was already confirmed during the lookup, so the binding
+        must still carry the recorded identity, and failures are reported
+        as happening during the export rather than the scan.
+        """
+        return _open_confirmed_directory(
+            parent_fd,
+            name,
+            display,
+            expected=(expected_dev, expected_inode),
+            during_scan=False,
+        )
 
 
 # Open-relative-to-a-directory-descriptor support (openat/fstatat with
