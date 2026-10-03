@@ -184,6 +184,88 @@ class SplitPlanStoreTest(StoreHarness):
         with self.assertRaises(SplitError):
             self.store.get_split("ok")
 
+    def _rewrite_plan(self, name: str, mutate) -> None:
+        plan_path = self.store.splits_directory / f"{name}.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        mutate(payload)
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_corrupt_statistics_rejected(self) -> None:
+        for label in ["cat", "cat", "dog"]:
+            self.add_sample(label)
+        self.store.create_split("stats", 1, [0.5, 0.5, 0])
+        plan_path = self.store.splits_directory / "stats.json"
+        original = plan_path.read_text(encoding="utf-8")
+        plan = json.loads(original)
+        nonempty = next(
+            name for name in SET_NAMES if plan["sets"][name]["members"]
+        )
+        empty = next(
+            name for name in SET_NAMES if not plan["sets"][name]["members"]
+        )
+
+        def set_count_as(value):
+            def mutate(p):
+                distribution = p["sets"][nonempty]["distribution"]
+                distribution[next(iter(distribution))] = value
+            return mutate
+
+        corruptions = [
+            # Sample counts: only non-negative integers are valid; values
+            # merely equal to the right count (True, 1.0) are corruption.
+            (lambda p: p["sets"][nonempty].update(samples=True), nonempty),
+            (lambda p: p["sets"][nonempty].update(
+                samples=float(p["sets"][nonempty]["samples"])), nonempty),
+            (lambda p: p["sets"][nonempty].update(samples="1"), nonempty),
+            (lambda p: p["sets"][nonempty].update(samples=None), nonempty),
+            (lambda p: p["sets"][nonempty].update(samples=-1), nonempty),
+            (lambda p: p["samples"].update(total=True), None),
+            (lambda p: p["samples"].update(total=3.0), None),
+            (lambda p: p["samples"].update(total=-1), None),
+            # Distributions must be JSON objects of class to count.
+            (lambda p: p["sets"][nonempty].update(distribution=["cat"]), nonempty),
+            (lambda p: p["sets"][nonempty].update(distribution=None), nonempty),
+            (lambda p: p["sets"][nonempty].update(distribution="cat"), nonempty),
+            (lambda p: p["sets"][nonempty].pop("distribution"), nonempty),
+            # An empty set's empty-object distribution is required too.
+            (lambda p: p["sets"][empty].pop("distribution"), empty),
+            (lambda p: p["sets"][empty].update(distribution=[]), empty),
+            (lambda p: p["samples"].update(distribution=None), None),
+            (lambda p: p["samples"].update(distribution=[]), None),
+            # Class counts inside a distribution follow the same rule.
+            (set_count_as(True), nonempty),
+            (set_count_as(1.0), nonempty),
+            (lambda p: p["samples"]["distribution"].update(cat=True), None),
+            (lambda p: p["samples"]["distribution"].update(cat=2.0), None),
+        ]
+        for mutate, set_name in corruptions:
+            with self.subTest(set=set_name, mutate=mutate):
+                self._rewrite_plan("stats", mutate)
+                with self.assertRaises(SplitError) as caught:
+                    self.store.get_split("stats")
+                if set_name is not None:
+                    self.assertIn(set_name, str(caught.exception))
+                # The rejection never rewrites the stored plan.
+                self.assertNotEqual(
+                    plan_path.read_text(encoding="utf-8"), original
+                )
+                plan_path.write_text(original, encoding="utf-8")
+        # The intact plan still loads.
+        self.assertEqual(self.store.get_split("stats"), plan)
+
+    def test_export_rejected_for_corrupt_statistics(self) -> None:
+        from vision_workbench.exporter import export_split
+
+        self.add_sample("cat")
+        self.store.create_split("exp", 0, [1, 0, 0])
+        self._rewrite_plan(
+            "exp", lambda p: p["sets"]["train"].update(distribution=None)
+        )
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(SplitError):
+            export_split(self.store, "exp", target)
+        self.assertFalse(target.exists())
+
     def test_partial_write_never_visible(self) -> None:
         self.add_sample("cat")
         plan_path = self.store.splits_directory / "ghost.json"
@@ -256,6 +338,25 @@ class CliTest(StoreHarness):
                                "--seed", "1", "--train", "0.5",
                                "--validation", "0.5", "--test", "0.5")
         self.assertNotEqual(invalid.returncode, 0)
+
+    def test_cli_show_corrupt_statistics_fails_cleanly(self) -> None:
+        self.add_sample("cat")
+        created = self.run_cli("split", "create", str(self.root), "c1",
+                               "--seed", "0", "--train", "1",
+                               "--validation", "0", "--test", "0")
+        self.assertEqual(created.returncode, 0, created.stderr)
+
+        plan_path = self.store.splits_directory / "c1.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        payload["sets"]["train"]["distribution"] = ["cat"]
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        shown = self.run_cli("split", "show", str(self.root), "c1")
+        self.assertNotEqual(shown.returncode, 0)
+        self.assertIn("error:", shown.stderr)
+        self.assertIn("train", shown.stderr)
+        self.assertNotIn("Traceback", shown.stderr)
+        self.assertEqual(shown.stdout.strip(), "")
 
     def test_existing_commands_unchanged(self) -> None:
         image = self.root.parent / "pic.jpg"
