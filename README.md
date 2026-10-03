@@ -175,7 +175,29 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   or by a symlink, even one pointing at the original file, the whole
   export fails with the sample digest, the selected source path and the
   reason; no other same-content copy is substituted and the plan's
-  recorded source path is not used as a fallback. Files unrelated to the
+  recorded source path is not used as a fallback.
+
+  The directory walk is itself pinned to directory descriptors rather
+  than path strings: each directory is entered with `openat`
+  (`O_NOFOLLOW` and `O_DIRECTORY`) relative to its parent's descriptor
+  and verified with `fstatat`, and the confirmed root stays open for the
+  whole export. A subdirectory that is a real directory when the walk
+  first reaches it but is replaced by a symlink before it is entered,
+  while its contents are read, after the lookup or while the package is
+  copied fails the whole export with the changed directory's path and
+  the symlink reason — whether the link points outside the specified
+  directory, inside it, or at the directory moved to its new location,
+  and at any nesting level. The link's target is never read, matched or
+  packaged, even if it holds a file byte-identical to the planned
+  sample; no other normal copy and no still-readable recorded source are
+  substituted. Before each matched file is copied its ancestor
+  directories are re-verified the same way, and after all samples are
+  streamed every directory from the walk is verified once more before
+  the ZIP is published, so the target ZIP is never created and no
+  incomplete export file remains. Only entries that are already
+  symlinks the first time the walk meets them are skipped, as before.
+
+  Files unrelated to the
   plan are read (an unreadable file anywhere fails the export) but never
   included. The plan still decides
   sample identities, labels, set assignments and package file extensions;

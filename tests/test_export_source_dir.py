@@ -507,6 +507,331 @@ class ResolvedCopySwapTest(SourceDirHarness):
         self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
 
 
+class DirectoryReplacedBySymlinkTest(SourceDirHarness):
+    """A real subdirectory must not be followed once it becomes a symlink.
+
+    A subdirectory that is a genuine directory when the walk first
+    reaches it, but is replaced by a symlink before it is entered, while
+    its contents are read, after the lookup or while the package is
+    copied, must fail the whole export — regardless of where the link
+    points (outside the tree, inside it, or at the moved original) and
+    regardless of the nesting level at which the change happens.
+    """
+
+    CAT = b"cat-photo"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.digest = self.add_sample("cat", self.CAT)
+        self.create_plan()
+        self.moved = self.root.parent / "moved"
+        self.target_zip = self.root.parent / "out.zip"
+        # The recorded old source still exists and is readable; it must
+        # never mask the directory change.
+        self.recorded = Path(
+            self.store.get_split("baseline")["sets"]["train"]["members"][0]["source"]
+        )
+        self.assertTrue(self.recorded.exists())
+
+    def _build_tree(self, nested: bool) -> Path:
+        """Create moved[/a/b]/photos/cat.jpg plus same-content decoys.
+
+        Decoys: another normal copy elsewhere under the tree and a
+        directory outside the tree — the symlink swaps below point at
+        directories holding the same image content.
+        """
+        photos = self.moved / ("a/b/photos" if nested else "photos")
+        photos.mkdir(parents=True)
+        (photos / "cat.jpg").write_bytes(self.CAT)
+        # A normal same-content copy elsewhere in the tree: not a fallback.
+        spare = self.moved / "spare"
+        spare.mkdir(parents=True)
+        (spare / "cat.jpg").write_bytes(self.CAT)
+        # The outside directory a swapped link could point at.
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        (outside / "cat.jpg").write_bytes(self.CAT)
+        # The inside directory a swapped link could point at.
+        inside = self.moved / "other"
+        inside.mkdir()
+        (inside / "cat.jpg").write_bytes(self.CAT)
+        return photos
+
+    def _swap_to_symlink(self, photos: Path, kind: str) -> None:
+        """Replace the real ``photos`` directory with a symlink."""
+        moved_away = photos.with_name(photos.name + "-moved")
+        os.rename(photos, moved_away)
+        if kind == "outside":
+            target = self.root.parent / "outside"
+        elif kind == "inside":
+            target = self.moved / "other"
+        elif kind == "moved":
+            target = moved_away
+        else:  # pragma: no cover - test programming error
+            raise AssertionError(kind)
+        photos.symlink_to(target)
+
+    @contextmanager
+    def _swap_at(self, when: str, photos: Path, mutate):
+        patches = []
+        if when == "enter":
+            # After the parent listed and typed the entry as a real
+            # directory, before that directory is entered.
+            real_enter = exporter_mod._enter_subdirectory
+
+            def enter_wrap(parent_fd, name, display, *args, **kwargs):
+                if Path(os.fspath(display)) == photos:
+                    mutate()
+                return real_enter(parent_fd, name, display, *args, **kwargs)
+
+            patches.append(
+                patch.object(exporter_mod, "_enter_subdirectory", side_effect=enter_wrap)
+            )
+        elif when == "open-gap":
+            # Between the no-follow fstatat of the entry and the openat
+            # that enters it.
+            real_open = os.open
+
+            def open_wrap(path, flags, *args, **kwargs):
+                if (
+                    flags & getattr(os, "O_DIRECTORY", 0)
+                    and Path(os.fspath(path)).name == photos.name
+                ):
+                    mutate()
+                return real_open(path, flags, *args, **kwargs)
+
+            patches.append(
+                patch.object(exporter_mod.os, "open", side_effect=open_wrap)
+            )
+        elif when == "child":
+            # While the directory's children are being processed: after
+            # the file beneath it has been read, before the directory's
+            # own post-child binding check.
+            real_hash = exporter_mod._hash_regular_file_at
+
+            def hash_wrap(directory_fd, name, path, *args, **kwargs):
+                result = real_hash(directory_fd, name, path, *args, **kwargs)
+                if Path(path).parent == photos:
+                    mutate()
+                return result
+
+            patches.append(
+                patch.object(
+                    exporter_mod, "_hash_regular_file_at", side_effect=hash_wrap
+                )
+            )
+        elif when == "after-scan":
+            real_scan = exporter_mod._scan_source_directory
+
+            def scan_wrap(root):
+                resolver = real_scan(root)
+                mutate()
+                return resolver
+
+            patches.append(
+                patch.object(
+                    exporter_mod, "_scan_source_directory", side_effect=scan_wrap
+                )
+            )
+        elif when == "during-read":
+            # After the selected file was opened for copying; the final
+            # whole-tree gate must still refuse the finished package.
+            real_resolve = exporter_mod._open_resolved_source
+
+            def resolve_wrap(source, digest, device, inode):
+                stream, size = real_resolve(source, digest, device, inode)
+                mutate()
+                return stream, size
+
+            patches.append(
+                patch.object(
+                    exporter_mod,
+                    "_open_resolved_source",
+                    side_effect=resolve_wrap,
+                )
+            )
+        else:  # pragma: no cover - test programming error
+            raise AssertionError(when)
+        for patched in patches:
+            patched.start()
+        try:
+            yield
+        finally:
+            for patched in patches:
+                patched.stop()
+
+    def _assert_failed_cleanly(self, caught: Exception, photos: Path) -> None:
+        message = str(caught.exception)
+        self.assertIn(str(photos), message)
+        self.assertIn("symlink", message)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertFalse(self.target_zip.exists())
+        leftovers = [
+            entry.name
+            for entry in self.root.parent.iterdir()
+            if entry.name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_swapped_before_entry_outside_target(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at("enter", photos, lambda: self._swap_to_symlink(photos, "outside")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_between_stat_and_open_outside_target(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at("open-gap", photos, lambda: self._swap_to_symlink(photos, "outside")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_before_entry_target_inside_tree(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at("enter", photos, lambda: self._swap_to_symlink(photos, "inside")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_before_entry_points_at_moved_original(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at("enter", photos, lambda: self._swap_to_symlink(photos, "moved")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_while_children_processed(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at("child", photos, lambda: self._swap_to_symlink(photos, "outside")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_at_deep_nesting_level(self) -> None:
+        photos = self._build_tree(nested=True)
+        with self._swap_at("open-gap", photos, lambda: self._swap_to_symlink(photos, "moved")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_at_ancestor_level_of_nested_tree(self) -> None:
+        photos = self._build_tree(nested=True)
+        ancestor = self.moved / "a"
+        with self._swap_at(
+            "enter", ancestor, lambda: self._swap_to_symlink(ancestor, "outside")
+        ):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, ancestor)
+
+    def test_swapped_during_children_of_nested_directory(self) -> None:
+        photos = self._build_tree(nested=True)
+        with self._swap_at("child", photos, lambda: self._swap_to_symlink(photos, "outside")):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_after_lookup_fails_before_copy(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at(
+            "after-scan", photos, lambda: self._swap_to_symlink(photos, "moved")
+        ):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swapped_during_read_fails_final_gate(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at(
+            "during-read", photos, lambda: self._swap_to_symlink(photos, "moved")
+        ):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target_zip, source_dir=self.moved)
+        # The pinned bytes may have been read, but the directory changed
+        # before publication, so the package must not exist.
+        self._assert_failed_cleanly(caught, photos)
+
+    def test_swap_after_first_sample_fails_whole_export(self) -> None:
+        # Two samples in separate directories: replacing the second
+        # sample's directory after the first entry was written must still
+        # fail the whole export and publish nothing.
+        self.moved.mkdir(parents=True)
+        first = self.moved / "one"
+        first.mkdir()
+        (first / "cat.jpg").write_bytes(self.CAT)
+        self.add_sample("dog", b"dog-photo")
+        self.create_plan("two")
+        two = self.moved / "two"
+        two.mkdir(parents=True)
+        (two / "dog.jpg").write_bytes(b"dog-photo")
+        target = self.root.parent / "multi.zip"
+
+        real_write_sample = exporter_mod._write_sample
+        fired = {"done": False}
+
+        def write_wrap(archive, arc_name, member, *args, **kwargs):
+            result = real_write_sample(archive, arc_name, member, *args, **kwargs)
+            if not fired["done"] and member["sha256"] == self.digest:
+                fired["done"] = True
+                outside = self.root.parent / "outside-two"
+                outside.mkdir()
+                (outside / "dog.jpg").write_bytes(b"dog-photo")
+                moved_away = two.with_name("two-moved")
+                os.rename(two, moved_away)
+                two.symlink_to(outside)
+            return result
+
+        with patch.object(exporter_mod, "_write_sample", side_effect=write_wrap):
+            with self.assertRaises(ExportError) as caught:
+                self.export("two", target=target, source_dir=self.moved)
+        self.assertTrue(fired["done"])
+        message = str(caught.exception)
+        self.assertIn(str(two), message)
+        self.assertIn("symlink", message)
+        self.assertFalse(target.exists())
+
+    def test_failure_preserves_target_and_workspace(self) -> None:
+        photos = self._build_tree(nested=False)
+        existing = self.root.parent / "existing.zip"
+        existing.write_bytes(b"keep-me")
+        manifest_before = self.store.manifest_path.read_bytes()
+        plan_before = (
+            self.store.splits_directory / "baseline.json"
+        ).read_bytes()
+        with self._swap_at("enter", photos, lambda: self._swap_to_symlink(photos, "outside")):
+            with self.assertRaises(ExportError):
+                self.export(target=existing, source_dir=self.moved)
+        self.assertEqual(existing.read_bytes(), b"keep-me")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            (self.store.splits_directory / "baseline.json").read_bytes(),
+            plan_before,
+        )
+
+    def test_directory_swap_rejected_by_scan_directly(self) -> None:
+        photos = self._build_tree(nested=False)
+        with self._swap_at(
+            "open-gap", photos, lambda: self._swap_to_symlink(photos, "inside")
+        ):
+            with self.assertRaises(ExportError) as caught:
+                exporter_mod._scan_source_directory(self.moved)
+        self.assertIn(str(photos), str(caught.exception))
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_no_swap_keeps_normal_export_behavior(self) -> None:
+        photos = self._build_tree(nested=False)
+        normal = self.root.parent / "normal.zip"
+        self.export(target=normal)
+        via_dir = self.root.parent / "via-dir.zip"
+        result, target = self.export(target=via_dir, source_dir=self.moved)
+        self.assertEqual(result["exported"], 1)
+        self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
+        with zipfile.ZipFile(target) as archive:
+            names = [n for n in archive.namelist() if n.endswith(".jpg")]
+            self.assertEqual(archive.read(names[0]), self.CAT)
+
+
 class SourceDirCliTest(SourceDirHarness):
     def test_cli_source_dir_flag(self) -> None:
         self.add_sample("cat", b"abc")

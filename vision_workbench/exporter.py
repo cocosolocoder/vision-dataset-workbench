@@ -21,10 +21,36 @@ copy is pinned through the open (lstat without symlink follow,
 from the exact regular file confirmed at lookup time; a replacement
 landing after the lookup — another regular file, even with identical
 content, or a symlink, even pointing at the original file — fails the
-export.  The new
-directory only changes where bytes are read from; sample identities,
-labels, set assignments and package file extensions remain the plan's.
-The lookup is used for this one export only and is never written back.
+export.
+
+The walk itself is anchored to directory descriptors: the confirmed
+root is held open for the whole export and each directory is entered
+with ``openat`` (``O_NOFOLLOW`` plus ``O_DIRECTORY``) relative to its
+parent's descriptor and verified with ``fstatat`` on both the
+parent-relative name and the opened descriptor, so a real subdirectory
+cannot be followed through even if its path is swapped for a symlink in
+the gap between its first inspection and its entry.  A subdirectory
+confirmed real during the walk that is a symlink by the time it is
+entered — whether the link points outside the tree, inside it, or at
+the moved original — fails the whole export naming that path and the
+symlink; the same applies to a swap landing while its children are
+being processed.
+
+The protection extends to the package copy that follows the lookup.
+Before each matched file is opened its ancestor directories are
+re-derived and re-pinned through the same descriptor-anchored checks,
+and after every sample has been streamed every directory recorded
+during the walk is verified once more before the package is published:
+a real directory replaced by a symlink after the lookup — before a
+sample is opened, while a sample is read or between samples — still
+fails the export, and a byte-equal file behind the new link is never
+read, matched or packaged.  Entries that are symlinks when first
+encountered keep being skipped exactly as before.
+
+The new directory only changes where bytes are read from; sample
+identities, labels, set assignments and package file extensions remain
+the plan's.  The lookup is used for this one export only and is never
+written back.
 
 ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
@@ -65,6 +91,10 @@ _FILE_ATTR = 0o100644 << 16
 _DIR_ATTR = (0o40755 << 16) | 0x10  # MS-DOS directory flag
 _CHUNK_SIZE = 1024 * 1024
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+# Descriptor-relative, no-symlink-follow directory opens: POSIX and
+# available on the platforms this tool runs on (0 where a flag is absent).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class ExportError(ValueError):
@@ -104,6 +134,11 @@ def export_split(
     sample is matched to a file with the same full SHA-256 digest.  The
     plan still decides identities, labels, set assignments and package
     file extensions; the lookup is used for this export only.
+
+    The walk is anchored to directory descriptors, so a subdirectory that
+    was a real directory when the walk reached it but has become a symlink
+    before it is entered or while its contents are read fails the export
+    naming that path; the link is never followed.
     """
     plan = store.get_split(plan_name)
     members = _collect_members(plan)
@@ -135,17 +170,48 @@ def export_split(
         # An empty plan (or every sample skipped) needs no files at all;
         # the directory still has to exist and be one.
         if exported:
-            resolver = _scan_source_directory(source_dir.resolve())
-            for member in exported:
-                if member["sha256"] not in resolver:
-                    raise ExportError(
-                        f"sample {member['sha256']} in set {member['set']}: "
-                        f"no file with matching content (full SHA-256 "
-                        f"{member['sha256']}) found under source directory "
-                        f"{source_dir}"
-                    )
-
-    _write_package(target, classes, exported, manifest, resolver)
+            resolved_root = source_dir.resolve()
+            # Keep the confirmed root open and pinned for the whole
+            # export: the lookup and the later package copy both resolve
+            # through this descriptor, so a subdirectory turned into a
+            # symlink after the lookup cannot be traversed while reading
+            # the package bytes either.
+            try:
+                root_fd = os.open(resolved_root, os.O_RDONLY | _O_DIRECTORY)
+            except OSError as error:
+                raise ExportError(
+                    f"cannot scan directory {resolved_root}: {error}"
+                ) from error
+            try:
+                resolver = _scan_source_directory(resolved_root)
+                for member in exported:
+                    if member["sha256"] not in resolver:
+                        raise ExportError(
+                            f"sample {member['sha256']} in set {member['set']}: "
+                            f"no file with matching content (full SHA-256 "
+                            f"{member['sha256']}) found under source directory "
+                            f"{source_dir}"
+                        )
+                directory_ids = getattr(resolver, "directory_ids", None)
+                anchor = (
+                    _SourceAnchor(root_fd, resolved_root, directory_ids)
+                    if directory_ids is not None
+                    else None
+                )
+                _write_package(
+                    target,
+                    classes,
+                    exported,
+                    manifest,
+                    resolver,
+                    source_anchor=anchor,
+                )
+            finally:
+                os.close(root_fd)
+        else:
+            _write_package(target, classes, exported, manifest, None)
+    else:
+        _write_package(target, classes, exported, manifest, None)
 
     return {
         "plan": plan["name"],
@@ -277,6 +343,24 @@ def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 Resolver = dict[str, tuple[Path, int, int]]
 
 
+class _ScanResult(dict):
+    """The digest resolver, also carrying every real directory seen.
+
+    Behaves as the plain digest-to-file resolver mapping, with an extra
+    ``directory_ids`` attribute: each key is a ``/``-separated path
+    relative to the root (``""`` for the root itself) and each value is
+    ``(display path, device, inode)`` as observed during the walk.
+    """
+
+    def __init__(
+        self,
+        files: dict[str, tuple[Path, int, int]],
+        directories: dict[str, tuple[Path, int, int]],
+    ) -> None:
+        super().__init__(files)
+        self.directory_ids = directories
+
+
 def _scan_source_directory(root: Path) -> Resolver:
     """Walk ``root`` and map every digest to the sorted-first copy.
 
@@ -289,62 +373,430 @@ def _scan_source_directory(root: Path) -> Resolver:
     by Unicode code point owns the digest.  A directory that cannot be
     scanned, an entry that cannot be inspected or a file that cannot be
     read in full fails the export with the path and reason.
+
+    Every step is anchored to directory descriptors rather than path
+    strings: a child is typed and entered with ``fstatat``/``openat``
+    relative to the descriptor of the directory it was listed from, and
+    each entered directory is pinned for the whole time its contents are
+    processed.  A real subdirectory whose path is swapped for a symlink
+    after it was listed but before or while it is entered therefore can
+    never be followed — the open refuses the link and the export fails
+    naming that directory — and a swap landing while its children are
+    being read is detected when its path binding is re-checked after the
+    children have been processed.  Only entries that are already
+    symlinks when first listed are skipped, preserving the original
+    convention.
     """
+    try:
+        root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY)
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {root}: {error}") from error
+    try:
+        return _scan_tree(root_fd, root)
+    finally:
+        os.close(root_fd)
+
+
+def _scan_tree(root_fd: int, root: Path) -> _ScanResult:
+    """Walk the tree reached through the already-open, pinned ``root_fd``."""
     found: dict[str, tuple[str, Path, int, int]] = {}
-
-    def walk(directory: Path) -> None:
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as error:
-            raise ExportError(f"cannot scan directory {directory}: {error}") from error
-        for entry in entries:
-            try:
-                is_file = entry.is_file(follow_symlinks=False)
-            except OSError as error:
-                raise ExportError(
-                    f"cannot inspect entry {entry.path}: {error}"
-                ) from error
-            if is_file:
-                rel = os.path.relpath(entry.path, root).replace(os.sep, "/")
-                digest, device, inode = _hash_regular_file(Path(entry.path))
-                current = found.get(digest)
-                if current is None or rel < current[0]:
-                    found[digest] = (rel, Path(entry.path), device, inode)
-            else:
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                except OSError as error:
-                    raise ExportError(
-                        f"cannot inspect entry {entry.path}: {error}"
-                    ) from error
-                if is_dir:
-                    walk(Path(entry.path))
-
-    walk(root)
-    return {
+    directories: dict[str, tuple[Path, int, int]] = {}
+    try:
+        root_status = os.fstat(root_fd)
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {root}: {error}") from error
+    directories[""] = (root, root_status.st_dev, root_status.st_ino)
+    _walk_directory(root_fd, None, root, root, found, directories)
+    files = {
         digest: (path, device, inode)
         for digest, (_, path, device, inode) in found.items()
     }
+    return _ScanResult(files, directories)
 
 
-def _hash_regular_file(path: Path) -> tuple[str, int, int]:
-    """Read one file in full, returning ``(digest, device, inode)``.
+def _walk_directory(
+    parent_fd: int,
+    name: str | None,
+    display: Path,
+    root: Path,
+    found: dict[str, tuple[str, Path, int, int]],
+    directories: dict[str, tuple[Path, int, int]],
+) -> None:
+    """Process one directory, anchored to a pinned descriptor.
 
-    The bytes are read with ``O_NOFOLLOW`` so a symlink swapped in after
-    the lookup cannot redirect the read; any failure raises with the path
-    and reason.
+    ``name`` is the parent-relative basename; ``None`` marks the already
+    open ``root`` whose descriptor is ``parent_fd``.  Any other
+    directory is entered through :func:`_enter_subdirectory`, which
+    pins the exact directory listed by the parent.
+    """
+    if name is None:
+        directory_fd = parent_fd
+        entered = False
+    else:
+        directory_fd = _enter_subdirectory(parent_fd, name, display)
+        entered = True
+    try:
+        if entered:
+            try:
+                pinned = os.fstat(directory_fd)
+            except OSError as error:
+                raise ExportError(
+                    f"cannot scan directory {display}: {error}"
+                ) from error
+            rel = os.path.relpath(display, root).replace(os.sep, "/")
+            directories[rel] = (display, pinned.st_dev, pinned.st_ino)
+        try:
+            entries = list(os.scandir(directory_fd))
+        except OSError as error:
+            raise ExportError(f"cannot scan directory {display}: {error}") from error
+        for entry in entries:
+            child_name = entry.name
+            child_display = display / child_name
+            try:
+                status = os.stat(
+                    child_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise ExportError(
+                    f"cannot inspect entry {child_display}: {error}"
+                ) from error
+            mode = status.st_mode
+            if stat.S_ISLNK(mode):
+                # A symlink when first encountered: skipped, never read.
+                continue
+            if stat.S_ISREG(mode):
+                digest, device, inode = _hash_regular_file_at(
+                    directory_fd, child_name, child_display
+                )
+                rel = os.path.relpath(child_display, root).replace(os.sep, "/")
+                current = found.get(digest)
+                if current is None or rel < current[0]:
+                    found[digest] = (rel, child_display, device, inode)
+            elif stat.S_ISDIR(mode):
+                _walk_directory(
+                    directory_fd,
+                    child_name,
+                    child_display,
+                    root,
+                    found,
+                    directories,
+                )
+            # Any other entry type is skipped as before.
+        if entered:
+            # The children are done and were all reached through this
+            # pinned descriptor.  Re-prove the parent-relative name still
+            # binds to this same directory: a symlink (or anything else)
+            # swapped onto it while the children were being processed
+            # must fail the export even though nothing was read through
+            # that link.
+            _assert_still_same_directory(
+                parent_fd, name, display, directory_fd
+            )
+    finally:
+        if entered:
+            os.close(directory_fd)
+
+
+def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
+    """Open a listed subdirectory relative to ``parent_fd`` and pin it.
+
+    The parent listed ``name`` as a real directory, so anything other
+    than that same directory observed here means the path changed after
+    the listing.  The name is inspected with ``fstatat`` without
+    following symlinks and then opened with ``openat`` using
+    ``O_NOFOLLOW`` and ``O_DIRECTORY``; the descriptor is fstat()ed and
+    proved to be the directory the inspection named.  A symlink swapped
+    in at any point in this sequence fails the export identifying
+    ``display`` as a directory that changed into a symlink, and its
+    target — outside the tree, inside it, or the moved original — is
+    never touched.
     """
     try:
-        stat_result = os.lstat(path)
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
-        raise ExportError(f"cannot read source file {path}: {error}") from error
-    if not stat.S_ISREG(stat_result.st_mode):
+        raise ExportError(f"cannot inspect directory {display}: {error}") from error
+    if stat.S_ISLNK(before.st_mode):
+        raise ExportError(
+            f"directory changed during scan: {display} is now a symlink"
+        )
+    if not stat.S_ISDIR(before.st_mode):
+        raise ExportError(
+            f"directory changed during scan: {display} is no longer a directory"
+        )
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            # The path changed between the fstatat and the open; inspect
+            # it once more to report the concrete reason.
+            raise _directory_changed_error(
+                parent_fd, name, display, during_scan=True
+            ) from error
+        raise ExportError(f"cannot scan directory {display}: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(f"cannot scan directory {display}: {error}") from error
+    if not stat.S_ISDIR(opened.st_mode) or (
+        opened.st_dev,
+        opened.st_ino,
+    ) != (before.st_dev, before.st_ino):
+        os.close(descriptor)
+        raise _directory_changed_error(
+            parent_fd, name, display, during_scan=True
+        )
+    return descriptor
+
+
+def _assert_still_same_directory(
+    parent_fd: int, name: str, display: Path, directory_fd: int
+) -> None:
+    """Re-check that ``name`` in the parent still names ``directory_fd``."""
+    try:
+        now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ExportError(f"cannot inspect directory {display}: {error}") from error
+    try:
+        pinned = os.fstat(directory_fd)
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {display}: {error}") from error
+    if (now.st_dev, now.st_ino) != (pinned.st_dev, pinned.st_ino):
+        raise _directory_changed_message(
+            display, now.st_mode, during_scan=True
+        )
+
+
+def _directory_changed_error(
+    parent_fd: int, name: str, display: Path, during_scan: bool
+) -> ExportError:
+    """Build the change error, inspecting the swapped path once for the reason."""
+    try:
+        now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        mode: int | None = now.st_mode
+    except OSError:
+        mode = None
+    return _directory_changed_message(display, mode, during_scan=during_scan)
+
+
+def _directory_changed_message(
+    display: Path, mode: int | None, during_scan: bool
+) -> ExportError:
+    """Fail naming the directory that changed and what it became."""
+    phase = "during scan" if during_scan else "during export"
+    if mode is not None and stat.S_ISLNK(mode):
+        reason = "is now a symlink"
+    elif mode is not None and stat.S_ISDIR(mode):
+        reason = "was replaced by a different directory"
+    else:
+        reason = "no longer points to the directory being scanned"
+    return ExportError(f"directory changed {phase}: {display} {reason}")
+
+
+class _SourceAnchor:
+    """Pinned view of the confirmed source tree, used while copying.
+
+    Holds the root descriptor for the whole export and the identity of
+    every directory observed during the lookup.  Each verification
+    re-derives directory bindings from descriptors (``fstatat`` and
+    ``openat`` with ``O_NOFOLLOW``/``O_DIRECTORY``) instead of trusting
+    path strings, so a real directory replaced by a symlink after the
+    lookup — before a sample is opened, while it is read or between
+    samples — fails the export even when the link leads to byte-equal
+    content.  :meth:`verify_all` runs once more after every sample has
+    been copied, so the package is never published when a binding
+    changed.
+    """
+
+    def __init__(
+        self,
+        root_fd: int,
+        root: Path,
+        directories: dict[str, tuple[Path, int, int]],
+    ) -> None:
+        self.root_fd = root_fd
+        self.root = root
+        self.directories = directories
+
+    def verify_file(self, source: Path) -> None:
+        """Prove the root and all ancestor directories of ``source``."""
+        parts = source.relative_to(self.root).parts[:-1]
+        self._descend(tuple(parts))
+
+    def verify_all(self) -> None:
+        """Prove the root and every directory recorded during the lookup.
+
+        A single descriptor-anchored traversal over the recorded
+        parent/child structure opens each directory exactly once, so a
+        tree of any depth costs one descent rather than one per
+        directory.  Every open is an ``openat`` relative to the pinned
+        parent, so a symlink swapped in at any level is refused.
+        """
+        self._check_root()
+        children: dict[str, list[tuple[str, str]]] = {}
+        for key in self.directories:
+            if not key:
+                continue
+            parent_key, _, name = key.rpartition("/")
+            children.setdefault(parent_key, []).append((name, key))
+        self._verify_children(self.root_fd, "", self.root, children)
+
+    def _check_root(self) -> None:
+        _, root_dev, root_inode = self.directories[""]
+        try:
+            pinned_root = os.fstat(self.root_fd)
+        except OSError as error:
+            raise ExportError(
+                f"cannot inspect directory {self.root}: {error}"
+            ) from error
+        if (pinned_root.st_dev, pinned_root.st_ino) != (
+            root_dev,
+            root_inode,
+        ) or not stat.S_ISDIR(pinned_root.st_mode):
+            raise _directory_changed_message(
+                self.root, pinned_root.st_mode, during_scan=False
+            )
+
+    def _verify_children(
+        self,
+        parent_fd: int,
+        parent_key: str,
+        display: Path,
+        children: dict[str, list[tuple[str, str]]],
+    ) -> None:
+        for name, key in sorted(children.get(parent_key, ())):
+            child_display = display / name
+            descriptor = self._open_checked(
+                parent_fd, child_display.name, child_display,
+                *self.directories[key][1:],
+            )
+            try:
+                self._verify_children(
+                    descriptor, key, child_display, children
+                )
+            finally:
+                os.close(descriptor)
+
+    def _descend(self, parts: tuple[str, ...]) -> None:
+        # Start from the root descriptor held open since before the
+        # lookup: it pins the confirmed root inode regardless of later
+        # path changes.  Only intermediate children are opened here, and
+        # each is closed before returning (the root descriptor itself is
+        # owned by the export and must not be closed).
+        self._check_root()
+        cursor = self.root_fd
+        display = self.root
+        owned: list[int] = []
+        try:
+            for part in parts:
+                display = display / part
+                key = os.path.relpath(display, self.root).replace(os.sep, "/")
+                expected = self.directories.get(key)
+                if expected is None:
+                    raise ExportError(
+                        f"directory changed during export: {display} is "
+                        f"not part of the scanned tree"
+                    )
+                cursor = self._open_checked(cursor, part, display, *expected[1:])
+                owned.append(cursor)
+        finally:
+            for descriptor in owned:
+                os.close(descriptor)
+
+    def _open_checked(
+        self,
+        parent_fd: int,
+        name: str,
+        display: Path,
+        expected_dev: int,
+        expected_inode: int,
+    ) -> int:
+        """Open one directory component, refusing any changed binding."""
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ExportError(
+                f"cannot inspect directory {display}: {error}"
+            ) from error
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(before.st_mode)
+            or (before.st_dev, before.st_ino) != (expected_dev, expected_inode)
+        ):
+            raise _directory_changed_message(
+                display, before.st_mode, during_scan=False
+            )
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise _directory_changed_error(
+                    parent_fd, name, display, during_scan=False
+                ) from error
+            raise ExportError(
+                f"cannot inspect directory {display}: {error}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            os.close(descriptor)
+            raise ExportError(
+                f"cannot inspect directory {display}: {error}"
+            ) from error
+        if not stat.S_ISDIR(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (expected_dev, expected_inode):
+            os.close(descriptor)
+            raise _directory_changed_error(
+                parent_fd, name, display, during_scan=False
+            )
+        return descriptor
+
+
+# Open-relative-to-a-directory-descriptor support (openat/fstatat with
+# dir_fd, O_NOFOLLOW, O_DIRECTORY) is provided by the module-level
+# _O_NOFOLLOW / _O_DIRECTORY flags above.
+
+
+def _hash_regular_file_at(
+    directory_fd: int, name: str, path: Path
+) -> tuple[str, int, int]:
+    """Read one directory-relative file in full, pinned through the open.
+
+    The name is inspected with ``fstatat`` relative to the pinned
+    directory descriptor and opened with ``openat`` plus
+    ``O_NOFOLLOW``, so a symlink swapped in after the inspection cannot
+    redirect the read (the open fails with ``ELOOP``) and the bytes can
+    only come from an entry reached through the confirmed directory.
+    The recorded identity is the ``fstatat`` result; the copy later
+    independently re-pins the exact inode before its bytes are streamed
+    into the package.  Any failure raises with the path and reason.
+    Returns ``(digest, device, inode)``.
+    """
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ExportError(f"cannot inspect entry {path}: {error}") from error
+    if not stat.S_ISREG(before.st_mode):
         raise ExportError(f"cannot read source file {path}: not a regular file")
     try:
         descriptor = os.open(
-            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=directory_fd
         )
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ExportError(
+                f"cannot read source file {path}: path is now a symlink"
+            ) from error
         raise ExportError(f"cannot read source file {path}: {error}") from error
     try:
         hasher = hashlib.sha256()
@@ -356,7 +808,7 @@ def _hash_regular_file(path: Path) -> tuple[str, int, int]:
                 hasher.update(chunk)
     except OSError as error:
         raise ExportError(f"cannot read source file {path}: {error}") from error
-    return hasher.hexdigest(), stat_result.st_dev, stat_result.st_ino
+    return hasher.hexdigest(), before.st_dev, before.st_ino
 
 
 def _write_package(
@@ -365,6 +817,7 @@ def _write_package(
     members: list[dict[str, Any]],
     manifest: dict[str, Any],
     resolver: dict[str, tuple[Path, int, int]] | None = None,
+    source_anchor: _SourceAnchor | None = None,
 ) -> None:
     """Write the ZIP atomically: lock the target name, stream to a temp file.
 
@@ -399,9 +852,23 @@ def _write_package(
         temp_path = Path(temp_name)
         try:
             with os.fdopen(fd, "wb") as stream:
-                _write_zip(stream, classes, members, manifest, resolver)
+                _write_zip(
+                    stream,
+                    classes,
+                    members,
+                    manifest,
+                    resolver,
+                    source_anchor=source_anchor,
+                )
                 stream.flush()
                 os.fsync(stream.fileno())
+            if source_anchor is not None:
+                # Final gate before the package is published: every
+                # directory binding confirmed during the lookup must
+                # still hold.  A directory turned into a symlink while
+                # the last entry was streamed is caught here and the
+                # temp file is discarded rather than renamed into place.
+                source_anchor.verify_all()
             os.replace(temp_path, target)
             temp_path = None
             _fsync_directory(parent)
@@ -424,6 +891,7 @@ def _write_zip(
     members: list[dict[str, Any]],
     manifest: dict[str, Any],
     resolver: Resolver | None = None,
+    source_anchor: _SourceAnchor | None = None,
 ) -> None:
     """Stream the package into ``stream`` without holding media in memory."""
     directory_entries = _directory_entries(classes)
@@ -436,7 +904,13 @@ def _write_zip(
         for name in sorted(directory_entries):
             archive.writestr(_directory_info(name), b"")
         for arc_name, member in file_entries:
-            _write_sample(archive, arc_name, member, resolver)
+            _write_sample(
+                archive,
+                arc_name,
+                member,
+                resolver,
+                source_anchor=source_anchor,
+            )
         archive.writestr(_file_info("manifest.json"), _manifest_bytes(manifest))
 
 
@@ -453,6 +927,7 @@ def _write_sample(
     arc_name: str,
     member: dict[str, Any],
     resolver: Resolver | None = None,
+    source_anchor: _SourceAnchor | None = None,
 ) -> None:
     digest = member["sha256"]
     hasher = hashlib.sha256()
@@ -460,9 +935,13 @@ def _write_sample(
         # Source-directory export: read from the matched copy only.  The
         # plan's recorded source path is deliberately not consulted, so a
         # still-usable original location cannot paper over a missing
-        # match.  The opened object is pinned to the regular inode
-        # confirmed at lookup time, so a swap after that confirmation
-        # cannot be copied in its place.
+        # match.  First prove every ancestor directory is still the
+        # directory confirmed during the lookup (anchored to descriptors,
+        # not path strings), so a real directory replaced by a symlink
+        # after the lookup cannot lead to the bytes below.  The opened
+        # file itself is then pinned to the regular inode confirmed at
+        # lookup time, so a file swap after that confirmation cannot be
+        # copied in its place.
         try:
             source, expected_device, expected_inode = resolver[digest]
         except KeyError:
@@ -470,6 +949,8 @@ def _write_sample(
                 f"sample {digest} in set {member['set']}: no file with "
                 f"matching content found under the source directory"
             ) from None
+        if source_anchor is not None:
+            source_anchor.verify_file(source)
         source_stream, source_size = _open_resolved_source(
             source, digest, expected_device, expected_inode
         )
