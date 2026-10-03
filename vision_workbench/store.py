@@ -200,9 +200,11 @@ class DatasetStore:
         a candidate cannot be read in full, a candidate's identity,
         size or modification time changes while it is being read, or a
         subdirectory confirmed as a real directory is replaced by a
-        symbolic link before its scan or before its candidates finish
-        reading — the link target's images are never imported or even
-        reported as duplicates.
+        symbolic link before its scan, while it is being scanned, or
+        while one of its candidates is being read — the replacement is
+        reported with the subdirectory's path and the symbolic-link
+        reason, the link target's entries are never used and its images
+        are never read, imported or even reported as duplicates.
         """
         self.initialize()
         source_path = Path(source)
@@ -217,16 +219,30 @@ class DatasetStore:
         # lock: I/O overlaps with peers, and a file that changes mid-read
         # fails the whole batch before anything is committed.  A confirmed
         # subdirectory swapped for a symlink is never read through: every
-        # candidate's ancestor directories are re-checked before it is
-        # opened, and once more after all reads, so the link target's
+        # candidate's ancestor directories are checked before it is opened
+        # and re-checked if its read fails, so a swap around the read
+        # reports the replaced directory rather than a read failure of the
+        # link target, and once more after all reads, so the link target's
         # images cannot be imported or even reported as duplicates.
         candidates = []
         for rel_path in rel_paths:
             ancestor = root
+            ancestors = []
             for part in Path(rel_path).parts[:-1]:
                 ancestor = ancestor / part
                 self._raise_if_now_symlink(ancestor)
-            candidates.append(self._read_candidate(root / rel_path, rel_path))
+                ancestors.append(ancestor)
+            try:
+                candidates.append(self._read_candidate(root / rel_path, rel_path))
+            except ValueError:
+                # A confirmed ancestor replaced by a symlink around the
+                # read makes the read fail with the target's problem (or
+                # an identity mismatch against it); the batch must report
+                # the replaced subdirectory and its symbolic-link reason
+                # instead of the read failure the swap caused.
+                for ancestor in ancestors:
+                    self._raise_if_now_symlink(ancestor)
+                raise
         for directory in confirmed_dirs:
             self._raise_if_now_symlink(directory)
 
@@ -287,10 +303,12 @@ class DatasetStore:
         skipped, and recursion never follows symlinked directories.  Any
         directory that should be visited but cannot be scanned fails the
         whole import with the path and reason.  A subdirectory is
-        re-checked with lstat() immediately before it is descended into,
-        and the confirmed list lets the caller re-verify it after the
-        candidate reads: a directory replaced by a symlink mid-import fails
-        the whole batch rather than following the link.
+        re-checked with lstat() immediately before it is descended into
+        and again right after its scan, and the confirmed list lets the
+        caller re-verify it after the candidate reads: a directory
+        replaced by a symlink mid-import fails the whole batch with the
+        subdirectory's path and the symbolic-link reason, and entries
+        obtained by scanning through the link are never used.
         """
         rel_paths: list[str] = []
         confirmed_dirs: list[Path] = []
@@ -299,13 +317,21 @@ class DatasetStore:
             try:
                 entries = list(os.scandir(directory))
             except OSError as error:
+                # A confirmed directory swapped for a symlink just before
+                # its scan reports the swap itself, never the link
+                # target's scan error.
+                self._raise_if_now_symlink(directory)
                 raise ValueError(
                     f"cannot scan directory {directory}: {error}"
                 ) from error
+            # The scan may have raced a swap and followed a symlink onto
+            # the link target; never use entries obtained that way.
+            self._raise_if_now_symlink(directory)
             for entry in entries:
                 try:
                     is_file = entry.is_file(follow_symlinks=False)
                 except OSError as error:
+                    self._raise_if_now_symlink(directory)
                     raise ValueError(
                         f"cannot inspect entry {entry.path}: {error}"
                     ) from error
@@ -318,6 +344,7 @@ class DatasetStore:
                     try:
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError as error:
+                        self._raise_if_now_symlink(directory)
                         raise ValueError(
                             f"cannot inspect entry {entry.path}: {error}"
                         ) from error

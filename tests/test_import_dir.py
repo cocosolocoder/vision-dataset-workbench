@@ -454,6 +454,115 @@ class DirectoryImportTest(unittest.TestCase):
                 self.assertEqual(store.lookup_label(digest)["label"], "bird")
                 self.assertFalse(store.transaction_path.exists())
 
+    def test_subdirectory_swapped_mid_read_reports_symlink(self) -> None:
+        # The swap lands while a candidate inside the confirmed directory
+        # is being read; the link target holds a same-named image with
+        # different bytes.  The batch must report the replaced directory,
+        # not an identity mismatch against the target's file.
+        self._write("top.jpg", b"top")
+        self._write("sub/inside.jpg", b"inside")
+        target = self.base / "target"
+        target.mkdir()
+        (target / "inside.jpg").write_bytes(b"different-bytes")
+        from vision_workbench import confirmed
+
+        real_hash = confirmed.hash_descriptor
+        state = {"done": False}
+
+        def swap_mid_read(descriptor):
+            if not state["done"]:
+                state["done"] = True
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(target, self.source / "sub")
+            return real_hash(descriptor)
+
+        with mock.patch(
+            "vision_workbench.store.confirmed.hash_descriptor", swap_mid_read
+        ):
+            with self.assertRaises(ValueError) as context:
+                self.store.import_directory(self.source, "cat", recursive=True)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symbolic link", message)
+        self.assertEqual(self.store.summary()["items"], 0)
+        self.assertFalse(self.store.transaction_path.exists())
+
+    def test_subdirectory_swapped_before_its_scan_reports_symlink(self) -> None:
+        # The swap lands after the pre-descend check but before the
+        # subdirectory's own scan; the link target cannot even be scanned.
+        # The batch must report the replaced directory, never the target's
+        # scan error.
+        self._write("sub/inside.jpg", b"inside")
+        target = self.base / "locked-target"
+        target.mkdir()
+        (target / "other.jpg").write_bytes(b"other")
+        real_scandir = os.scandir
+        state = {"done": False}
+
+        def swap_on_subdir_scan(path, *args, **kwargs):
+            if not state["done"] and Path(path) == self.source.resolve() / "sub":
+                state["done"] = True
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(target, self.source / "sub")
+            return real_scandir(path, *args, **kwargs)
+
+        try:
+            os.chmod(target, 0o000)
+            with mock.patch("vision_workbench.store.os.scandir", swap_on_subdir_scan):
+                with self.assertRaises(ValueError) as context:
+                    self.store.import_directory(self.source, "cat", recursive=True)
+        finally:
+            os.chmod(target, 0o755)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symbolic link", message)
+        self.assertNotIn("cannot scan directory", message)
+        self.assertEqual(self.store.summary()["items"], 0)
+        self.assertFalse(self.store.transaction_path.exists())
+
+    def test_subdirectory_swapped_before_candidate_open_reports_symlink(self) -> None:
+        # The swap lands after the ancestor check but before the candidate
+        # is opened; the link target's same-named image is unreadable.
+        # The batch must report the replaced directory, never a read
+        # failure of the target's image.
+        self._write("sub/inside.jpg", b"inside")
+        target = self.base / "target"
+        target.mkdir()
+        (target / "inside.jpg").write_bytes(b"target-inside")
+        from vision_workbench import confirmed
+
+        real_confirm = confirmed.confirm_and_open_regular
+        state = {"done": False}
+
+        def swap_before_open(path, *args, **kwargs):
+            if not state["done"] and (
+                Path(path).parent == self.source.resolve() / "sub"
+            ):
+                state["done"] = True
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(target, self.source / "sub")
+            return real_confirm(path, *args, **kwargs)
+
+        try:
+            os.chmod(target / "inside.jpg", 0o000)
+            with mock.patch(
+                "vision_workbench.store.confirmed.confirm_and_open_regular",
+                swap_before_open,
+            ):
+                with self.assertRaises(ValueError) as context:
+                    self.store.import_directory(self.source, "cat", recursive=True)
+        finally:
+            os.chmod(target / "inside.jpg", 0o644)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symbolic link", message)
+        self.assertNotIn("cannot read", message)
+        self.assertEqual(self.store.summary()["items"], 0)
+        self.assertFalse(self.store.transaction_path.exists())
+
     def test_failed_import_preserves_labels_history_and_splits(self) -> None:
         seed = self.base / "seed.jpg"
         seed.write_bytes(b"seed")
