@@ -497,19 +497,139 @@ def _walk_directory(
             os.close(directory_fd)
 
 
+class _DirectoryConfirmation:
+    """The one directory-confirmation rule, parameterized by its scene.
+
+    Both scenes that prove a directory along the source tree apply the
+    same rule:
+
+    1. inspect the parent-relative name with ``fstatat`` without
+       following a symlink;
+    2. open it with ``openat`` using ``O_NOFOLLOW`` and ``O_DIRECTORY``;
+    3. ``fstat`` the descriptor and prove the object reached is a real
+       directory carrying the expected ``(device, inode)`` identity.
+
+    The scenes differ only in what the expected identity is and how a
+    failure is worded, which this class carries:
+
+    * :data:`_LOOKUP_CONFIRMATION` is the walk's *first* confirmation:
+      the expected identity is the fresh ``fstatat`` observation itself,
+      the open/descriptor failures read "cannot scan" and a change
+      reads "during scan";
+    * :data:`_COPY_CONFIRMATION` is the package copy's re-confirmation
+      of a directory the lookup already recorded: the expected identity
+      is the recorded one, failures read "cannot inspect" and a change
+      reads "during export".
+    """
+
+    __slots__ = ("change_label", "access_verb")
+
+    def __init__(self, change_label: str, access_verb: str) -> None:
+        self.change_label = change_label
+        self.access_verb = access_verb
+
+    def access_failure(self, display: Path, error: OSError) -> ExportError:
+        """Build the failure for a directory that cannot be opened/read."""
+        return ExportError(f"cannot {self.access_verb} directory {display}: {error}")
+
+    def changed_message(self, display: Path, mode: int | None) -> ExportError:
+        """Fail naming ``display`` and what the changed path is now.
+
+        ``mode`` is the no-follow status of the path that replaced the
+        confirmed directory; ``None`` when that path cannot be inspected.
+        """
+        if mode is not None and stat.S_ISLNK(mode):
+            reason = "is now a symlink"
+        elif mode is not None and stat.S_ISDIR(mode):
+            reason = "was replaced by a different directory"
+        else:
+            reason = "no longer points to the directory being scanned"
+        return ExportError(
+            f"directory changed {self.change_label}: {display} {reason}"
+        )
+
+    def changed_after_reinspection(
+        self, parent_fd: int, name: str, display: Path
+    ) -> ExportError:
+        """Build the change error, inspecting the swapped path once for why."""
+        try:
+            now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            mode: int | None = now.st_mode
+        except OSError:
+            mode = None
+        return self.changed_message(display, mode)
+
+
+# First confirmation during the lookup walk; re-confirmation while the
+# confirmed tree is copied into the package.
+_LOOKUP_CONFIRMATION = _DirectoryConfirmation("during scan", "scan")
+_COPY_CONFIRMATION = _DirectoryConfirmation("during export", "inspect")
+
+
+def _open_confirmed_directory(
+    parent_fd: int,
+    name: str,
+    display: Path,
+    expected_identity: tuple[int, int],
+    confirmation: _DirectoryConfirmation,
+) -> int:
+    """Open ``name`` under ``parent_fd`` and pin the confirmed directory.
+
+    The caller has already inspected the name (``fstatat`` without
+    following symlinks) and decided it names the directory it expects;
+    this is the shared second half of both confirmation scenes: open
+    with ``openat`` using ``O_NOFOLLOW``/``O_DIRECTORY`` and prove via
+    ``fstat`` of the descriptor that the object really reached is a
+    directory with ``expected_identity``.
+
+    If the path is remapped in the inspection-to-open gap the open
+    fails with ``ELOOP``/``ENOTDIR``; the name is then inspected once
+    more so the error says concretely what it became.  Any other open
+    or descriptor-inspection failure is reported through the scene's
+    own access wording.  The returned descriptor is owned by the caller.
+    """
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            # The path changed between the fstatat and the open; inspect
+            # it once more to report the concrete reason.
+            raise confirmation.changed_after_reinspection(
+                parent_fd, name, display
+            ) from error
+        raise confirmation.access_failure(display, error) from error
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise confirmation.access_failure(display, error) from error
+    if not stat.S_ISDIR(opened.st_mode) or (
+        opened.st_dev,
+        opened.st_ino,
+    ) != expected_identity:
+        os.close(descriptor)
+        raise confirmation.changed_after_reinspection(parent_fd, name, display)
+    return descriptor
+
+
 def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
-    """Open a listed subdirectory relative to ``parent_fd`` and pin it.
+    """First-confirm a listed subdirectory of the lookup and pin it.
 
     The parent listed ``name`` as a real directory, so anything other
     than that same directory observed here means the path changed after
     the listing.  The name is inspected with ``fstatat`` without
-    following symlinks and then opened with ``openat`` using
-    ``O_NOFOLLOW`` and ``O_DIRECTORY``; the descriptor is fstat()ed and
-    proved to be the directory the inspection named.  A symlink swapped
-    in at any point in this sequence fails the export identifying
-    ``display`` as a directory that changed into a symlink, and its
-    target — outside the tree, inside it, or the moved original — is
-    never touched.
+    following symlinks; a symlink swapped in at this point fails the
+    export identifying ``display`` as a directory that changed into a
+    symlink, and any other non-directory fails saying it is no longer a
+    directory.  The descriptor is then opened and proved by the shared
+    :func:`_open_confirmed_directory` rule against the identity just
+    observed, so a swap landing between the inspection and the open —
+    link target outside the tree, inside it, or the moved original — is
+    never followed.
     """
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -523,34 +643,13 @@ def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
         raise ExportError(
             f"directory changed during scan: {display} is no longer a directory"
         )
-    try:
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
-            dir_fd=parent_fd,
-        )
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            # The path changed between the fstatat and the open; inspect
-            # it once more to report the concrete reason.
-            raise _directory_changed_error(
-                parent_fd, name, display, during_scan=True
-            ) from error
-        raise ExportError(f"cannot scan directory {display}: {error}") from error
-    try:
-        opened = os.fstat(descriptor)
-    except OSError as error:
-        os.close(descriptor)
-        raise ExportError(f"cannot scan directory {display}: {error}") from error
-    if not stat.S_ISDIR(opened.st_mode) or (
-        opened.st_dev,
-        opened.st_ino,
-    ) != (before.st_dev, before.st_ino):
-        os.close(descriptor)
-        raise _directory_changed_error(
-            parent_fd, name, display, during_scan=True
-        )
-    return descriptor
+    return _open_confirmed_directory(
+        parent_fd,
+        name,
+        display,
+        (before.st_dev, before.st_ino),
+        _LOOKUP_CONFIRMATION,
+    )
 
 
 def _assert_still_same_directory(
@@ -566,35 +665,7 @@ def _assert_still_same_directory(
     except OSError as error:
         raise ExportError(f"cannot scan directory {display}: {error}") from error
     if (now.st_dev, now.st_ino) != (pinned.st_dev, pinned.st_ino):
-        raise _directory_changed_message(
-            display, now.st_mode, during_scan=True
-        )
-
-
-def _directory_changed_error(
-    parent_fd: int, name: str, display: Path, during_scan: bool
-) -> ExportError:
-    """Build the change error, inspecting the swapped path once for the reason."""
-    try:
-        now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        mode: int | None = now.st_mode
-    except OSError:
-        mode = None
-    return _directory_changed_message(display, mode, during_scan=during_scan)
-
-
-def _directory_changed_message(
-    display: Path, mode: int | None, during_scan: bool
-) -> ExportError:
-    """Fail naming the directory that changed and what it became."""
-    phase = "during scan" if during_scan else "during export"
-    if mode is not None and stat.S_ISLNK(mode):
-        reason = "is now a symlink"
-    elif mode is not None and stat.S_ISDIR(mode):
-        reason = "was replaced by a different directory"
-    else:
-        reason = "no longer points to the directory being scanned"
-    return ExportError(f"directory changed {phase}: {display} {reason}")
+        raise _LOOKUP_CONFIRMATION.changed_message(display, now.st_mode)
 
 
 class _SourceAnchor:
@@ -650,15 +721,13 @@ class _SourceAnchor:
         try:
             pinned_root = os.fstat(self.root_fd)
         except OSError as error:
-            raise ExportError(
-                f"cannot inspect directory {self.root}: {error}"
-            ) from error
+            raise _COPY_CONFIRMATION.access_failure(self.root, error) from error
         if (pinned_root.st_dev, pinned_root.st_ino) != (
             root_dev,
             root_inode,
         ) or not stat.S_ISDIR(pinned_root.st_mode):
-            raise _directory_changed_message(
-                self.root, pinned_root.st_mode, during_scan=False
+            raise _COPY_CONFIRMATION.changed_message(
+                self.root, pinned_root.st_mode
             )
 
     def _verify_children(
@@ -715,51 +784,32 @@ class _SourceAnchor:
         expected_dev: int,
         expected_inode: int,
     ) -> int:
-        """Open one directory component, refusing any changed binding."""
+        """Open one directory component, refusing any changed binding.
+
+        The copy phase re-confirms a directory the lookup already
+        recorded, so the name's fresh ``fstatat`` observation must be a
+        real directory carrying that recorded identity; the open and
+        descriptor pin then run through the shared
+        :func:`_open_confirmed_directory` rule, worded for the copy
+        scene.
+        """
         try:
             before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError as error:
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
+            raise _COPY_CONFIRMATION.access_failure(display, error) from error
         if (
             stat.S_ISLNK(before.st_mode)
             or not stat.S_ISDIR(before.st_mode)
             or (before.st_dev, before.st_ino) != (expected_dev, expected_inode)
         ):
-            raise _directory_changed_message(
-                display, before.st_mode, during_scan=False
-            )
-        try:
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
-                dir_fd=parent_fd,
-            )
-        except OSError as error:
-            if error.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise _directory_changed_error(
-                    parent_fd, name, display, during_scan=False
-                ) from error
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
-        try:
-            opened = os.fstat(descriptor)
-        except OSError as error:
-            os.close(descriptor)
-            raise ExportError(
-                f"cannot inspect directory {display}: {error}"
-            ) from error
-        if not stat.S_ISDIR(opened.st_mode) or (
-            opened.st_dev,
-            opened.st_ino,
-        ) != (expected_dev, expected_inode):
-            os.close(descriptor)
-            raise _directory_changed_error(
-                parent_fd, name, display, during_scan=False
-            )
-        return descriptor
+            raise _COPY_CONFIRMATION.changed_message(display, before.st_mode)
+        return _open_confirmed_directory(
+            parent_fd,
+            name,
+            display,
+            (expected_dev, expected_inode),
+            _COPY_CONFIRMATION,
+        )
 
 
 # Open-relative-to-a-directory-descriptor support (openat/fstatat with
