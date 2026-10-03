@@ -17,6 +17,19 @@ python3 -m vision_workbench summary ./workspace
 
 The manifest is written to `.vision-workbench/manifest.json`. Importing the same file twice is idempotent because records are keyed by the file content hash. Imports, batch writes, undos and plan creation are serialized by a single workspace lock and committed through the same write-ahead journal, so several local processes can operate on one workspace at once: every successful operation survives, concurrent imports of different content all land, and duplicate imports report `already present` once while keeping the first registration's source and label.
 
+A single-file `add` registers the file's full SHA-256 digest, byte size and
+resolved absolute source path, and all three are read from the same stable
+regular file: the source is checked before and after the read, and the read
+itself is pinned to the confirmed file. If the source is rewritten, appended
+to, truncated, deleted and recreated, or replaced by another file (even one
+with identical content, size and modification time) while it is being
+confirmed or read — or if the path vanishes, becomes a directory or a
+symlink, or cannot be opened or read in full — the import fails with the
+source path and the reason, and no sample is registered. Content that
+happens to match an existing digest never masks such a failure. A source
+path that is a symlink when the command starts is still followed and its
+target imported.
+
 ## Importing a directory
 
 A whole directory of images can be registered in one batch:

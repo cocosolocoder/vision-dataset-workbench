@@ -89,7 +89,12 @@ class DatasetStore:
         # Hashing is pure I/O on the source file; do it before taking the
         # workspace lock so concurrent imports of different files hash in
         # parallel and only serialize for the manifest check-and-commit.
-        digest = self._digest(file_path)
+        # The digest and the size must describe one stable file: the read
+        # fails if the file's identity, size or modification time changes
+        # around or during the read, so a source being rewritten or
+        # replaced is rejected instead of registering a digest/size pair
+        # that never coexisted.
+        digest, size = self._read_stable(file_path, str(file_path))
         with self._locked(create=True):
             manifest = self._read()
             if any(item["sha256"] == digest for item in manifest["items"]):
@@ -100,7 +105,7 @@ class DatasetStore:
                 {
                     "sha256": digest,
                     "source": str(file_path),
-                    "size": file_path.stat().st_size,
+                    "size": size,
                     "label": label,
                 }
             )
@@ -248,12 +253,30 @@ class DatasetStore:
         Returns ``(rel_path, absolute_path, digest, size)``.  A mismatch or
         read failure raises before the batch is committed.
         """
+        digest, size = self._read_stable(path, rel_path)
+        return rel_path, path, digest, size
+
+    @staticmethod
+    def _read_stable(path: Path, display: str) -> tuple[str, int]:
+        """Read one file in full and return ``(digest, size)`` for it.
+
+        The digest and size are guaranteed to describe the same stable
+        regular file: the path is lstat()ed before and after the read, the
+        open uses ``O_NOFOLLOW`` so a path swapped for a symlink cannot
+        redirect the read to another file, and the opened descriptor is
+        fstat()ed to prove it is the inode that was confirmed before the
+        read.  Any identity, size or modification-time change — in-place
+        rewrites, appends, truncation, delete-and-recreate, or replacing
+        the path with another file, even one with identical content, size
+        and mtime — fails with the path and reason, as do a vanishing
+        path, a non-regular file and any open or read error.
+        """
         try:
             before = os.lstat(path)
         except OSError as error:
-            raise ValueError(f"cannot read {rel_path}: {error}") from error
+            raise ValueError(f"cannot read {display}: {error}") from error
         if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"cannot read {rel_path}: not a regular file")
+            raise ValueError(f"cannot read {display}: not a regular file")
         try:
             # O_NOFOLLOW guarantees the bytes come from the inode just
             # lstat()ed, even if the path is swapped for a symlink meanwhile.
@@ -261,9 +284,24 @@ class DatasetStore:
                 path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             )
         except OSError as error:
-            raise ValueError(f"cannot read {rel_path}: {error}") from error
+            raise ValueError(f"cannot read {display}: {error}") from error
         try:
-            hasher = hashlib.sha256()
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            os.close(descriptor)
+            raise ValueError(f"cannot read {display}: {error}") from error
+        # The path may have been replaced by another regular file between
+        # the lstat() and the open(); the descriptor must belong to the
+        # inode that was confirmed, or the bytes read would not come from
+        # the file this import agreed to read.
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            os.close(descriptor)
+            raise ValueError(
+                f"file changed during import: {display} "
+                "(identity, size or modification time changed)"
+            )
+        hasher = hashlib.sha256()
+        try:
             with os.fdopen(descriptor, "rb") as stream:
                 while True:
                     chunk = stream.read(1024 * 1024)
@@ -271,18 +309,18 @@ class DatasetStore:
                         break
                     hasher.update(chunk)
         except OSError as error:
-            raise ValueError(f"cannot read {rel_path}: {error}") from error
+            raise ValueError(f"cannot read {display}: {error}") from error
         try:
             after = os.lstat(path)
         except OSError as error:
-            raise ValueError(f"cannot read {rel_path}: {error}") from error
+            raise ValueError(f"cannot read {display}: {error}") from error
         identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ValueError(
-                f"file changed during import: {rel_path} "
+                f"file changed during import: {display} "
                 "(identity, size or modification time changed)"
             )
-        return rel_path, path, hasher.hexdigest(), before.st_size
+        return hasher.hexdigest(), before.st_size
 
     def summary(self) -> dict[str, Any]:
         self.initialize()
@@ -858,11 +896,3 @@ class DatasetStore:
         if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
             raise ValueError("Unsupported dataset manifest")
         return data
-
-    @staticmethod
-    def _digest(path: Path) -> str:
-        hasher = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
