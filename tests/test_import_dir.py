@@ -366,6 +366,101 @@ class DirectoryImportTest(unittest.TestCase):
         self.assertEqual(self.store.summary()["items"], 0)
         self.assertFalse(self.store.transaction_path.exists())
 
+    def test_subdirectory_swapped_for_symlink_before_scan_fails_batch(self) -> None:
+        self._write("top.jpg", b"top")
+        self._write("sub/inner.jpg", b"inner")
+        # The link target even lives inside the source tree.
+        self._write("real/x.jpg", b"x")
+        swapped = {"done": False}
+        real_lstat = os.lstat
+
+        def swap_at_check(path, *args, **kwargs):
+            if Path(path) == self.source / "sub" and not swapped["done"]:
+                swapped["done"] = True
+                # Confirmed a real directory when the parent was scanned,
+                # replaced by a symlink before it is entered.
+                (self.source / "sub").rename(self.base / "sub-moved")
+                os.symlink(self.source / "real", self.source / "sub")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch("vision_workbench.store.os.lstat", swap_at_check):
+            with self.assertRaises(ValueError) as context:
+                self.store.import_directory(self.source, "cat", recursive=True)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symlink", message)
+        # The whole batch failed: nothing was committed.
+        self.assertEqual(self.store.summary()["items"], 0)
+        self.assertFalse(self.store.transaction_path.exists())
+
+    def test_subdirectory_swapped_for_symlink_during_read_fails_batch(self) -> None:
+        self._write("top.jpg", b"top")
+        self._write("sub/inner.jpg", b"inner")
+        # Target outside the source tree, with a same-named, same-content
+        # image whose digest is already registered in the workspace.
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "inner.jpg").write_bytes(b"inner")
+        (outside / "extra.jpg").write_bytes(b"extra")
+        seed = self.base / "seed.jpg"
+        seed.write_bytes(b"seed")
+        self.store.add(seed, "bird")
+        plan = self.store.create_split("keep", 1, [1, 0, 0])
+
+        swapped = {"done": False}
+        real_read = self.store._read_candidate
+
+        def read_then_swap(path, rel_path):
+            if not swapped["done"]:
+                swapped["done"] = True
+                (self.source / "sub").rename(self.base / "sub-moved")
+                os.symlink(outside, self.source / "sub")
+            return real_read(path, rel_path)
+
+        with mock.patch.object(self.store, "_read_candidate", read_then_swap):
+            with self.assertRaises(ValueError) as context:
+                self.store.import_directory(self.source, "cat", recursive=True)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symlink", message)
+        # Already-read normal candidates did not become samples either.
+        self.assertEqual(self.store.summary()["items"], 1)
+        self.assertEqual(self.store.summary()["labels"], {"bird": 1})
+        # Existing history and split plans are untouched.
+        self.assertEqual(self.store.history(), [])
+        self.assertEqual(self.store.get_split("keep"), plan.plan)
+        self.assertFalse(self.store.transaction_path.exists())
+
+    def test_symlink_to_moved_original_subdirectory_still_fails(self) -> None:
+        self._write("sub/inner.jpg", b"inner")
+        swapped = {"done": False}
+        real_read = self.store._read_candidate
+
+        def read_then_swap(path, rel_path):
+            if not swapped["done"]:
+                swapped["done"] = True
+                # The link points at the very directory that was moved away;
+                # a symlink at the confirmed path fails the batch regardless.
+                (self.source / "sub").rename(self.base / "sub-moved")
+                os.symlink(self.base / "sub-moved", self.source / "sub")
+            return real_read(path, rel_path)
+
+        with mock.patch.object(self.store, "_read_candidate", read_then_swap):
+            with self.assertRaises(ValueError) as context:
+                self.store.import_directory(self.source, "cat", recursive=True)
+        self.assertIn("symlink", str(context.exception))
+        self.assertEqual(self.store.summary()["items"], 0)
+
+    def test_source_directory_given_through_symlink_still_works(self) -> None:
+        self._write("top.jpg", b"top")
+        self._write("sub/inner.jpg", b"inner")
+        link = self.base / "source-link"
+        os.symlink(self.source, link)
+
+        result = self.store.import_directory(link, "cat", recursive=True)
+        self.assertEqual(result["added"], 2)
+        self.assertEqual(result["directory"], str(self.source.resolve()))
+
     def test_new_files_appearing_after_scan_are_left_for_next_import(self) -> None:
         self._write("a.jpg", b"a")
         real_read = self.store._read_candidate
