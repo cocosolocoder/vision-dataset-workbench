@@ -184,6 +184,117 @@ class SplitPlanStoreTest(StoreHarness):
         with self.assertRaises(SplitError):
             self.store.get_split("ok")
 
+    def corrupt_plan(self, mutate) -> tuple[Path, str]:
+        """Create a valid plan, apply ``mutate`` to its payload, return path/text."""
+        self.store.create_split("ok", 0, [1, 0, 0])
+        plan_path = self.store.splits_directory / "ok.json"
+        original = plan_path.read_text(encoding="utf-8")
+        payload = json.loads(original)
+        mutate(payload)
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+        return plan_path, original
+
+    def test_set_distribution_must_be_an_object(self) -> None:
+        self.add_sample("cat")
+        for bad in ([["cat", 1]], "cat", None):
+            with self.subTest(bad=bad):
+                plan_path, original = self.corrupt_plan(
+                    lambda payload: payload["sets"]["train"].__setitem__(
+                        "distribution", bad
+                    )
+                )
+                with self.assertRaises(SplitError) as caught:
+                    self.store.get_split("ok")
+                self.assertIn("train", str(caught.exception))
+                plan_path.write_text(original, encoding="utf-8")
+
+    def test_missing_set_distribution_rejected(self) -> None:
+        self.add_sample("cat")
+        # Even an empty set may not silently treat a missing distribution
+        # as an empty object.
+        self.corrupt_plan(
+            lambda payload: [
+                payload["sets"][name].pop("distribution")
+                for name in SET_NAMES
+            ]
+        )
+        with self.assertRaises(SplitError) as caught:
+            self.store.get_split("ok")
+        self.assertIn("train", str(caught.exception))
+
+    def test_set_sample_count_must_be_a_plain_integer(self) -> None:
+        self.add_sample("cat")
+        for bad in (True, 1.0, "1", None, -1):
+            with self.subTest(bad=bad):
+                plan_path, original = self.corrupt_plan(
+                    lambda payload: payload["sets"]["train"].__setitem__(
+                        "samples", bad
+                    )
+                )
+                with self.assertRaises(SplitError) as caught:
+                    self.store.get_split("ok")
+                self.assertIn("train", str(caught.exception))
+                plan_path.write_text(original, encoding="utf-8")
+
+    def test_category_counts_must_be_plain_integers(self) -> None:
+        self.add_sample("cat")
+        for bad in (True, 1.0, "1", None, -1):
+            with self.subTest(bad=bad):
+                plan_path, original = self.corrupt_plan(
+                    lambda payload: payload["sets"]["train"]["distribution"]
+                    .__setitem__("cat", bad)
+                )
+                with self.assertRaises(SplitError) as caught:
+                    self.store.get_split("ok")
+                self.assertIn("train", str(caught.exception))
+                plan_path.write_text(original, encoding="utf-8")
+
+    def test_overall_statistics_must_be_plain_integers(self) -> None:
+        self.add_sample("cat")
+        for bad in (True, 1.0, "1", None, -1):
+            with self.subTest(bad=bad):
+                plan_path, original = self.corrupt_plan(
+                    lambda payload: payload["samples"].__setitem__("total", bad)
+                )
+                with self.assertRaises(SplitError):
+                    self.store.get_split("ok")
+                plan_path.write_text(original, encoding="utf-8")
+
+    def test_overall_distribution_must_be_an_object_of_counts(self) -> None:
+        self.add_sample("cat")
+        for bad in ([["cat", 1]], "cat", None, {"cat": True}, {"cat": 1.0}):
+            with self.subTest(bad=bad):
+                plan_path, original = self.corrupt_plan(
+                    lambda payload: payload["samples"].__setitem__(
+                        "distribution", bad
+                    )
+                )
+                with self.assertRaises(SplitError):
+                    self.store.get_split("ok")
+                plan_path.write_text(original, encoding="utf-8")
+
+    def test_rejected_read_does_not_rewrite_plan(self) -> None:
+        self.add_sample("cat")
+        plan_path, _ = self.corrupt_plan(
+            lambda payload: payload["sets"]["train"].__setitem__("samples", True)
+        )
+        corrupted = plan_path.read_text(encoding="utf-8")
+        with self.assertRaises(SplitError):
+            self.store.get_split("ok")
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+    def test_statistics_must_match_the_saved_members(self) -> None:
+        self.add_sample("cat")
+        self.add_sample("dog")
+        self.corrupt_plan(
+            lambda payload: payload["sets"]["train"].__setitem__(
+                "distribution", {"cat": 2}
+            )
+        )
+        with self.assertRaises(SplitError) as caught:
+            self.store.get_split("ok")
+        self.assertIn("train", str(caught.exception))
+
     def test_partial_write_never_visible(self) -> None:
         self.add_sample("cat")
         plan_path = self.store.splits_directory / "ghost.json"
@@ -256,6 +367,40 @@ class CliTest(StoreHarness):
                                "--seed", "1", "--train", "0.5",
                                "--validation", "0.5", "--test", "0.5")
         self.assertNotEqual(invalid.returncode, 0)
+
+    def test_cli_show_and_export_reject_corrupt_statistics(self) -> None:
+        self.add_sample("cat")
+        created = self.run_cli("split", "create", str(self.root), "run1",
+                               "--seed", "7", "--train", "1",
+                               "--validation", "0", "--test", "0")
+        self.assertEqual(created.returncode, 0, created.stderr)
+
+        plan_path = self.store.splits_directory / "run1.json"
+        original = plan_path.read_text(encoding="utf-8")
+        payload = json.loads(original)
+        payload["sets"]["validation"]["distribution"] = None
+        payload["sets"]["test"]["samples"] = True
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+        corrupted = plan_path.read_text(encoding="utf-8")
+
+        shown = self.run_cli("split", "show", str(self.root), "run1")
+        self.assertEqual(shown.returncode, 1)
+        self.assertEqual(shown.stdout, "")
+        self.assertIn("error:", shown.stderr)
+        self.assertIn("validation", shown.stderr)
+        self.assertNotIn("Traceback", shown.stderr)
+
+        target = self.root.parent / "out.zip"
+        exported = self.run_cli("export", str(self.root), "run1", str(target))
+        self.assertEqual(exported.returncode, 1)
+        self.assertIn("error:", exported.stderr)
+        self.assertNotIn("Traceback", exported.stderr)
+        self.assertFalse(target.exists())
+        # The failed reads must not have rewritten the plan.
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+        plan_path.write_text(original, encoding="utf-8")
+        restored = self.run_cli("split", "show", str(self.root), "run1")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
 
     def test_existing_commands_unchanged(self) -> None:
         image = self.root.parent / "pic.jpg"

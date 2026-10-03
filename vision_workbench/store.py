@@ -87,6 +87,36 @@ class SplitPlanResult:
     plan: dict[str, Any]
 
 
+def _is_count(value: Any) -> bool:
+    """Whether ``value`` can serve as a sample or category count.
+
+    Only a genuine non-negative integer qualifies: booleans, floats
+    (even integral ones like ``1.0``), strings and ``None`` are rejected
+    even when they would compare equal to the correct count.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validated_distribution(distribution: Any, description: str) -> dict[str, Any]:
+    """Return a plan's class distribution, requiring a JSON object of counts.
+
+    A missing distribution — or an array, string or ``null`` in its
+    place — is a plan error, never silently treated as an empty
+    distribution, and every category count must be a non-negative
+    integer.  ``description`` names the statistic (and its set, when
+    the distribution belongs to one) for the error message.
+    """
+    if not isinstance(distribution, dict):
+        raise SplitError(f"Split plan record is missing {description}")
+    for category, count in distribution.items():
+        if not _is_count(count):
+            raise SplitError(
+                f"Split plan record has an invalid count for category "
+                f"{category!r} in {description}"
+            )
+    return distribution
+
+
 class DatasetStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -860,14 +890,13 @@ class DatasetStore:
             raise SplitError(f"Split plan record has invalid ratios: {error}") from error
 
         samples = data.get("samples")
-        if (
-            not isinstance(samples, dict)
-            or not isinstance(samples.get("total"), int)
-            or isinstance(samples.get("total"), bool)
-        ):
+        if not isinstance(samples, dict):
             raise SplitError("Split plan record is missing its sample summary")
-        if not isinstance(samples.get("distribution"), dict):
-            raise SplitError("Split plan record is missing its class distribution")
+        if not _is_count(samples.get("total")):
+            raise SplitError("Split plan record has an invalid sample total")
+        overall_distribution = _validated_distribution(
+            samples.get("distribution"), "its class distribution"
+        )
         sets = data.get("sets")
         if not isinstance(sets, dict):
             raise SplitError("Split plan record is missing its set assignments")
@@ -881,9 +910,15 @@ class DatasetStore:
             members = set_payload.get("members")
             if not isinstance(members, list):
                 raise SplitError(f"Split plan record is missing members for {set_name}")
-            if set_payload.get("samples") != len(members):
-                raise SplitError(f"Split plan record has a bad count for {set_name}")
-            distribution = Counter()
+            if not _is_count(set_payload.get("samples")):
+                raise SplitError(
+                    f"Split plan record has an invalid sample count for {set_name}"
+                )
+            set_distribution = _validated_distribution(
+                set_payload.get("distribution"),
+                f"its class distribution for {set_name}",
+            )
+            distribution: Counter[str] = Counter()
             for member in members:
                 if (
                     not isinstance(member, dict)
@@ -900,17 +935,19 @@ class DatasetStore:
                 seen.add(digest)
                 distribution[member["label"]] += 1
                 overall[member["label"]] += 1
-            if dict(sorted(distribution.items())) != {
-                key: value for key, value in sorted(set_payload.get("distribution", {}).items())
-            }:
+            if set_payload["samples"] != len(members):
+                raise SplitError(f"Split plan record has a bad count for {set_name}")
+            if dict(sorted(distribution.items())) != dict(
+                sorted(set_distribution.items())
+            ):
                 raise SplitError(
                     f"Split plan record has a mismatched distribution for {set_name}"
                 )
         if samples["total"] != len(seen):
             raise SplitError("Split plan record has a mismatched sample total")
-        if dict(sorted(overall.items())) != {
-            key: value for key, value in sorted(samples["distribution"].items())
-        }:
+        if dict(sorted(overall.items())) != dict(
+            sorted(overall_distribution.items())
+        ):
             raise SplitError("Split plan record has a mismatched class distribution")
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
