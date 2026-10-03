@@ -138,8 +138,12 @@ class DatasetStore:
         The whole batch commits as one journal transaction.  The import
         fails entirely (no new samples) when the source is missing or not
         a directory, a directory that should be visited cannot be scanned,
-        a candidate cannot be read in full, or a candidate's identity,
-        size or modification time changes while it is being read.
+        a candidate cannot be read in full, a candidate's identity,
+        size or modification time changes while it is being read, or a
+        subdirectory confirmed as a real directory is replaced by a
+        symbolic link before its scan or before its candidates finish
+        reading — the link target's images are never imported or even
+        reported as duplicates.
         """
         self.initialize()
         source_path = Path(source)
@@ -149,13 +153,23 @@ class DatasetStore:
             raise ValueError(f"source is not a directory: {source}")
         root = source_path.resolve()
 
-        rel_paths = self._scan_image_files(root, recursive)
+        rel_paths, confirmed_dirs = self._scan_image_files(root, recursive)
         # Read (and re-stat) every candidate before taking the workspace
         # lock: I/O overlaps with peers, and a file that changes mid-read
-        # fails the whole batch before anything is committed.
-        candidates = [
-            self._read_candidate(root / rel_path, rel_path) for rel_path in rel_paths
-        ]
+        # fails the whole batch before anything is committed.  A confirmed
+        # subdirectory swapped for a symlink is never read through: every
+        # candidate's ancestor directories are re-checked before it is
+        # opened, and once more after all reads, so the link target's
+        # images cannot be imported or even reported as duplicates.
+        candidates = []
+        for rel_path in rel_paths:
+            ancestor = root
+            for part in Path(rel_path).parts[:-1]:
+                ancestor = ancestor / part
+                self._raise_if_now_symlink(ancestor)
+            candidates.append(self._read_candidate(root / rel_path, rel_path))
+        for directory in confirmed_dirs:
+            self._raise_if_now_symlink(directory)
 
         with self._locked(create=True):
             manifest = self._read()
@@ -201,15 +215,26 @@ class DatasetStore:
             "candidates": results,
         }
 
-    def _scan_image_files(self, root: Path, recursive: bool) -> list[str]:
-        """Return accepted files as ``/``-separated paths relative to root.
+    def _scan_image_files(
+        self, root: Path, recursive: bool
+    ) -> tuple[list[str], list[Path]]:
+        """Return accepted files and the real directories descended into.
+
+        The first element lists accepted files as ``/``-separated paths
+        relative to root; the second lists every subdirectory confirmed as
+        a real directory and descended into (empty unless ``recursive``).
 
         Only real regular files qualify; symlinks and other entry types are
         skipped, and recursion never follows symlinked directories.  Any
         directory that should be visited but cannot be scanned fails the
-        whole import with the path and reason.
+        whole import with the path and reason.  A subdirectory is
+        re-checked with lstat() immediately before it is descended into,
+        and the confirmed list lets the caller re-verify it after the
+        candidate reads: a directory replaced by a symlink mid-import fails
+        the whole batch rather than following the link.
         """
         rel_paths: list[str] = []
+        confirmed_dirs: list[Path] = []
 
         def walk(directory: Path) -> None:
             try:
@@ -238,12 +263,36 @@ class DatasetStore:
                             f"cannot inspect entry {entry.path}: {error}"
                         ) from error
                     if is_dir:
-                        walk(Path(entry.path))
+                        subdirectory = Path(entry.path)
+                        # The entry may have been swapped for a symlink
+                        # since the check above; never descend through one.
+                        self._raise_if_now_symlink(subdirectory)
+                        confirmed_dirs.append(subdirectory)
+                        walk(subdirectory)
 
         walk(root)
         # Unicode code point order on the slash-separated relative path.
         rel_paths.sort()
-        return rel_paths
+        return rel_paths, confirmed_dirs
+
+    @staticmethod
+    def _raise_if_now_symlink(directory: Path) -> None:
+        """Fail if a previously confirmed real directory is now a symlink.
+
+        A path that vanished is left to the candidate reads (or ignored
+        when the directory held no candidates); only the symlink swap is
+        rejected here, because following the link would import the target's
+        images against the no-symlinked-directories rule.
+        """
+        try:
+            current = os.lstat(directory)
+        except OSError:
+            return
+        if stat.S_ISLNK(current.st_mode):
+            raise ValueError(
+                f"directory changed during import: {directory} "
+                "is now a symbolic link"
+            )
 
     def _read_candidate(
         self, path: Path, rel_path: str

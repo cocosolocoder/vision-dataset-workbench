@@ -66,7 +66,13 @@ python3 -m vision_workbench import-dir ./workspace ./examples --recursive
   directory that cannot be scanned, a candidate that cannot be read in
   full, or a candidate whose identity, size or modification time changes
   while it is read fails the whole import with the path and reason and
-  leaves no new samples. The batch commits through the same journal as
+  leaves no new samples. With `--recursive`, a subdirectory that was
+  confirmed as a real directory and is then replaced by a symbolic link —
+  wherever the link points — likewise fails the whole import with the
+  subdirectory's path, rather than following the link or skipping the
+  directory; the link target's images are neither imported nor reported
+  as duplicates, and directories that were symlinks from the start are
+  still simply ignored. The batch commits through the same journal as
   single-file imports, so an interruption shows either the old state or
   the complete batch, and concurrent label batches are never lost.
 

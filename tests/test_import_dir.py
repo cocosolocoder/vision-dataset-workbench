@@ -15,6 +15,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -365,6 +366,146 @@ class DirectoryImportTest(unittest.TestCase):
         self.assertIn("file changed during import", str(context.exception))
         self.assertEqual(self.store.summary()["items"], 0)
         self.assertFalse(self.store.transaction_path.exists())
+
+    def test_subdirectory_swapped_for_symlink_before_descend_fails(self) -> None:
+        self._write("top.jpg", b"top")
+        self._write("sub/inside.jpg", b"inside")
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "other.jpg").write_bytes(b"other")
+        real_scandir = os.scandir
+        state = {"done": False}
+
+        def swap_on_root_scan(path, *args, **kwargs):
+            entries = list(real_scandir(path, *args, **kwargs))
+            if not state["done"] and Path(path) == self.source.resolve():
+                state["done"] = True
+                # Swap the confirmed subdirectory for a symlink after the
+                # root scan but before the walk descends into it.
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(elsewhere, self.source / "sub")
+            return entries
+
+        with mock.patch("vision_workbench.store.os.scandir", swap_on_root_scan):
+            with self.assertRaises(ValueError) as context:
+                self.store.import_directory(self.source, "cat", recursive=True)
+        message = str(context.exception)
+        self.assertIn(str(self.source / "sub"), message)
+        self.assertIn("symbolic link", message)
+        # No partial batch landed: neither the real nor the linked images.
+        self.assertEqual(self.store.summary()["items"], 0)
+        self.assertFalse(self.store.transaction_path.exists())
+
+    def test_subdirectory_swapped_for_symlink_during_read_fails(self) -> None:
+        # The link target may live outside the source tree, inside it, or
+        # be the moved-away original directory; every variant fails.
+        for variant in ("outside", "inside", "moved-away"):
+            with self.subTest(variant=variant):
+                source = self.base / f"src-{variant}"
+                (source / "sub").mkdir(parents=True)
+                (source / "sub" / "inside.jpg").write_bytes(b"inside")
+                (source / "top.jpg").write_bytes(b"top")
+                store = DatasetStore(self.base / f"ws-{variant}")
+                # A digest the workspace already knows: a target whose
+                # images are registered duplicates cannot save the batch.
+                seed = self.base / f"seed-{variant}.jpg"
+                seed.write_bytes(b"seed-content")
+                digest = store.add(seed, "bird").digest
+
+                if variant == "inside":
+                    target = source / "sibling"
+                    target.mkdir()
+                else:
+                    target = self.base / f"target-{variant}"
+                    target.mkdir()
+                (target / "other.jpg").write_bytes(b"seed-content")
+                # A same-named image with the same bytes: reading through
+                # the link would "succeed", so the swap must be detected.
+                (target / "inside.jpg").write_bytes(b"inside")
+
+                real_read = store._read_candidate
+                state = {"done": False}
+
+                def swap_after_first_read(abs_path, rel_path):
+                    result = real_read(abs_path, rel_path)
+                    if not state["done"]:
+                        state["done"] = True
+                        subdir = source / "sub"
+                        if variant == "moved-away":
+                            moved = self.base / f"moved-{variant}"
+                            os.rename(subdir, moved)
+                            os.symlink(moved, subdir)
+                        else:
+                            shutil.rmtree(subdir)
+                            os.symlink(target, subdir)
+                    return result
+
+                with mock.patch.object(
+                    store, "_read_candidate", swap_after_first_read
+                ):
+                    with self.assertRaises(ValueError) as context:
+                        store.import_directory(source, "cat", recursive=True)
+                message = str(context.exception)
+                self.assertIn(str(source / "sub"), message)
+                self.assertIn("symbolic link", message)
+                # Nothing new registered; the pre-existing sample is intact.
+                self.assertEqual(store.summary()["items"], 1)
+                self.assertEqual(store.lookup_label(digest)["label"], "bird")
+                self.assertFalse(store.transaction_path.exists())
+
+    def test_failed_import_preserves_labels_history_and_splits(self) -> None:
+        seed = self.base / "seed.jpg"
+        seed.write_bytes(b"seed")
+        digest = self.store.add(seed, "bird").digest
+        self.store.submit_batch(
+            {"batch": "b1", "changes": [{"sha256": digest, "old": "bird", "new": "eagle"}]}
+        )
+        plan = self.store.create_split("baseline", 7, [1, 0, 0])
+        self._write("sub/inside.jpg", b"inside")
+        real_read = self.store._read_candidate
+        state = {"done": False}
+
+        def swap_after_first_read(abs_path, rel_path):
+            result = real_read(abs_path, rel_path)
+            if not state["done"]:
+                state["done"] = True
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(moved, self.source / "sub")
+            return result
+
+        with mock.patch.object(self.store, "_read_candidate", swap_after_first_read):
+            with self.assertRaises(ValueError):
+                self.store.import_directory(self.source, "cat", recursive=True)
+
+        # Existing samples, labels, batch history and split plans are as
+        # they were; the failed batch added nothing.
+        self.assertEqual(self.store.summary()["items"], 1)
+        self.assertEqual(self.store.lookup_label(digest)["label"], "eagle")
+        self.assertEqual([entry["batch"] for entry in self.store.history()], ["b1"])
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self.assertEqual(self.store.get_split("baseline"), plan.plan)
+
+    def test_non_recursive_import_unaffected_by_subdirectory_swap(self) -> None:
+        self._write("top.jpg", b"top")
+        self._write("sub/inside.jpg", b"inside")
+        real_read = self.store._read_candidate
+        state = {"done": False}
+
+        def swap_after_first_read(abs_path, rel_path):
+            result = real_read(abs_path, rel_path)
+            if not state["done"]:
+                state["done"] = True
+                moved = self.base / "moved-away"
+                os.rename(self.source / "sub", moved)
+                os.symlink(moved, self.source / "sub")
+            return result
+
+        with mock.patch.object(self.store, "_read_candidate", swap_after_first_read):
+            result = self.store.import_directory(self.source, "cat")
+        self.assertEqual(result["added"], 1)
+        self.assertEqual([c["path"] for c in result["candidates"]], ["top.jpg"])
 
     def test_new_files_appearing_after_scan_are_left_for_next_import(self) -> None:
         self._write("a.jpg", b"a")
