@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import stat
@@ -13,6 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from . import confirmed
 from .batches import (
     BatchError,
     content_key,
@@ -43,6 +43,35 @@ SPLIT_SCHEMA_VERSION = 1
 
 # Image extensions accepted by whole-directory import, matched case-insensitively.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+
+def _import_confirmation_error(
+    failure: confirmed.ConfirmationError, display: str
+) -> ValueError:
+    """Translate a shared confirmation failure into import's existing error.
+
+    Import reports every non-replacement problem as ``cannot read
+    <path>: …`` — a non-regular object at the pre-open inspection
+    (including a symlink swapped onto the path by then) is “not a
+    regular file”, and a refused no-follow open keeps its underlying
+    ``OSError`` wording — while an object that replaced the confirmed
+    file between its inspection and the pinned open is “file changed
+    during import …”.  The shared rule supplies only the structured
+    reason; this entry point keeps the public text and the source path.
+    """
+    if failure.stage is confirmed.ConfirmStage.INSPECT and failure.reason in (
+        confirmed.ConfirmReason.NOT_REGULAR,
+        confirmed.ConfirmReason.NOW_SYMLINK,
+    ):
+        return ValueError(f"cannot read {display}: not a regular file")
+    if failure.reason is confirmed.ConfirmReason.WRONG_IDENTITY:
+        return ValueError(
+            f"file changed during import: {display} "
+            "(identity, size or modification time changed)"
+        )
+    if failure.error is not None:
+        return ValueError(f"cannot read {display}: {failure.error}")
+    return ValueError(f"cannot read {display}: not a regular file")
 
 
 @dataclass(frozen=True)
@@ -310,66 +339,45 @@ class DatasetStore:
         """Read one file in full and return ``(digest, size)`` for it.
 
         The digest and size are guaranteed to describe the same stable
-        regular file: the path is lstat()ed before and after the read, the
-        open uses ``O_NOFOLLOW`` so a path swapped for a symlink cannot
-        redirect the read to another file, and the opened descriptor is
-        fstat()ed to prove it is the inode that was confirmed before the
-        read.  Any identity, size or modification-time change — in-place
-        rewrites, appends, truncation, delete-and-recreate, or replacing
-        the path with another file, even one with identical content, size
-        and mtime — fails with the path and reason, as do a vanishing
-        path, a non-regular file and any open or read error.
+        regular file: the path is lstat()ed without following symlinks
+        and opened with ``O_NOFOLLOW``, the opened descriptor is
+        fstat()ed to prove it is the inode that was confirmed, and the
+        path is lstat()ed again after the read, requiring the same
+        object with the same size and modification time.  Any identity,
+        size or modification-time change — in-place rewrites, appends,
+        truncation, delete-and-recreate, or replacing the path with
+        another file, even one with identical content, size and mtime —
+        fails with the path and reason, as do a vanishing path, a
+        non-regular file and any open or read error.
+
+        The confirm/open/prove rule itself lives in :mod:`confirmed`
+        and is shared with the source-directory export; only the
+        post-read stability requirement and the import wording are
+        specific to this entry point.
         """
         try:
-            before = os.lstat(path)
-        except OSError as error:
-            raise ValueError(f"cannot read {display}: {error}") from error
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"cannot read {display}: not a regular file")
+            opened_file = confirmed.confirm_and_open_regular(path)
+        except confirmed.ConfirmationError as failure:
+            raise _import_confirmation_error(failure, display) from failure
         try:
-            # O_NOFOLLOW guarantees the bytes come from the inode just
-            # lstat()ed, even if the path is swapped for a symlink meanwhile.
-            descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
+            digest = confirmed.hash_descriptor(opened_file.descriptor)
         except OSError as error:
             raise ValueError(f"cannot read {display}: {error}") from error
-        try:
-            opened = os.fstat(descriptor)
-        except OSError as error:
-            os.close(descriptor)
-            raise ValueError(f"cannot read {display}: {error}") from error
-        # The path may have been replaced by another regular file between
-        # the lstat() and the open(); the descriptor must belong to the
-        # inode that was confirmed, or the bytes read would not come from
-        # the file this import agreed to read.
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            os.close(descriptor)
-            raise ValueError(
-                f"file changed during import: {display} "
-                "(identity, size or modification time changed)"
-            )
-        hasher = hashlib.sha256()
-        try:
-            with os.fdopen(descriptor, "rb") as stream:
-                while True:
-                    chunk = stream.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-        except OSError as error:
-            raise ValueError(f"cannot read {display}: {error}") from error
+        # Import, unlike export, also requires the path itself to still
+        # name the same unchanged file after the read: an in-place
+        # rewrite, append, truncation or replacement that landed while
+        # the bytes were streamed must not register a digest/size pair
+        # that never coexisted.
         try:
             after = os.lstat(path)
         except OSError as error:
             raise ValueError(f"cannot read {display}: {error}") from error
-        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        if not confirmed.same_identity_size_mtime(opened_file.confirmed, after):
             raise ValueError(
                 f"file changed during import: {display} "
                 "(identity, size or modification time changed)"
             )
-        return hasher.hexdigest(), before.st_size
+        return digest, opened_file.confirmed.st_size
 
     def summary(self) -> dict[str, Any]:
         self.initialize()

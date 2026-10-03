@@ -80,6 +80,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from . import confirmed
 from .splits import SET_NAMES
 
 EXPORT_SCHEMA_VERSION = 1
@@ -786,37 +787,45 @@ def _hash_regular_file_at(
     redirect the read (the open fails with ``ELOOP``) and the bytes can
     only come from an entry reached through the confirmed directory.
     The recorded identity is the ``fstatat`` result; the copy later
-    independently re-pins the exact inode before its bytes are streamed
-    into the package.  Any failure raises with the path and reason.
-    Returns ``(digest, device, inode)``.
+    independently re-pins the exact inode (including the fstat proof)
+    before its bytes are streamed into the package, so this lookup
+    deliberately does not prove the descriptor itself.  Any failure
+    raises with the path and reason.  Returns ``(digest, device,
+    inode)``.
+
+    The confirm/open rule and the chunked hashing come from
+    :mod:`confirmed`, shared with import; only the export wording is
+    assembled here.
     """
     try:
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError as error:
-        raise ExportError(f"cannot inspect entry {path}: {error}") from error
-    if not stat.S_ISREG(before.st_mode):
-        raise ExportError(f"cannot read source file {path}: not a regular file")
+        before = confirmed.inspect_regular(name, dir_fd=directory_fd)
+        descriptor = confirmed.open_without_follow(name, dir_fd=directory_fd)
+    except confirmed.ConfirmationError as failure:
+        raise _scan_file_error(failure, path) from failure
     try:
-        descriptor = os.open(
-            name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=directory_fd
+        digest = confirmed.hash_descriptor(descriptor)
+    except OSError as error:
+        raise ExportError(f"cannot read source file {path}: {error}") from error
+    return digest, before.st_dev, before.st_ino
+
+
+def _scan_file_error(
+    failure: confirmed.ConfirmationError, path: Path
+) -> ExportError:
+    """Translate a shared confirmation failure into the scan's wording."""
+    if failure.stage is confirmed.ConfirmStage.INSPECT:
+        if failure.reason is confirmed.ConfirmReason.ACCESS_ERROR:
+            return ExportError(
+                f"cannot inspect entry {path}: {failure.error}"
+            )
+        # A symlink or any other non-regular object at a name the walk
+        # had just typed as a regular file: the entry changed.
+        return ExportError(f"cannot read source file {path}: not a regular file")
+    if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
+        return ExportError(
+            f"cannot read source file {path}: path is now a symlink"
         )
-    except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise ExportError(
-                f"cannot read source file {path}: path is now a symlink"
-            ) from error
-        raise ExportError(f"cannot read source file {path}: {error}") from error
-    try:
-        hasher = hashlib.sha256()
-        with os.fdopen(descriptor, "rb") as stream:
-            while True:
-                chunk = stream.read(_CHUNK_SIZE)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-    except OSError as error:
-        raise ExportError(f"cannot read source file {path}: {error}") from error
-    return hasher.hexdigest(), before.st_dev, before.st_ino
+    return ExportError(f"cannot read source file {path}: {failure.error}")
 
 
 def _write_package(
@@ -1029,75 +1038,71 @@ def _open_resolved_source(
 
     The selected path can be remapped in the gap between the directory
     lookup and this copy.  The path is lstat()ed without following
-    symlinks and is opened with ``O_NOFOLLOW``; the opened descriptor is
-    then fstat()ed, so the decision covers the object that is actually
-    read, not just one pre-open look at the path.  A stream is returned
-    only when that object is a regular file carrying the device/inode
-    confirmed at lookup time, together with that confirmed file's size.
+    symlinks and must still be a regular file carrying the device/inode
+    recorded at lookup; it is opened with ``O_NOFOLLOW`` and the
+    descriptor is fstat()ed and proved to be that exact regular file, so
+    the decision covers the object that is actually read, not just one
+    pre-open look at the path.  A stream is returned only then, together
+    with that confirmed file's size.
 
     A different regular file renamed onto the path — even one with
     identical content, size and modification time — or a symlink — even
     one pointing at the original file — fails with the sample's full
-    digest, the selected source path and the reason.
+    digest, the selected source path and the reason.  Once the
+    descriptor is open this function is done: unlike import, export does
+    not re-check the path after the read, so the path being occupied by
+    another file cannot stop the already pinned original from being
+    read.
     """
     try:
-        before = os.lstat(source)
-    except OSError as error:
-        raise ExportError(
-            f"sample {digest}: cannot stat source file {source}: {error}"
-        ) from error
-    if stat.S_ISLNK(before.st_mode):
-        raise ExportError(
-            f"sample {digest}: source file was replaced after lookup: "
-            f"{source} is now a symlink"
+        opened_file = confirmed.confirm_and_open_regular(
+            source, expected=(expected_device, expected_inode)
         )
-    if not stat.S_ISREG(before.st_mode):
-        raise ExportError(
-            f"sample {digest}: source is not a regular file: {source}"
-        )
-    if (before.st_dev, before.st_ino) != (expected_device, expected_inode):
-        raise ExportError(
-            f"sample {digest}: source file was replaced after lookup: {source}"
-        )
+    except confirmed.ConfirmationError as failure:
+        raise _resolved_source_error(failure, source, digest) from failure
+    descriptor = opened_file.descriptor
     try:
-        # O_NOFOLLOW makes the open fail instead of following a symlink
-        # swapped onto the path after the lstat() above.
-        descriptor = os.open(
-            source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        )
+        return os.fdopen(descriptor, "rb"), opened_file.opened.st_size
     except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise ExportError(
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
+
+
+def _resolved_source_error(
+    failure: confirmed.ConfirmationError, source: Path, digest: str
+) -> ExportError:
+    """Translate a shared confirmation failure into the export wording.
+
+    Replacements (a different object at the selected path, at the
+    inspection or when the descriptor is proved) say “replaced after
+    lookup”; a final symlink additionally says so.  Plain access
+    failures keep their underlying ``OSError`` and “cannot read/stat”
+    wording, so an unreadable or vanished selected copy reports exactly
+    what it did before.
+    """
+    replaced = (
+        failure.reason is confirmed.ConfirmReason.WRONG_IDENTITY
+        or failure.reason is confirmed.ConfirmReason.NOW_SYMLINK
+    )
+    if replaced:
+        if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
+            return ExportError(
                 f"sample {digest}: source file was replaced after lookup: "
                 f"{source} is now a symlink"
-            ) from error
-        raise ExportError(
-            f"sample {digest}: cannot read source file {source}: {error}"
-        ) from error
-    try:
-        opened = os.fstat(descriptor)
-    except OSError as error:
-        os.close(descriptor)
-        raise ExportError(
-            f"sample {digest}: cannot read source file {source}: {error}"
-        ) from error
-    # Prove the descriptor itself belongs to the confirmed regular inode:
-    # the path could have been remapped in the lstat()-to-open() gap.
-    if (opened.st_dev, opened.st_ino) != (
-        expected_device,
-        expected_inode,
-    ) or not stat.S_ISREG(opened.st_mode):
-        os.close(descriptor)
-        raise ExportError(
+            )
+        return ExportError(
             f"sample {digest}: source file was replaced after lookup: {source}"
         )
-    try:
-        return os.fdopen(descriptor, "rb"), opened.st_size
-    except OSError as error:
-        os.close(descriptor)
-        raise ExportError(
-            f"sample {digest}: cannot read source file {source}: {error}"
-        ) from error
+    if failure.reason is confirmed.ConfirmReason.NOT_REGULAR:
+        return ExportError(
+            f"sample {digest}: source is not a regular file: {source}"
+        )
+    action = "stat" if failure.stage is confirmed.ConfirmStage.INSPECT else "read"
+    return ExportError(
+        f"sample {digest}: cannot {action} source file {source}: {failure.error}"
+    )
 
 
 def _file_info(arc_name: str) -> zipfile.ZipInfo:
