@@ -207,9 +207,27 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   and reason; the package is byte-identical to a normal export of the
   same plan, options and content. For an empty plan (or when every sample
   is skipped) the directory only has to exist and be a directory.
-- The target must not already exist; it is written atomically, so a failure
-  or interruption leaves no incomplete file. Concurrent exports to the
-  same path are serialized and at most one succeeds.
+- The target name must remain unoccupied for the whole export. It is
+  rejected if anything exists at the path when the export starts, and the
+  complete, fsynced package is published from a temp file only after every
+  image has been copied and compressed and the source checks have passed;
+  the name is re-checked immediately before publication and publication is
+  a hard link that refuses an occupied name, so a file or directory another
+  program creates at the target while the package is being generated — even
+  in the last instant before it is saved, and even if it is empty or its
+  bytes are identical to the package — fails the export with a "target
+  already exists" message naming the path and leaves the other program's
+  file and file type untouched. A symlink at the target, including one that
+  points to a nonexistent location, counts as occupied whether it was there
+  at the start or appears during generation: the link itself and whatever
+  it points to are preserved, never written through or replaced. On such a
+  conflict (or any other failure/interruption) the temp package is discarded
+  and no incomplete target is left; the command exits nonzero and reports no
+  success result. There is no overwrite option and no automatic alternative
+  file name. Concurrent exports to the same path are serialized (a lock file
+  next to the target) and at most one succeeds, with the losers reporting the
+  same target conflict. Readers of the target path therefore only ever see
+  the target absent or a complete package.
 - Package bytes are deterministic for a given plan, options and source
   content: exporting at a different time, from a copied workspace or to a
   different path yields byte-identical ZIPs, and source modification times

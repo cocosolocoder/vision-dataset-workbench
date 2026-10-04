@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -387,12 +388,261 @@ class TargetHandlingTest(ExportHarness):
             self.assertIn("manifest.json", archive.namelist())
 
 
+class TargetOccupiedDuringExportTest(ExportHarness):
+    """The target name may be claimed only in the last, atomic step.
+
+    An export takes arbitrarily long (images are copied and compressed),
+    so a name that is free when the export starts is not proof it stays
+    free: anything another program places there while the package is being
+    generated — including at the very last instant, including an empty
+    file or one with byte-identical content, and including a (possibly
+    dangling) symlink — must be preserved and fail the export as a target
+    conflict, with the temp package discarded.
+    """
+
+    def _occupy_during_generation(self, target: Path, occupant) -> None:
+        """Replace exporter._write_zip so ``occupant`` lands mid-export."""
+        import vision_workbench.exporter as exporter
+
+        original = exporter._write_zip
+
+        def occupying_write(*args, **kwargs):
+            original(*args, **kwargs)
+            occupant()
+
+        exporter._write_zip = occupying_write
+        self.addCleanup(setattr, exporter, "_write_zip", original)
+
+    def _assert_no_temp_left(self, target: Path) -> None:
+        leftovers = [
+            path.name
+            for path in target.parent.iterdir()
+            if path.name.startswith(f".{target.name}.")
+            and path.name != f".{target.name}.lock"
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_file_created_during_generation_is_preserved_not_replaced(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(b"not-your-file")
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        message = str(caught.exception)
+        self.assertIn("target already exists", message)
+        self.assertIn(str(target), message)
+        self.assertEqual(target.read_bytes(), b"not-your-file")
+        self._assert_no_temp_left(target)
+
+    def test_empty_occupant_still_conflicts(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(target, lambda: target.write_bytes(b""))
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"")
+        self._assert_no_temp_left(target)
+
+    def test_byte_identical_occupant_still_conflicts(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        package_target = self.root.parent / "reference.zip"
+        export_split(self.store, "baseline", package_target)
+        package_bytes = package_target.read_bytes()
+
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(package_bytes)
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertEqual(target.read_bytes(), package_bytes)
+        self._assert_no_temp_left(target)
+
+    def test_dangling_symlink_during_generation_is_preserved(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+
+        def occupy():
+            os.symlink("/nonexistent/export-target", target)
+
+        self._occupy_during_generation(target, occupy)
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        message = str(caught.exception)
+        self.assertIn("target already exists", message)
+        self.assertIn(str(target), message)
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(os.readlink(target), "/nonexistent/export-target")
+        self._assert_no_temp_left(target)
+
+    def test_symlink_during_generation_and_its_target_are_preserved(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        link_target = self.root.parent / "foreign.dat"
+        link_target.write_bytes(b"foreign content")
+
+        self._occupy_during_generation(
+            target, lambda: os.symlink(link_target, target)
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(os.readlink(target), str(link_target))
+        # Nothing was written through the link.
+        self.assertEqual(link_target.read_bytes(), b"foreign content")
+        self._assert_no_temp_left(target)
+
+    def test_dangling_symlink_present_at_start_is_rejected_and_kept(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        os.symlink("/nonexistent/export-target", target)
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "baseline", target)
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(os.readlink(target), "/nonexistent/export-target")
+        self._assert_no_temp_left(target)
+
+    def test_symlink_at_start_is_not_written_through(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        link_target = self.root.parent / "foreign.dat"
+        link_target.write_bytes(b"foreign")
+        os.symlink(link_target, target)
+        with self.assertRaises(ExportError):
+            export_split(self.store, "baseline", target)
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(link_target.read_bytes(), b"foreign")
+        self._assert_no_temp_left(target)
+
+    def test_conflict_applies_with_source_dir(self) -> None:
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        moved = self.root.parent / "moved"
+        moved.mkdir()
+        (moved / "pic.bin").write_bytes(b"abc")
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(b"intruder")
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(
+                self.store, "baseline", target, source_dir=moved
+            )
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertEqual(target.read_bytes(), b"intruder")
+        self._assert_no_temp_left(target)
+
+    def test_conflict_applies_to_empty_plan_and_skip_unlabeled(self) -> None:
+        # An all-skipped plan goes through the same publish path.
+        self.add_sample(None, b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(b"")
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(
+                self.store, "baseline", target, skip_unlabeled=True
+            )
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertEqual(target.read_bytes(), b"")
+        self._assert_no_temp_left(target)
+
+    def test_conflict_applies_to_completely_empty_plan(self) -> None:
+        self.create_plan("empty")
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(b"")
+        )
+        with self.assertRaises(ExportError) as caught:
+            export_split(self.store, "empty", target)
+        self.assertIn("target already exists", str(caught.exception))
+        self.assertEqual(target.read_bytes(), b"")
+        self._assert_no_temp_left(target)
+
+    def test_failed_conflict_export_can_succeed_at_another_path(self) -> None:
+        # The conflict is per name, not a poisoned workspace/plan state.
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        target = self.root.parent / "raced.zip"
+        self._occupy_during_generation(
+            target, lambda: target.write_bytes(b"occupied")
+        )
+        with self.assertRaises(ExportError):
+            export_split(self.store, "baseline", target)
+        other = self.root.parent / "other.zip"
+        result = export_split(self.store, "baseline", other)
+        self.assertEqual(result["exported"], 1)
+        with zipfile.ZipFile(other) as archive:
+            self.assertIn("manifest.json", archive.namelist())
+        self.assertEqual(target.read_bytes(), b"occupied")
+
+
 class CliTest(ExportHarness):
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-m", "vision_workbench", *arguments],
             cwd=REPO_ROOT, text=True, capture_output=True, check=False,
         )
+
+    def test_cli_target_occupied_during_export_fails_naming_target(self) -> None:
+        # A large, incompressible source keeps generation running long
+        # enough for another program to claim the target name mid-way.
+        large = self.root.parent / "large.jpg"
+        large.write_bytes(os.urandom(60 * 1024 * 1024))
+        result = self.store.add(large, "cat")
+        self.assertTrue(result.added)
+        self.create_plan()
+        target = self.root.parent / "cli-race.zip"
+
+        process = subprocess.Popen(
+            [sys.executable, "-m", "vision_workbench", "export",
+             str(self.root), "baseline", str(target)],
+            cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        def intruder() -> None:
+            while True:
+                temps = [
+                    path for path in target.parent.iterdir()
+                    if path.name.startswith(".cli-race.zip.")
+                    and path.name.endswith(".tmp")
+                ]
+                if temps:
+                    target.write_bytes(b"claimed by another program")
+                    return
+
+        thread = threading.Thread(target=intruder, daemon=True)
+        thread.start()
+        stdout, stderr = process.communicate()
+        thread.join(timeout=5)
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("target already exists", stderr)
+        self.assertIn(str(target), stderr)
+        self.assertEqual(target.read_bytes(), b"claimed by another program")
+        leftovers = [
+            path.name for path in target.parent.iterdir()
+            if path.name.startswith(".cli-race.zip.")
+            and path.name != ".cli-race.zip.lock"
+        ]
+        self.assertEqual(leftovers, [])
 
     def test_cli_export_success_json(self) -> None:
         self.add_sample("cat")

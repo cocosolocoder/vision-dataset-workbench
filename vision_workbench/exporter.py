@@ -56,6 +56,20 @@ ZIP bytes are deterministic for a given plan, options and source content:
 entry metadata uses fixed values, entries are written in a fixed order and
 source modification times are never consulted.
 
+The target name is claimed only at the end.  The complete package is
+streamed into a temp file beside the target and published only after it
+has been written, fsynced and (for source-directory exports) every
+confirmed source directory has been re-verified.  The name is rejected if
+occupied at the start, re-checked once the package is complete, and the
+final publication is a hard link rather than a rename: unlike
+``os.replace``, ``os.link`` refuses an occupied name, so anything another
+program places at the target while the images are copied and compressed —
+even in the instant before publication, even an empty file or one with
+identical bytes, and even a symlink (dangling or not) — is preserved
+untouched and the export fails reporting the target conflict instead of
+replacing it.  The temp package is discarded on any failure, so the
+target path is observed only as absent or as a complete package.
+
 A single sample whose bytes reach the classic ZIP 32-bit size limit
 (2 GiB, or close enough that its deflated form could) is written as a
 ZIP64 entry: the local file header carries a ZIP64 extra field with the
@@ -838,11 +852,19 @@ def _write_package(
 ) -> None:
     """Write the ZIP atomically: lock the target name, stream to a temp file.
 
-    The target is never overwritten: an existing target is rejected and a
-    temp file is used until the whole package has been written and fsynced,
-    so a failure or interruption leaves no incomplete target.  An flock on
-    a lock file next to the target serializes concurrent exports to the
-    same path.
+    The target is never overwritten: the name is rejected if it is
+    occupied when the export starts (a lock file next to the target
+    serializes concurrent exports), the whole package is streamed to a
+    temp file and fsynced, and the name is claimed only once the package
+    is complete.  Immediately before publishing, the target name is
+    re-checked and publication itself is a hard link (``os.link``), which
+    fails with ``EEXIST`` whenever the name is occupied — so a file,
+    directory or symlink (including one pointing at a nonexistent
+    location) created by another program while the images were copied and
+    compressed, even in the gap between the final check and the link, is
+    preserved untouched and the export reports a target conflict.  A
+    failure or interruption discards the temp package and leaves no
+    incomplete target.
     """
     target = Path(target)
     parent = target.parent
@@ -860,8 +882,7 @@ def _write_package(
     temp_path: Path | None = None
     try:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        if os.path.lexists(target):
-            raise ExportError(f"target already exists: {target}")
+        _assert_target_absent(target)
 
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=parent
@@ -884,15 +905,31 @@ def _write_package(
                 # directory binding confirmed during the lookup must
                 # still hold.  A directory turned into a symlink while
                 # the last entry was streamed is caught here and the
-                # temp file is discarded rather than renamed into place.
+                # temp file is discarded rather than published.
                 source_anchor.verify_all()
-            os.replace(temp_path, target)
-            temp_path = None
+            # Copying and compressing can take arbitrarily long, so a
+            # name that was free at the start is not a license to claim
+            # it now: re-prove the name is unoccupied once the complete
+            # package is ready, then hard-link it into place.  A hard
+            # link refuses an occupied name (unlike os.replace), so an
+            # occupant appearing even in the final gap — another file,
+            # even an empty one or one with identical bytes, or a
+            # symlink, even a dangling one — is preserved and the export
+            # fails as a target conflict instead of replacing it.
+            _assert_target_absent(target)
+            try:
+                os.link(temp_path, target)
+            except FileExistsError:
+                raise _target_exists_error(target) from None
             _fsync_directory(parent)
         except BaseException:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+            # Discard this run's temp package; the target name and any
+            # file another program placed there are never touched.
+            temp_path.unlink(missing_ok=True)
             raise
+        # The target now reaches the package inode through the new link;
+        # drop only the temp name.
+        temp_path.unlink(missing_ok=True)
     except OSError as error:
         raise ExportError(f"cannot write export package: {error}") from error
     finally:
@@ -900,6 +937,23 @@ def _write_package(
             fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         finally:
             os.close(lock_descriptor)
+
+
+def _assert_target_absent(target: Path) -> None:
+    """Reject an occupied target name.
+
+    ``lexists`` treats a symlink as occupied even when it points at a
+    nonexistent location, so a dangling link is never written through or
+    replaced; neither the link nor its target's content (if any) is
+    touched.
+    """
+    if os.path.lexists(target):
+        raise _target_exists_error(target)
+
+
+def _target_exists_error(target: Path) -> ExportError:
+    """The target-name conflict wording, always naming the user's path."""
+    return ExportError(f"target already exists: {target}")
 
 
 def _write_zip(
