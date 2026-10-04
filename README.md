@@ -30,6 +30,50 @@ happens to match an existing digest never masks such a failure. A source
 path that is a symlink when the command starts is still followed and its
 target imported.
 
+## Dataset manifest integrity
+
+The registration list lives in `.vision-workbench/manifest.json`. Before
+any command that uses registered samples (`add`, `import-dir`,
+`summary`, `label`, `find-label`, `batch`, `undo` and `split create`)
+touches a single sample, it validates the **whole** list; the check
+itself never writes.
+
+- The top level must be a JSON object whose `schema_version` is the
+  integer `1` and which contains an `items` list. Booleans, decimal
+  numbers and strings cannot stand for the version number.
+- Every sample must be an object with a full 64-character lowercase
+  hexadecimal SHA-256 in `sha256`, a non-empty string `source`, a
+  non-negative integer `size`, and a string-or-null `label`. Booleans,
+  decimal numbers (even `1.0`) and numeric strings (even `"1"`) are not
+  accepted as sizes.
+- Each digest may be registered exactly once. Two records with the same
+  digest are rejected even when their source and label are identical;
+  the records are never merged and neither one is picked to continue —
+  the error names the digest and both records' positions.
+- Error messages locate the problem: structural problems name the
+  offending part, sample problems name the sample's 1-based position in
+  the list and the bad field, and duplicates name the digest and both
+  positions. A damaged record later in the list rejects the operation
+  even when that command's query would never have matched the record,
+  and valid records earlier in the list never let the problem pass.
+- On rejection the command ends with a non-zero status, writes only to
+  standard error (no traceback) and prints no success result and no
+  partial samples. The existing manifest, label-modification history and
+  saved split plans stay byte-for-byte as they were: bad records are
+  never deleted, missing fields are never filled with defaults and the
+  list is never rebuilt empty.
+- Empty lists and zero-byte samples remain valid; `null` and the empty
+  string both keep meaning *unlabeled* and every other label is kept
+  literally. Records that predate optional information such as the
+  label revision (`rev`) keep working, and additional fields are
+  preserved on later commits.
+- Only the structure is checked. A source image that has since been
+  moved or deleted is not manifest corruption: queries still use the
+  registered source path and never reopen the file.
+- Commands that depend solely on already-saved data — `split show`,
+  `export` and `history` — read the saved plan or history directly and
+  keep working regardless of the manifest.
+
 ## Importing a directory
 
 A whole directory of images can be registered in one batch:

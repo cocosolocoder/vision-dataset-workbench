@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import confirmed
+from .manifest import ManifestError, validate_manifest
 from .batches import (
     BatchError,
     apply_resolutions,
@@ -158,6 +159,11 @@ class DatasetStore:
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
         self.initialize()
+        # Refuse a damaged registration list before reading the source:
+        # a corrupt manifest must never be extended, and "already
+        # present" must never be answered from duplicate records.
+        with self._locked(create=True):
+            self._read()
         file_path = source.resolve(strict=True)
         if not file_path.is_file():
             raise ValueError(f"Not a regular file: {source}")
@@ -227,6 +233,12 @@ class DatasetStore:
         if not source_path.is_dir():
             raise ValueError(f"source is not a directory: {source}")
         root = source_path.resolve()
+
+        # Refuse a damaged registration list before scanning or reading
+        # any candidate: the batch must never extend or consult a
+        # manifest whose full sample list cannot be trusted.
+        with self._locked(create=True):
+            self._read()
 
         rel_paths, confirmed_dirs = self._scan_image_files(root, recursive)
         # Read (and re-stat) every candidate before taking the workspace
@@ -807,19 +819,24 @@ class DatasetStore:
         try:
             journal = json.loads(self.transaction_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise BatchError(f"cannot recover interrupted transaction: {error}") from error
+            raise ManifestError(f"cannot recover interrupted transaction: {error}") from error
         manifest = journal.get("manifest")
         history = journal.get("batches")
         if not isinstance(manifest, dict) or not isinstance(history, dict):
-            raise BatchError("cannot recover interrupted transaction: journal is malformed")
-        # Only install a coherent pair, so recovery can never leave the
-        # manifest and the history in two different states.
-        if manifest.get("schema_version") != 1 or not isinstance(
-            manifest.get("items"), list
-        ):
-            raise BatchError(
-                "cannot recover interrupted transaction: journal manifest is malformed"
+            raise ManifestError(
+                "cannot recover interrupted transaction: journal is malformed"
             )
+        # Only install a coherent pair, so recovery can never leave the
+        # manifest and the history in two different states.  The prepared
+        # manifest must satisfy the same whole-list integrity gate as a
+        # manifest read from disk; a damaged journal is rejected instead
+        # of installing damaged registration data.
+        try:
+            validate_manifest(manifest)
+        except ManifestError as error:
+            raise ManifestError(
+                f"cannot recover interrupted transaction: {error}"
+            ) from error
         validate_history(history)
         # Idempotent installs: both files end up at the journal's version.
         self._write_json_atomic(self.manifest_path, manifest)
@@ -1137,7 +1154,10 @@ class DatasetStore:
         try:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Cannot read dataset manifest: {error}") from error
-        if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
-            raise ValueError("Unsupported dataset manifest")
-        return data
+            raise ManifestError(f"Cannot read dataset manifest: {error}") from error
+        # The whole registration list is verified before any caller can
+        # use a single sample: a bad field or duplicate digest later in
+        # the list rejects this operation just as a bad structure at the
+        # top does, instead of crashing on one record or acting on one of
+        # two duplicates. Nothing is repaired, defaulted or rebuilt.
+        return validate_manifest(data)
