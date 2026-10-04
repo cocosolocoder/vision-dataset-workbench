@@ -368,6 +368,35 @@ if the label was changed back). Other samples' later changes do not block
 the undo. Undo leaves a queryable record; repeating it reports
 `already-undone`.
 
+### Corrupted batch history
+
+Every sample record stored for a successful batch carries a `rev`: the
+sample's label revision at the moment the batch finished, which an undo
+pins against. That `rev` is mandatory on **every** history record —
+whether the record actually changed a label or not — and must be a genuine
+non-negative integer. A boolean (`true`), a decimal (`1.0`), a numeric
+string (`"1"`), `null` and a missing field are all invalid; a missing
+revision is never treated as zero, and the integer `0` on an unchanged
+record stays legal. This requirement is specific to batch history: the
+optional `rev` on manifest registrations keeps its old compatibility
+behaviour, including records that omit it.
+
+When an undo targets a batch containing such a record, the command exits
+with a non-zero status, prints nothing on standard output and no
+traceback, and reports on standard error that the **batch history** is
+corrupted — naming the batch number, the sample's full SHA-256 digest and
+the exact `rev` problem. The whole undo is refused even if an earlier
+record in the same batch was restorable: no sample changes label, and
+neither the registration list nor the batch history is rewritten,
+default-filled or given a new undo marker. This refusal is distinct from
+the normal "sample modified after the batch" rejection and from an
+unknown batch number — a corrupt record can never be reported as undone,
+as having no changes, or as an unknown batch. Corruption is checked before
+the repeated-undo short-circuit too, so a batch already marked undone
+still surfaces its bad record instead of returning `already-undone`.
+Damage in a different batch does not matter: only the target batch's
+records are examined, so a valid batch still undoes normally.
+
 Imports, batch writes and undos are crash-safe: a write-ahead journal
 installs the manifest and the history together, so after an interruption
 the workspace shows either the old state or the complete new state with

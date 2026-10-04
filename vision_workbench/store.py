@@ -25,6 +25,7 @@ from .batches import (
     normalize_label,
     parse_batch_file,
     reject_unknown_samples,
+    require_intact_history_revisions,
     resolve_re_submission,
     result_payload,
     validate_history,
@@ -708,6 +709,12 @@ class DatasetStore:
         the same label revision it had right after the batch (no later
         modification, even one that restored the same label).  Repeated
         undos are idempotent and do not add history.
+
+        Integrity comes before either verdict: every record of the target
+        batch must carry a sound pinned revision.  A bad row rejects the
+        undo even when the batch is already marked undone, so corruption is
+        never hidden behind an ``already-undone`` success or confused with
+        a sample modified after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -718,6 +725,13 @@ class DatasetStore:
             )
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
+
+            # Validate the target batch's pinned revisions before the
+            # already-undone short-circuit and the later-modification
+            # checks: a corrupt history record is refusal, not an undo, a
+            # no-op or an unknown batch, and nothing is rewritten.
+            require_intact_history_revisions(entry)
+
             if entry["undone"]:
                 return {"batch": number, "status": "already-undone", "restored": 0}
 
@@ -732,6 +746,9 @@ class DatasetStore:
                         "is no longer in the manifest"
                     )
                 current = normalize_label(item.get("label"))
+                # record["rev"] is now known to be a genuine non-negative
+                # integer, so a boolean/decimal/string can never compare
+                # equal to the sample's current revision.
                 if item_revision(item) != record["rev"] or current != record["new"]:
                     raise BatchError(
                         f"cannot undo batch {number!r}: sample {record['sha256']} "

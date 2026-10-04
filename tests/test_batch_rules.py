@@ -14,10 +14,12 @@ from vision_workbench.batches import (
     BatchResolution,
     apply_resolutions,
     build_history_entry,
+    describe_history_revision_problem,
     no_changes_result,
     normalize_label,
     reject_unknown_samples,
     replay_result,
+    require_intact_history_revisions,
     resolve_re_submission,
     result_payload,
     verify_records,
@@ -224,6 +226,63 @@ class ResultAssemblyTest(unittest.TestCase):
             {"batch": "b1", "status": "already-applied",
              "changed": 1, "unchanged": 1, "total": 2},
         )
+
+
+class HistoryRevisionValidationTest(unittest.TestCase):
+    def test_zero_and_non_negative_integers_are_valid(self) -> None:
+        # Zero stays legal even on an unchanged record.
+        self.assertIsNone(describe_history_revision_problem(0, present=True))
+        self.assertIsNone(describe_history_revision_problem(1, present=True))
+        self.assertIsNone(describe_history_revision_problem(42, present=True))
+
+    def test_missing_field_is_not_treated_as_zero(self) -> None:
+        problem = describe_history_revision_problem(None, present=False)
+        self.assertEqual(problem, "missing 'rev' field")
+
+    def test_boolean_decimal_string_null_and_negative_are_invalid(self) -> None:
+        for value in (True, False, 1.0, 0.0, "1", "0", None, -1):
+            problem = describe_history_revision_problem(value, present=True)
+            self.assertIsNotNone(problem, value)
+            self.assertIn("non-negative integer", problem)
+
+    def test_require_passes_when_every_record_has_a_sound_rev(self) -> None:
+        entry = {
+            "batch": "b1",
+            "records": [
+                {"sha256": "d1", "changed": True, "rev": 1},
+                {"sha256": "d2", "changed": False, "rev": 0},
+            ],
+        }
+        require_intact_history_revisions(entry)  # must not raise
+
+    def test_require_reports_batch_digest_and_problem(self) -> None:
+        entry = {
+            "batch": "b1",
+            "records": [
+                {"sha256": "d1", "changed": True, "rev": 1},
+                {"sha256": "d2", "changed": True},  # missing rev
+            ],
+        }
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_revisions(entry)
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("d2", message)
+        self.assertIn("missing 'rev'", message)
+
+    def test_require_rejects_spoofing_types_on_unchanged_record_too(self) -> None:
+        # Integrity applies to every record, not just changed ones: a
+        # boolean or decimal on an unchanged row is still damage.
+        for bad in (True, 1.0, "0", None):
+            entry = {
+                "batch": "b1",
+                "records": [{"sha256": "d1", "changed": False, "rev": bad}],
+            }
+            with self.subTest(bad=bad):
+                with self.assertRaises(BatchError) as ctx:
+                    require_intact_history_revisions(entry)
+                self.assertIn("d1", str(ctx.exception))
 
 
 if __name__ == "__main__":

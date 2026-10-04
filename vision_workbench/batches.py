@@ -288,6 +288,64 @@ def item_revision(item: dict[str, Any]) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def describe_history_revision_problem(value: Any, *, present: bool) -> str | None:
+    """Describe why a history record's ``rev`` is not a usable revision.
+
+    Every batch-history sample record must carry ``rev`` as a genuine
+    non-negative integer: the revision pinned for later undos.  Booleans
+    (``True == 1``), decimals (``1.0 == 1``), numeric strings (``"1"``),
+    ``null`` and a missing field are all rejected rather than coerced, so
+    they can never compare equal to a sample's current revision.  Returns
+    ``None`` when the value is valid.
+    """
+    if not present:
+        return "missing 'rev' field"
+    if isinstance(value, bool):
+        return f"'rev' must be a non-negative integer, got boolean {value!r}"
+    if not isinstance(value, int):
+        return f"'rev' must be a non-negative integer, got {value!r}"
+    if value < 0:
+        return f"'rev' must be a non-negative integer, got negative {value}"
+    return None
+
+
+def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records lack a sound pinned ``rev``.
+
+    Every record — changed or not — must carry ``rev`` as a genuine
+    non-negative integer, since undo pins each changed sample to the
+    revision it had at the end of the batch.  This is integrity damage,
+    unlike the *manifest's* optional revision (see
+    :func:`item_revision`, which keeps the legacy missing-means-zero
+    behaviour): a bad row is reported with the batch number, the sample's
+    full digest and the exact ``rev`` problem, and nothing is repaired.
+
+    Callers must run this before any success-shaped short-circuit (such as
+    an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    for record in records:
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        problem = describe_history_revision_problem(
+            record.get("rev"), present="rev" in record
+        )
+        if problem is not None:
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, "
+                f"sample {record.get('sha256')}: {problem}"
+            )
+
+
 def empty_history() -> dict[str, Any]:
     return {"schema_version": BATCH_SCHEMA_VERSION, "batches": []}
 
