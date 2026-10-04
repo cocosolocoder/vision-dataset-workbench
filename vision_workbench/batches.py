@@ -16,9 +16,27 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 BATCH_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class BatchResolution:
+    """One record's verdict, produced before anything is written.
+
+    ``current`` is the label read once during verification and ``changed``
+    is whether ``new`` differs from it.  A resolution never references the
+    manifest item or its revision, so the decision stays independent of
+    the later workspace save.
+    """
+
+    sha256: str
+    old: str | None
+    new: str | None
+    current: str | None
+    changed: bool
 
 
 class BatchError(ValueError):
@@ -92,6 +110,182 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
     return frozenset(
         (record["sha256"], record["old"], record["new"]) for record in records
     )
+
+
+# ---------------------------------------------------------------------------
+# Submission rules
+#
+# Each stage is a pure function of parsed records and the state passed to
+# it; none of them mutate the manifest or the history.  The stages line up
+# with the conditions that reject a submission, in their original order:
+#
+#   1. reject_unknown_samples  — records naming no registered sample
+#   2. resolve_re_submission   — same-number history: replay or conflict
+#   3. verify_records          — one current-label pass: old-label
+#                                mismatches reject the whole batch; the
+#                                surviving resolutions also decide which
+#                                records actually change
+#   4. apply_resolutions       — the only mutating stage (store layer)
+#   5. build_history_entry / result_payload — result/history assembly
+#
+# "Current label" is read exactly once for the whole submission (stage 3),
+# so verification and the change decision never process it twice.
+# ---------------------------------------------------------------------------
+
+# A current-label lookup: full digest -> normalized current label (or
+# ``None`` when the digest names no registered sample).
+CurrentLabels = Callable[[str], str | None]
+
+
+def reject_unknown_samples(
+    records: list[dict[str, Any]], known: Callable[[str], bool]
+) -> None:
+    """Reject the batch if any record names a sample that is not registered.
+
+    The first unknown record is reported, in submission order.
+    """
+    for record in records:
+        if not known(record["sha256"]):
+            raise BatchError(f"sample not found: {record['sha256']}")
+
+
+def resolve_re_submission(
+    number: str,
+    records: list[dict[str, Any]],
+    existing: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Handle a batch number already present in history.
+
+    Equal content (per :func:`content_key`) replays the first submission's
+    result without touching the manifest — even when samples have since
+    changed — while different content conflicts.  Returns the replay
+    result, or ``None`` when the number is free.
+    """
+    if existing is None:
+        return None
+    if content_key(existing["records"]) == content_key(records):
+        return replay_result(existing)
+    raise BatchError(
+        f"batch number {number!r} is already used with different content"
+    )
+
+
+def verify_records(
+    records: list[dict[str, Any]], current_label: CurrentLabels
+) -> list[BatchResolution]:
+    """Verify every expected old label and classify each record, in one pass.
+
+    Each record's current label is looked up once and used for both
+    decisions: a current label differing from the expected old rejects the
+    whole batch; otherwise the record is classified as changed only when
+    the target label differs from that same current label.  No manifest
+    item is modified here.
+    """
+    resolutions: list[BatchResolution] = []
+    for record in records:
+        current = current_label(record["sha256"])
+        if current != record["old"]:
+            raise BatchError(
+                f"change for {record['sha256']}: expected old label "
+                f"{render_label(record['old'])!r} but current label is "
+                f"{render_label(current)!r}"
+            )
+        resolutions.append(
+            BatchResolution(
+                sha256=record["sha256"],
+                old=record["old"],
+                new=record["new"],
+                current=current,
+                changed=current != record["new"],
+            )
+        )
+    return resolutions
+
+
+def apply_resolutions(
+    resolutions: list[BatchResolution],
+    items: Mapping[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Mutate manifest items for the resolved records and build history rows.
+
+    This is the only stage that changes samples: records flagged
+    ``changed`` receive their target label and a new revision; no-op
+    records keep both.  Every row additionally records the revision after
+    the batch, which later undos pin against.  The pre-change revision is
+    read from each item here, once, rather than during verification.
+    """
+    applied: list[dict[str, Any]] = []
+    for resolution in resolutions:
+        item = items[resolution.sha256]
+        revision = item_revision(item)
+        if resolution.changed:
+            item["label"] = resolution.new
+            revision += 1
+            item["rev"] = revision
+        applied.append(
+            {
+                "sha256": resolution.sha256,
+                "old": resolution.old,
+                "new": resolution.new,
+                "changed": resolution.changed,
+                "rev": revision,
+            }
+        )
+    return applied
+
+
+def build_history_entry(
+    number: str, applied_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Assemble the history row for a batch with at least one change."""
+    return {
+        "batch": number,
+        "records": applied_records,
+        "changed_count": sum(1 for record in applied_records if record["changed"]),
+        "undone": False,
+        "undone_at": None,
+    }
+
+
+def result_payload(
+    number: str, status: str, applied_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Build the user-facing result, keeping the original count meanings.
+
+    ``changed`` counts records that actually changed a label,
+    ``unchanged`` counts target-equals-current records and ``total``
+    counts every submitted record.
+    """
+    changed = sum(1 for record in applied_records if record["changed"])
+    return {
+        "batch": number,
+        "status": status,
+        "changed": changed,
+        "unchanged": len(applied_records) - changed,
+        "total": len(applied_records),
+    }
+
+
+def no_changes_result(number: str, total: int) -> dict[str, Any]:
+    """Result for a batch whose records all match their current labels."""
+    return {
+        "batch": number,
+        "status": "no-changes",
+        "changed": 0,
+        "unchanged": total,
+        "total": total,
+    }
+
+
+def replay_result(entry: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the original result from a stored history entry."""
+    return result_payload(entry["batch"], "already-applied", entry["records"])
+
+
+def item_revision(item: dict[str, Any]) -> int:
+    """Read a sample's label revision, treating malformed stored values as 0."""
+    value = item.get("rev", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def empty_history() -> dict[str, Any]:

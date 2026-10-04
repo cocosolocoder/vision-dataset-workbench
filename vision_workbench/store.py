@@ -16,12 +16,18 @@ from typing import Any
 from . import confirmed
 from .batches import (
     BatchError,
-    content_key,
+    apply_resolutions,
+    build_history_entry,
     empty_history,
+    item_revision,
+    no_changes_result,
     normalize_label,
     parse_batch_file,
-    render_label,
+    reject_unknown_samples,
+    resolve_re_submission,
+    result_payload,
     validate_history,
+    verify_records,
 )
 from .splits import (
     SET_NAMES,
@@ -627,12 +633,27 @@ class DatasetStore:
     def submit_batch(self, data: Any) -> dict[str, Any]:
         """Validate and apply a batch label update.
 
-        The whole batch is verified against the current manifest before any
-        change is written: missing digests, duplicate records, bad label
-        types and old-label mismatches reject the batch with no changes.
-        A successful batch is recorded in history; re-submitting the same
-        number with the same content returns the original result without
-        touching anything.
+        Parsing happens before the lock; inside the lock the submission
+        runs through clearly separated stages, each with one job:
+
+        1. **Unknown samples** — every named digest must be registered; the
+           first unknown one rejects the batch with nothing written.
+        2. **Number identity** — a batch number already in history either
+           replays the first submission's result (same content) or is a
+           conflict (different content); neither touches the manifest.
+        3. **Verification/classification** — each current label is read
+           once: an expected-old mismatch rejects the batch, and the same
+           reading decides whether that record actually changes.
+        4. **Application** — only records classified as changed are
+           mutated; if none are, the batch occupies no number and writes
+           no history.
+        5. **History and save** — the entry and result are assembled from
+           the applied records, and manifest plus history commit together
+           through the journal.
+
+        No stage mutates anything before every earlier stage has passed, so
+        a rejection can neither leave partially updated samples nor a
+        partial history entry.
         """
         number, records = parse_batch_file(data)
         with self._locked(create=True):
@@ -640,72 +661,38 @@ class DatasetStore:
             history = self._read_history()
             items = {item["sha256"]: item for item in manifest["items"]}
 
-            for record in records:
-                if record["sha256"] not in items:
-                    raise BatchError(f"sample not found: {record['sha256']}")
+            # Stage 1: every record must name a registered sample.
+            reject_unknown_samples(records, items.__contains__)
 
+            # Stage 2: a known number is replayed or conflicts; a fresh
+            # number proceeds without examining the current labels.
             existing = next(
                 (entry for entry in history["batches"] if entry["batch"] == number),
                 None,
             )
-            if existing is not None:
-                if content_key(existing["records"]) == content_key(records):
-                    return self._replay_result(existing)
-                raise BatchError(
-                    f"batch number {number!r} is already used with different content"
-                )
+            replay = resolve_re_submission(number, records, existing)
+            if replay is not None:
+                return replay
 
-            for record in records:
-                current = normalize_label(items[record["sha256"]].get("label"))
-                if current != record["old"]:
-                    raise BatchError(
-                        f"change for {record['sha256']}: expected old label "
-                        f"{render_label(record['old'])!r} but current label is "
-                        f"{render_label(current)!r}"
-                    )
+            # Stage 3: verify expected old labels and classify changed vs
+            # unchanged in a single current-label pass.
+            resolutions = verify_records(
+                records,
+                lambda digest: normalize_label(items[digest].get("label")),
+            )
 
-            applied_records: list[dict[str, Any]] = []
-            changed_count = 0
-            for record in records:
-                item = items[record["sha256"]]
-                current = normalize_label(item.get("label"))
-                changed = current != record["new"]
-                revision = self._revision(item)
-                if changed:
-                    item["label"] = record["new"]
-                    revision += 1
-                    item["rev"] = revision
-                    changed_count += 1
-                applied_records.append(
-                    {**record, "changed": changed, "rev": revision}
-                )
+            # Stage 4: apply is the only mutation.  No changes at all
+            # occupies no batch number and writes no history.
+            if not any(resolution.changed for resolution in resolutions):
+                return no_changes_result(number, len(records))
+            applied_records = apply_resolutions(resolutions, items)
 
-            if changed_count == 0:
-                # No-op batches occupy no number and write no history.
-                return {
-                    "batch": number,
-                    "status": "no-changes",
-                    "changed": 0,
-                    "unchanged": len(records),
-                    "total": len(records),
-                }
-
-            entry = {
-                "batch": number,
-                "records": applied_records,
-                "changed_count": changed_count,
-                "undone": False,
-                "undone_at": None,
-            }
+            # Stage 5: assemble history, then save manifest and history
+            # together through the journal.
+            entry = build_history_entry(number, applied_records)
             history["batches"].append(entry)
             self._commit(manifest, history)
-            return {
-                "batch": number,
-                "status": "applied",
-                "changed": changed_count,
-                "unchanged": len(records) - changed_count,
-                "total": len(records),
-            }
+            return result_payload(number, "applied", applied_records)
 
     def undo_batch(self, number: str) -> dict[str, Any]:
         """Undo a successful batch by number.
@@ -738,7 +725,7 @@ class DatasetStore:
                         "is no longer in the manifest"
                     )
                 current = normalize_label(item.get("label"))
-                if self._revision(item) != record["rev"] or current != record["new"]:
+                if item_revision(item) != record["rev"] or current != record["new"]:
                     raise BatchError(
                         f"cannot undo batch {number!r}: sample {record['sha256']} "
                         "was modified after the batch"
@@ -750,7 +737,7 @@ class DatasetStore:
                     continue
                 item = items[record["sha256"]]
                 item["label"] = record["old"]
-                item["rev"] = self._revision(item) + 1
+                item["rev"] = item_revision(item) + 1
                 restored += 1
 
             entry["undone"] = True
@@ -762,22 +749,6 @@ class DatasetStore:
         """Return successful batch entries in submission order."""
         with self._locked():
             return self._read_history()["batches"]
-
-    @staticmethod
-    def _replay_result(entry: dict[str, Any]) -> dict[str, Any]:
-        changed = sum(1 for record in entry["records"] if record["changed"])
-        return {
-            "batch": entry["batch"],
-            "status": "already-applied",
-            "changed": changed,
-            "unchanged": len(entry["records"]) - changed,
-            "total": len(entry["records"]),
-        }
-
-    @staticmethod
-    def _revision(item: dict[str, Any]) -> int:
-        value = item.get("rev", 0)
-        return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
     # ------------------------------------------------------------------
     # Workspace locking and transactional commits
