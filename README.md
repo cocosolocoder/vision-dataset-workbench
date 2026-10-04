@@ -303,3 +303,63 @@ and never report corruption from an in-flight write. Saved split plans are
 never touched by imports, label changes or undos; plans created afterwards
 use the current labels, and the same-name reuse/conflict rules still
 apply.
+
+## Listing samples by category
+
+Samples can be listed by their current category without browsing the
+dataset files:
+
+```bash
+python3 -m vision_workbench samples ./workspace cat
+python3 -m vision_workbench samples ./workspace 猫
+python3 -m vision_workbench samples ./workspace ""
+```
+
+The result is JSON with the match count and a sample list:
+
+```json
+{
+  "count": 1,
+  "samples": [
+    {
+      "sha256": "<full SHA-256 digest>",
+      "source": "/path/registered/at/first/import.jpg",
+      "size": 12345,
+      "label": "cat"
+    }
+  ]
+}
+```
+
+- Matching is exact and literal against each sample's *current* label:
+  querying `cat` never includes `Cat` or `cat ` (a trailing space), and
+  labels containing path separators are matched as text, never interpreted
+  as paths. Case, leading/trailing whitespace and the original separators
+  are all kept. Chinese and other non-ASCII label text is preserved in
+  both the query and the output.
+- The empty string (`""`) means *unlabeled*: every sample whose label is
+  `null` or the empty string is listed, and every such record reports its
+  current label as `null`.
+- The literal text `unlabeled` is a normal category: it returns only
+  samples actually labeled `unlabeled`, never the unlabeled samples. This
+  is deliberately finer than the summary statistics, where the two are
+  displayed together.
+- Each sample appears once regardless of how many paths ever imported
+  identical content; `source` is the absolute path saved at the sample's
+  first registration. The list is ordered by the full digest ascending,
+  and `count` always equals the list length.
+- An empty workspace or a category with no matches is a normal result:
+  `{"count": 0, "samples": []}`, never an error.
+- The query reads only the registered manifest: it never opens, re-hashes
+  or re-stats the source images, so a source that has since been moved,
+  deleted or made unreadable is still listed with its recorded source
+  path, size and label. Successful batch updates and undos are reflected
+  by the next query; labels snapshotted inside saved split plans neither
+  participate in matching nor are rewritten. Import de-duplication, the
+  `label` query and batch updates behave exactly as before.
+
+The digests from this list feed the existing workflows directly — for
+example `label ./workspace <digest>` to inspect one sample, or a batch
+file of `sha256`/`old`/`new` changes (with `""` or `null` as the old
+label for samples listed via the empty-string query) to reclassify a
+whole category.

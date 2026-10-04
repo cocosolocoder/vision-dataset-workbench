@@ -567,6 +567,52 @@ class DatasetStore:
                     return {"sha256": digest, "label": normalize_label(item.get("label"))}
         raise BatchError(f"sample not found: {digest}")
 
+    def samples_by_label(self, label: str) -> dict[str, Any]:
+        """List the registered samples whose current label matches exactly.
+
+        Matching uses only the records already in the manifest; source files
+        and saved split plans are never opened, read or rewritten, and a
+        missing workspace simply yields zero samples.
+
+        The empty string selects unlabeled samples: records storing ``null``
+        or ``""`` both match and are reported with ``label`` set to ``null``.
+        Every other string is a literal category matched character for
+        character — case, leading/trailing whitespace and path separators
+        are kept as given, so ``"cat"`` never matches ``"Cat"`` or
+        ``"cat "`` and the real class literally named ``"unlabeled"`` does
+        not mix into the unlabeled result.
+
+        Samples are returned ordered by their full digest; each entry gives
+        the full SHA-256, the source path saved at first registration, the
+        byte size and the current label.  A digest is registered once no
+        matter how many paths imported identical content, so each sample
+        appears at most once.
+        """
+        unlabeled = label == ""
+        with self._locked():
+            items = self._read()["items"] if self.manifest_path.exists() else []
+
+        samples: list[dict[str, Any]] = []
+        for item in sorted(items, key=lambda record: record["sha256"]):
+            stored = item.get("label")
+            if unlabeled:
+                if stored is not None and stored != "":
+                    continue
+                current_label = None
+            else:
+                if stored != label:
+                    continue
+                current_label = label
+            samples.append(
+                {
+                    "sha256": item["sha256"],
+                    "source": item["source"],
+                    "size": item["size"],
+                    "label": current_label,
+                }
+            )
+        return {"count": len(samples), "samples": samples}
+
     def submit_batch_file(self, path: Path) -> dict[str, Any]:
         """Submit a batch from a UTF-8 JSON file."""
         try:
