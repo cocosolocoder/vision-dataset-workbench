@@ -182,10 +182,16 @@ def main() -> int:
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
+            # Validate the manifest before printing anything, so a corrupt
+            # registration list refuses the demonstration without leaving
+            # partial output ahead of the error.
+            dataset_summary = json.dumps(
+                store.summary(), ensure_ascii=False, sort_keys=True
+            )
             print("视觉数据集工作台")
             print("本地 CPU 模式：可用")
             print("当前数据集摘要：")
-            print(json.dumps(store.summary(), ensure_ascii=False, sort_keys=True))
+            print(dataset_summary)
         return 0
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

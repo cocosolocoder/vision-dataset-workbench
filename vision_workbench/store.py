@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import confirmed
+from .manifest import ManifestError, validate_manifest
 from .batches import (
     BatchError,
     apply_resolutions,
@@ -155,6 +156,12 @@ class DatasetStore:
                 self._write_json_atomic(
                     self.manifest_path, {"schema_version": 1, "items": []}
                 )
+            else:
+                # An existing manifest is never rebuilt, emptied or
+                # normalized away — but initializing over a structurally
+                # broken one must not report success, so the corruption is
+                # surfaced here exactly as for any other operation.
+                self._read()
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
         self.initialize()
@@ -810,16 +817,19 @@ class DatasetStore:
             raise BatchError(f"cannot recover interrupted transaction: {error}") from error
         manifest = journal.get("manifest")
         history = journal.get("batches")
-        if not isinstance(manifest, dict) or not isinstance(history, dict):
+        if not isinstance(history, dict):
             raise BatchError("cannot recover interrupted transaction: journal is malformed")
-        # Only install a coherent pair, so recovery can never leave the
-        # manifest and the history in two different states.
-        if manifest.get("schema_version") != 1 or not isinstance(
-            manifest.get("items"), list
-        ):
+        # Only install a coherent, fully valid pair, so recovery can never
+        # replace the committed manifest with a structurally broken sample
+        # list (a missing field, a bad field type or a duplicated digest):
+        # the check runs before either file is rewritten, leaving both the
+        # last committed registration and its history untouched.
+        try:
+            validate_manifest(manifest)
+        except ManifestError as error:
             raise BatchError(
-                "cannot recover interrupted transaction: journal manifest is malformed"
-            )
+                f"cannot recover interrupted transaction: {error}"
+            ) from error
         validate_history(history)
         # Idempotent installs: both files end up at the journal's version.
         self._write_json_atomic(self.manifest_path, manifest)
@@ -1134,10 +1144,19 @@ class DatasetStore:
             os.close(descriptor)
 
     def _read(self) -> dict[str, Any]:
+        """Read and fully validate the current manifest.
+
+        Every caller — queries included — gets only a manifest whose
+        version and entire sample list are structurally sound: a missing
+        field, a wrong field type or a duplicated digest rejects the whole
+        operation before any sample is used, rather than surfacing as a
+        runtime exception on one record or silently acting on only one of
+        two duplicate registrations.
+        """
         try:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Cannot read dataset manifest: {error}") from error
-        if data.get("schema_version") != 1 or not isinstance(data.get("items"), list):
-            raise ValueError("Unsupported dataset manifest")
-        return data
+            raise ManifestError(
+                f"Dataset manifest is corrupted: cannot read manifest.json: {error}"
+            ) from error
+        return validate_manifest(data)

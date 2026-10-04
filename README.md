@@ -269,6 +269,43 @@ imported identical content, with the source from its first registration.
   moved, been deleted or become unreadable is still returned — the source
   file is never reopened and its recorded path is never updated.
 
+## Corrupted registrations
+
+Every command that uses the current manifest — `summary`, `label`,
+`find-label`, `add`, `import-dir`, `batch`, `undo` and `split create` —
+validates the **whole** `manifest.json` before using any sample, so a
+damaged registration list can never surface as a runtime exception on one
+record or make a label change touch only one of two duplicate records:
+
+- The manifest must be a JSON object whose `schema_version` is the integer
+  `1` and whose `items` is a list. Booleans (`true`) and decimals (`1.0`)
+  cannot stand in for the version.
+- Each sample record must be an object with a full 64-character lowercase
+  hexadecimal SHA-256 digest, a non-empty string source, a non-negative
+  integer size, and a string or `null` label. Booleans, numeric strings and
+  decimals are never accepted as sizes. One digest may be registered only
+  once — even two otherwise identical records are an error, never merged.
+- Valid records at the front of the list never mask a later bad record;
+  the check covers the complete list, including records a query would not
+  match.
+
+On any such problem the command exits with a non-zero status, prints
+nothing on standard output and no traceback, and reports on standard error
+that the **dataset manifest** is corrupted — naming the offending part, or
+the record's 1-based position in the list together with the bad field (for
+a duplicate digest, the digest and both positions). The operation is
+refused outright: the existing manifest, the batch history and saved split
+plans are never rewritten, pruned, default-filled or replaced by an empty
+list. Manifests produced by older versions remain valid without migration —
+records may lack the optional label revision and carry extra fields, both
+of which are kept — and the empty list and zero-byte samples stay legal,
+with `null` and `""` still meaning *unlabeled*.
+
+A source image that has since moved or been deleted is not corruption:
+queries keep using the registered information. Features that depend only on
+saved data also keep working regardless of the manifest: `history` reads
+the batch history, and `split show` and `export` use the saved plan alone.
+
 ## Tests
 
 ```bash
