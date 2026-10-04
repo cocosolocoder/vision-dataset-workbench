@@ -16,11 +16,17 @@ from typing import Any
 from . import confirmed
 from .batches import (
     BatchError,
-    content_key,
+    RecordPlan,
+    build_history_entry,
+    check_number_available,
     empty_history,
     normalize_label,
     parse_batch_file,
-    render_label,
+    plan_records,
+    reject_unknown_samples,
+    replay_result,
+    result_applied,
+    result_no_changes,
     validate_history,
 )
 from .splits import (
@@ -627,12 +633,20 @@ class DatasetStore:
     def submit_batch(self, data: Any) -> dict[str, Any]:
         """Validate and apply a batch label update.
 
-        The whole batch is verified against the current manifest before any
-        change is written: missing digests, duplicate records, bad label
-        types and old-label mismatches reject the batch with no changes.
-        A successful batch is recorded in history; re-submitting the same
-        number with the same content returns the original result without
-        touching anything.
+        The submission runs as distinct stages so the rejection rules stay
+        separate from persistence:
+
+        1. Parse and structurally validate the payload (outside the lock).
+        2. Against one locked manifest/history state, run every rejection
+           rule before anything is mutated: unknown samples, a batch number
+           already used (replay vs. conflict), and old-label mismatches.
+        3. Only a fully verified batch reaches :meth:`_apply_batch`, the
+           single place that rewrites sample labels; it also decides the
+           no-changes case, which occupies no number and writes no history.
+
+        Re-submitting the same number with the same content returns the
+        original result without touching anything, even if the samples
+        were relabelled in the meantime.
         """
         number, records = parse_batch_file(data)
         with self._locked(create=True):
@@ -640,72 +654,69 @@ class DatasetStore:
             history = self._read_history()
             items = {item["sha256"]: item for item in manifest["items"]}
 
-            for record in records:
-                if record["sha256"] not in items:
-                    raise BatchError(f"sample not found: {record['sha256']}")
+            # Stage 2a: every record must name a registered sample.
+            reject_unknown_samples(records, items)
 
+            # Stage 2b: the batch number rule — replay, conflict, or free.
             existing = next(
                 (entry for entry in history["batches"] if entry["batch"] == number),
                 None,
             )
-            if existing is not None:
-                if content_key(existing["records"]) == content_key(records):
-                    return self._replay_result(existing)
-                raise BatchError(
-                    f"batch number {number!r} is already used with different content"
+            repeat = check_number_available(number, records, existing)
+            if repeat is not None:
+                return replay_result(repeat)
+
+            # Stage 2c: verify every expected old label once.  Each batch
+            # sample's current label is normalized a single time here, and
+            # that same comparison also decides whether the record changes
+            # its sample (records are unique after parsing).
+            current_labels = {
+                record["sha256"]: normalize_label(
+                    items[record["sha256"]].get("label")
                 )
-
-            for record in records:
-                current = normalize_label(items[record["sha256"]].get("label"))
-                if current != record["old"]:
-                    raise BatchError(
-                        f"change for {record['sha256']}: expected old label "
-                        f"{render_label(record['old'])!r} but current label is "
-                        f"{render_label(current)!r}"
-                    )
-
-            applied_records: list[dict[str, Any]] = []
-            changed_count = 0
-            for record in records:
-                item = items[record["sha256"]]
-                current = normalize_label(item.get("label"))
-                changed = current != record["new"]
-                revision = self._revision(item)
-                if changed:
-                    item["label"] = record["new"]
-                    revision += 1
-                    item["rev"] = revision
-                    changed_count += 1
-                applied_records.append(
-                    {**record, "changed": changed, "rev": revision}
-                )
-
-            if changed_count == 0:
-                # No-op batches occupy no number and write no history.
-                return {
-                    "batch": number,
-                    "status": "no-changes",
-                    "changed": 0,
-                    "unchanged": len(records),
-                    "total": len(records),
-                }
-
-            entry = {
-                "batch": number,
-                "records": applied_records,
-                "changed_count": changed_count,
-                "undone": False,
-                "undone_at": None,
+                for record in records
             }
-            history["batches"].append(entry)
-            self._commit(manifest, history)
-            return {
-                "batch": number,
-                "status": "applied",
-                "changed": changed_count,
-                "unchanged": len(records) - changed_count,
-                "total": len(records),
-            }
+            plans = plan_records(records, current_labels)
+
+            # Stage 3: mutate and persist (the only stage that writes).
+            return self._apply_batch(number, plans, items, manifest, history)
+
+    def _apply_batch(
+        self,
+        number: str,
+        plans: list[RecordPlan],
+        items: dict[str, dict[str, Any]],
+        manifest: dict[str, Any],
+        history: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a fully verified batch and commit it with its history.
+
+        This is the only place a submission changes sample labels.  Records
+        whose target equals the current label are no-ops.  When every
+        record is a no-op (including an empty record list) the batch
+        reports ``no-changes``, occupies no batch number and writes no
+        history; otherwise the new labels and the history entry are
+        installed together by one journal commit.
+        """
+        outcomes: list[tuple[RecordPlan, int]] = []
+        for plan in plans:
+            item = items[plan.record["sha256"]]
+            revision = self._revision(item)
+            if plan.changed:
+                item["label"] = plan.record["new"]
+                revision += 1
+                item["rev"] = revision
+            outcomes.append((plan, revision))
+
+        changed_count = sum(1 for plan, _ in outcomes if plan.changed)
+        if changed_count == 0:
+            # Nothing was mutated above for no-op records; make that
+            # explicit by skipping the commit entirely.
+            return result_no_changes(number, len(plans))
+
+        history["batches"].append(build_history_entry(number, outcomes))
+        self._commit(manifest, history)
+        return result_applied(number, plans)
 
     def undo_batch(self, number: str) -> dict[str, Any]:
         """Undo a successful batch by number.
@@ -762,17 +773,6 @@ class DatasetStore:
         """Return successful batch entries in submission order."""
         with self._locked():
             return self._read_history()["batches"]
-
-    @staticmethod
-    def _replay_result(entry: dict[str, Any]) -> dict[str, Any]:
-        changed = sum(1 for record in entry["records"] if record["changed"])
-        return {
-            "batch": entry["batch"],
-            "status": "already-applied",
-            "changed": changed,
-            "unchanged": len(entry["records"]) - changed,
-            "total": len(entry["records"]),
-        }
 
     @staticmethod
     def _revision(item: dict[str, Any]) -> int:
