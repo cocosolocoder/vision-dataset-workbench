@@ -231,6 +231,44 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   different path yields byte-identical ZIPs, and source modification times
   do not matter.
 
+## Finding samples by label
+
+Samples can be listed by their current category label, so a class leads
+straight to the full sample summaries needed for the label queries and
+batch updates below — no need to page through the dataset listing.
+
+```bash
+python3 -m vision_workbench find-label ./workspace cat     # a normal class
+python3 -m vision_workbench find-label ./workspace 猫      # Chinese text, kept as-is
+python3 -m vision_workbench find-label ./workspace ''      # unlabeled samples
+python3 -m vision_workbench find-label ./workspace unlabeled  # the literal class
+```
+
+The result is readable UTF-8 JSON: the queried label, the match count and
+the sample list, each record giving the full SHA-256 digest, the source
+path saved at first registration, the byte size and the current label.
+Records are sorted ascending by full digest and `count` always equals the
+list length. A digest is listed once no matter how many paths once
+imported identical content, with the source from its first registration.
+
+- Matching is exact on the **current** registered label: case, leading or
+  trailing whitespace and path separators are matched literally and are
+  never trimmed, rewritten or interpreted as paths. Querying `cat` does
+  not return `Cat` or `cat ` (cat followed by a space).
+- The empty string queries **unlabeled** samples: records whose label is
+  `null` or `""` both match, and every returned record shows its label as
+  `null`. Querying the text `unlabeled` instead returns only samples
+  whose real class is literally named `unlabeled`; it never includes
+  unlabeled samples and does not use the summary statistics' display that
+  merges the two.
+- An empty workspace or a label with no matches is a normal result with
+  `count` 0 and an empty list, not an error.
+- The query reads only registered records. A successful batch update or
+  undo is reflected by the next query; labels snapshotted in saved split
+  plans neither match nor are changed, and a source image that has since
+  moved, been deleted or become unreadable is still returned — the source
+  file is never reopened and its recorded path is never updated.
+
 ## Tests
 
 ```bash
@@ -267,10 +305,15 @@ UTF-8 JSON file:
 
 ```bash
 python3 -m vision_workbench label ./workspace <digest>      # current label
+python3 -m vision_workbench find-label ./workspace <label>  # samples of one label
 python3 -m vision_workbench batch ./workspace changes.json   # submit a batch
 python3 -m vision_workbench history ./workspace              # successful batches
 python3 -m vision_workbench undo ./workspace <batch-number>  # undo a batch
 ```
+
+See [Finding samples by label](#finding-samples-by-label) for the
+`find-label` query, including the empty-string query for unlabeled
+samples.
 
 Submitting the same number with the same content again returns the
 original result without re-modifying anything (list order and the

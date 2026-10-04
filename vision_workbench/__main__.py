@@ -43,6 +43,19 @@ def parser() -> argparse.ArgumentParser:
     label.add_argument("workspace", type=Path)
     label.add_argument("digest", help="full SHA-256 digest of the sample")
 
+    find_label = commands.add_parser(
+        "find-label",
+        help="list samples currently registered under one exact label",
+    )
+    find_label.add_argument("workspace", type=Path)
+    find_label.add_argument(
+        "label",
+        help=(
+            "category label to match, exactly as registered; pass the "
+            "empty string ('' on the shell) to list unlabeled samples"
+        ),
+    )
+
     batch = commands.add_parser(
         "batch", help="submit a UTF-8 JSON file of batch label updates"
     )
@@ -125,6 +138,14 @@ def main() -> int:
             print(
                 json.dumps(
                     store.lookup_label(args.digest), ensure_ascii=False, sort_keys=True
+                )
+            )
+        elif args.command == "find-label":
+            print(
+                json.dumps(
+                    store.find_by_label(args.label),
+                    ensure_ascii=False,
+                    sort_keys=True,
                 )
             )
         elif args.command == "batch":

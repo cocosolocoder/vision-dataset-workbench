@@ -551,6 +551,55 @@ class DatasetStore:
             "labels": dict(sorted(labels.items())),
         }
 
+    def find_by_label(self, label: str) -> dict[str, Any]:
+        """List samples currently registered under one exact category label.
+
+        Matching is exact on the current manifest label: case, surrounding
+        whitespace and path separators are all kept literally, so ``"cat"``
+        never matches ``"Cat"`` or ``"cat "``.  The empty string queries
+        unlabeled samples — records whose stored label is ``None`` or ``""``
+        — and every matching record's label is reported uniformly as
+        ``None``.  A genuine class literally named ``"unlabeled"`` is
+        queried with that text and never mixed with unlabeled samples,
+        unlike :meth:`summary` which merges them under one display key.
+
+        Each record provides the full SHA-256 digest, the source path saved
+        at first registration, the byte size and the current label;
+        records are sorted ascending by full digest and ``count`` always
+        equals the list length.  The query reads the registered records
+        only — it never opens a source file, and saved split plans' old
+        labels are neither matched nor rewritten — so a moved, deleted or
+        unreadable source is still found, and a batch update or undo
+        committed before the call is immediately reflected.
+        """
+        if not isinstance(label, str):
+            raise BatchError("query label must be a string")
+        want_unlabeled = label == ""
+        samples: list[dict[str, Any]] = []
+        self.initialize()
+        with self._locked():
+            items = self._read()["items"]
+        for item in items:
+            stored = item.get("label")
+            if want_unlabeled:
+                if not (stored is None or stored == ""):
+                    continue
+                current = None
+            else:
+                if stored != label:
+                    continue
+                current = stored
+            samples.append(
+                {
+                    "sha256": item["sha256"],
+                    "source": item["source"],
+                    "size": item["size"],
+                    "label": current,
+                }
+            )
+        samples.sort(key=lambda sample: sample["sha256"])
+        return {"label": label, "count": len(samples), "samples": samples}
+
     # ------------------------------------------------------------------
     # Batch label updates
     # ------------------------------------------------------------------
