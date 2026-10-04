@@ -25,6 +25,7 @@ from .batches import (
     normalize_label,
     parse_batch_file,
     reject_unknown_samples,
+    require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
     result_payload,
@@ -710,11 +711,12 @@ class DatasetStore:
         modification, even one that restored the same label).  Repeated
         undos are idempotent and do not add history.
 
-        Integrity comes before either verdict: every record of the target
-        batch must carry a sound pinned revision.  A bad row rejects the
-        undo even when the batch is already marked undone, so corruption is
-        never hidden behind an ``already-undone`` success or confused with
-        a sample modified after the batch.
+        Integrity comes before either verdict: the target batch must list
+        every sample exactly once and carry a sound pinned revision on each
+        record.  A duplicated digest or a bad row rejects the undo even when
+        the batch is already marked undone, so corruption is never hidden
+        behind an ``already-undone`` success or confused with a sample
+        modified after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -726,10 +728,12 @@ class DatasetStore:
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
 
-            # Validate the target batch's pinned revisions before the
-            # already-undone short-circuit and the later-modification
-            # checks: a corrupt history record is refusal, not an undo, a
-            # no-op or an unknown batch, and nothing is rewritten.
+            # Validate the target batch's integrity — one row per sample and
+            # sound pinned revisions — before the already-undone
+            # short-circuit and the later-modification checks: a duplicated
+            # or corrupt history record is refusal, not an undo, a no-op or
+            # an unknown batch, and nothing is rewritten.
+            require_intact_history_records(entry)
             require_intact_history_revisions(entry)
 
             if entry["undone"]:

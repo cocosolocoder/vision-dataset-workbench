@@ -309,6 +309,51 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
     return None
 
 
+def require_intact_history_records(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records are not one row per sample.
+
+    Undo pins every stored record to a sample content digest, so a digest
+    may occur at most once in the target batch: a duplicated row — even a
+    byte-for-byte copy, or a copy of a record that never changed a label —
+    would otherwise restore the same sample more than once, bump its label
+    revision repeatedly and inflate the restored count.  Duplicates are
+    therefore batch-history corruption, never records to merge or
+    de-duplicate.  The decision is independent of the labels, the
+    before/after labels and the record's ``changed`` flag: the content
+    digest alone decides.
+
+    The whole record list is scanned, so rows preceding the repeat are
+    checked too and a restorable row at the front can never mask a later
+    duplicate.  On a repeat the error names the batch number, the sample's
+    full digest and both 1-based record positions; nothing is repaired.
+
+    Callers must run this before any success-shaped short-circuit (such as
+    an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    seen: dict[str, int] = {}
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        digest = record.get("sha256")
+        if digest in seen:
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, sample {digest} "
+                f"appears more than once, at record #{seen[digest]} and "
+                f"record #{position}"
+            )
+        seen[digest] = position
+
+
 def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose records lack a sound pinned ``rev``.
 

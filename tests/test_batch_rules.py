@@ -19,6 +19,7 @@ from vision_workbench.batches import (
     normalize_label,
     reject_unknown_samples,
     replay_result,
+    require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
     result_payload,
@@ -283,6 +284,108 @@ class HistoryRevisionValidationTest(unittest.TestCase):
                 with self.assertRaises(BatchError) as ctx:
                     require_intact_history_revisions(entry)
                 self.assertIn("d1", str(ctx.exception))
+
+
+class HistoryRecordUniquenessValidationTest(unittest.TestCase):
+    def entry(self, records: list[dict], *, number: str = "b1") -> dict:
+        return {"batch": number, "records": records}
+
+    def test_distinct_digests_pass(self) -> None:
+        require_intact_history_records(
+            self.entry(
+                [
+                    {"sha256": "d1", "changed": True, "rev": 1},
+                    {"sha256": "d2", "changed": False, "rev": 0},
+                ]
+            )
+        )
+
+    def test_empty_record_list_passes(self) -> None:
+        require_intact_history_records(self.entry([]))
+
+    def test_identical_copied_row_is_corruption_not_a_merge(self) -> None:
+        # A verbatim copy of a record that genuinely changed a label is
+        # still a repeat: undo must not restore the sample twice.
+        row = {"sha256": "d1", "old": "cat", "new": "dog",
+               "changed": True, "rev": 1}
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(self.entry([dict(row), dict(row)]))
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("d1", message)
+        self.assertIn("record #1", message)
+        self.assertIn("record #2", message)
+
+    def test_duplicate_of_an_unchanged_record_is_corruption(self) -> None:
+        # Repeating a no-op row ("record did not actually change a label")
+        # is just as invalid as repeating a changed row.
+        row = {"sha256": "d2", "old": "dog", "new": "dog",
+               "changed": False, "rev": 0}
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(self.entry([dict(row), dict(row)]))
+        self.assertIn("d2", str(ctx.exception))
+
+    def test_digest_alone_decides_even_when_labels_differ(self) -> None:
+        # The repeat carries different label text; identity is by digest.
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d1", "old": "cat", "new": "fish",
+                         "changed": True, "rev": 1},
+                    ]
+                )
+            )
+        self.assertIn("d1", str(ctx.exception))
+
+    def test_a_repeat_behind_valid_rows_is_not_masked(self) -> None:
+        # The first records are restorable; the duplicate only appears at
+        # the back, and positions are counted from the whole list.
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(
+                self.entry(
+                    [
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                        {"sha256": "d2", "changed": True, "rev": 1},
+                        {"sha256": "d3", "changed": True, "rev": 1},
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                    ]
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("record #4", message)
+
+    def test_only_first_two_positions_are_named(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(
+                self.entry(
+                    [
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                    ]
+                )
+            )
+        self.assertIn("record #1", str(ctx.exception))
+        self.assertIn("record #2", str(ctx.exception))
+        self.assertNotIn("record #3", str(ctx.exception))
+
+    def test_batch_number_is_named(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_records(
+                self.entry(
+                    [
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                        {"sha256": "d1", "changed": True, "rev": 1},
+                    ],
+                    number="renumber-9",
+                )
+            )
+        self.assertIn("'renumber-9'", str(ctx.exception))
 
 
 if __name__ == "__main__":

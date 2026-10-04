@@ -408,7 +408,33 @@ unknown batch number — a corrupt record can never be reported as undone,
 as having no changes, or as an unknown batch. Corruption is checked before
 the repeated-undo short-circuit too, so a batch already marked undone
 still surfaces its bad record instead of returning `already-undone`.
-Damage in a different batch does not matter: only the target batch's
+
+A batch history is likewise corrupted when the **same sample content
+digest appears on more than one record of the target batch**. Undo is one
+restore per sample, pinned by that digest, so a duplicated row — even an
+exact copy of a record that genuinely changed a label, or a copy of a
+record that did not change one — would otherwise restore one sample
+several times, add its label revision repeatedly and overstate the
+restored count. Such a batch is never merged or de-duplicated: the whole
+undo is refused. The decision is made from the full SHA-256 digest alone,
+regardless of the labels, whether the before/after labels differ or
+whether the record actually changed anything, so two records with
+different label content for one digest are still a duplicate. Every
+record in the batch is examined, so a perfectly restorable record at the
+front can never hide a repeat that appears later; the error names the
+batch number, the duplicated sample's full digest and the two 1-based
+record positions (the first occurrence and the one that repeats it). As
+with a bad revision, the command exits non-zero with nothing on standard
+output and no traceback, changes no sample label or revision, rewrites
+neither the registration list nor the batch history, sets no new undo
+marker, and is reported even when the batch is already marked undone
+rather than as `already-undone`. The later-modification conflict, an
+unknown batch number and a successful undo are all distinct from this
+refusal.
+
+The same sample participating in two *different* batches over time is
+normal and stays legal; only a repeat inside the one target batch is an
+error. Damage in a different batch does not matter: only the target batch's
 records are examined, so a valid batch still undoes normally.
 
 Imports, batch writes and undos are crash-safe: a write-ahead journal
