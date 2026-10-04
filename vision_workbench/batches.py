@@ -283,9 +283,60 @@ def replay_result(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def item_revision(item: dict[str, Any]) -> int:
-    """Read a sample's label revision, treating malformed stored values as 0."""
+    """Read a sample's label revision, treating malformed stored values as 0.
+
+    The manifest revision is optional for compatibility with older
+    registrations, so a missing value means zero and a malformed value is
+    never used.  History revisions, by contrast, are mandatory and are
+    checked strictly by :func:`history_record_revision`.
+    """
     value = item.get("rev", 0)
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def history_record_revision(record: dict[str, Any]) -> tuple[int | None, str | None]:
+    """Return a history record's label revision, or describe why it is bad.
+
+    Every batch-history record must pin the revision the sample had when
+    the batch ended, so the value must be present and be a genuine
+    non-negative integer: a boolean (``True == 1``), an integral float
+    (``1.0 == 1``), a numeric string, ``None`` or a missing field never
+    compare equal to a real revision and are reported instead of being
+    coerced or treated as zero.  Returns ``(revision, None)`` for a valid
+    record and ``(None, problem)`` when the ``rev`` field is unusable.
+    """
+    if "rev" not in record:
+        return None, "missing 'rev' field"
+    value = record["rev"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, (
+            f"'rev' must be a non-negative integer, got {value!r} "
+            "(booleans, decimals, numeric strings and null are not accepted)"
+        )
+    if value < 0:
+        return None, f"'rev' must be a non-negative integer, got {value}"
+    return value, None
+
+
+def validate_undo_history(number: str, records: list[dict[str, Any]]) -> None:
+    """Reject an undo whose target batch carries a corrupt history record.
+
+    Every record is checked — including records the batch did not change,
+    whose revision zero is still mandatory — before any label is examined
+    or restored, so a damaged batch can never be partially undone.  The
+    check precedes the already-undone short-circuit as well, so a repeated
+    undo cannot mask a damaged revision behind ``already-undone``.
+    """
+    for record in records:
+        _revision, problem = history_record_revision(record)
+        if problem is not None:
+            digest = record.get("sha256")
+            if not isinstance(digest, str):
+                digest = "<invalid digest>"
+            raise BatchError(
+                f"batch history is corrupted: batch {number!r}, sample {digest}: "
+                f"{problem}"
+            )
 
 
 def empty_history() -> dict[str, Any]:

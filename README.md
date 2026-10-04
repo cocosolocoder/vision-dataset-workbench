@@ -368,6 +368,28 @@ if the label was changed back). Other samples' later changes do not block
 the undo. Undo leaves a queryable record; repeating it reports
 `already-undone`.
 
+Each history record of the target batch must carry the `rev` the sample
+had when that batch ended, and it must be a genuine non-negative integer
+for **every** record — whether the batch actually changed that sample or
+not (an unchanged record's integer zero is valid, but the field is still
+required). Booleans (`true` never stands in for revision `1`), decimals
+(`1.0`), numeric strings (`"1"`), `null` and a missing field are all
+history corruption, never coerced or treated as zero. Undo verifies the
+whole target batch before restoring anything and before the
+already-undone short-circuit, so a damaged record refuses the entire
+operation: the command exits with a non-zero status, prints nothing on
+standard output and no traceback, and reports on standard error that the
+**batch history** is corrupted, naming the batch number, the offending
+sample's full SHA-256 and the problem with its `rev`. No label is
+restored (a sample that met every restore condition keeps its current
+label), no missing value is backfilled, no field type is converted, and
+no new undo marker is written. This refusal is distinct from the normal
+"sample was modified after the batch" rejection, from a successful undo,
+from a no-change batch and from an unknown batch number — and it is
+surfaced even for a batch that was already undone. Old registration
+records without the optional manifest `rev` remain valid; only
+batch-history records require it.
+
 Imports, batch writes and undos are crash-safe: a write-ahead journal
 installs the manifest and the history together, so after an interruption
 the workspace shows either the old state or the complete new state with

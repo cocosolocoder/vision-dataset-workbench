@@ -28,6 +28,7 @@ from .batches import (
     resolve_re_submission,
     result_payload,
     validate_history,
+    validate_undo_history,
     verify_records,
 )
 from .splits import (
@@ -704,10 +705,18 @@ class DatasetStore:
     def undo_batch(self, number: str) -> dict[str, Any]:
         """Undo a successful batch by number.
 
-        Only samples the batch actually changed are checked: each must have
-        the same label revision it had right after the batch (no later
-        modification, even one that restored the same label).  Repeated
-        undos are idempotent and do not add history.
+        Only samples the batch actually changed are checked for later
+        modification: each must have the same label revision it had right
+        after the batch (no later modification, even one that restored the
+        same label).  But the history itself is verified first: every
+        record — changed or not — must carry the genuine non-negative
+        integer revision the batch ended on, so a damaged record can
+        neither crash on a missing value nor let a boolean or decimal
+        compare equal to the current revision.  That verification also
+        precedes the already-undone short-circuit, and everything happens
+        before any label is touched, so a corrupt batch is refused whole.
+        Repeated undos of an intact batch are idempotent and add no
+        history.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -718,6 +727,13 @@ class DatasetStore:
             )
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
+
+            # Integrity first: a missing or mistyped revision is history
+            # corruption, distinct from a later label modification, and is
+            # refused even when the batch was already undone.  Nothing has
+            # been mutated yet, so the whole undo is rejected atomically.
+            validate_undo_history(number, entry["records"])
+
             if entry["undone"]:
                 return {"batch": number, "status": "already-undone", "restored": 0}
 

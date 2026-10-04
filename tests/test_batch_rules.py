@@ -14,12 +14,14 @@ from vision_workbench.batches import (
     BatchResolution,
     apply_resolutions,
     build_history_entry,
+    history_record_revision,
     no_changes_result,
     normalize_label,
     reject_unknown_samples,
     replay_result,
     resolve_re_submission,
     result_payload,
+    validate_undo_history,
     verify_records,
 )
 
@@ -224,6 +226,81 @@ class ResultAssemblyTest(unittest.TestCase):
             {"batch": "b1", "status": "already-applied",
              "changed": 1, "unchanged": 1, "total": 2},
         )
+
+
+class HistoryRevisionIntegrityTest(unittest.TestCase):
+    def valid_record(self, **overrides) -> dict:
+        record = {
+            "sha256": "d1", "old": "cat", "new": "dog",
+            "changed": True, "rev": 1,
+        }
+        record.update(overrides)
+        return record
+
+    def test_genuine_non_negative_integer_revisions_pass(self) -> None:
+        for revision in (0, 1, 42):
+            value, problem = history_record_revision(self.valid_record(rev=revision))
+            self.assertEqual(value, revision)
+            self.assertIsNone(problem)
+
+    def test_zero_revision_is_valid_even_for_unchanged_records(self) -> None:
+        value, problem = history_record_revision(
+            self.valid_record(changed=False, rev=0)
+        )
+        self.assertEqual(value, 0)
+        self.assertIsNone(problem)
+
+    def test_missing_revision_is_corruption_not_zero(self) -> None:
+        record = self.valid_record()
+        del record["rev"]
+        value, problem = history_record_revision(record)
+        self.assertIsNone(value)
+        self.assertIn("missing", problem)
+
+    def test_boolean_decimal_string_and_null_revisions_rejected(self) -> None:
+        for bad in (True, False, 1.0, 0.0, "1", "0", None, -1, -0.0, "x", [], {}):
+            with self.subTest(bad=bad):
+                value, problem = history_record_revision(self.valid_record(rev=bad))
+                self.assertIsNone(value)
+                self.assertIsNotNone(problem)
+
+    def test_boolean_true_never_compares_as_revision_one(self) -> None:
+        record = self.valid_record(rev=True)
+        value, problem = history_record_revision(record)
+        self.assertIsNone(value)
+        # The report makes the offending value identifiable.
+        self.assertIn("True", problem)
+
+    def test_validate_undo_history_reports_batch_sample_and_problem(self) -> None:
+        records = [
+            self.valid_record(sha256="d1", rev=1),
+            self.valid_record(
+                sha256="d2", old="cat", new="cat", changed=False, rev=0
+            ),
+        ]
+        validate_undo_history("b1", records)  # intact history passes
+
+        del records[1]["rev"]
+        with self.assertRaises(BatchError) as ctx:
+            validate_undo_history("b1", records)
+        message = str(ctx.exception)
+        self.assertIn("corrupted", message)
+        self.assertIn("b1", message)
+        self.assertIn("d2", message)
+        self.assertIn("rev", message)
+
+    def test_validate_covers_unchanged_records_too(self) -> None:
+        # An unmodified record still has to pin its revision; its integer
+        # zero is valid, but a missing value on one is still corruption.
+        records = [
+            self.valid_record(
+                sha256="d1", old="cat", new="cat", changed=False
+            ),
+        ]
+        del records[0]["rev"]
+        with self.assertRaises(BatchError) as ctx:
+            validate_undo_history("b1", records)
+        self.assertIn("d1", str(ctx.exception))
 
 
 if __name__ == "__main__":

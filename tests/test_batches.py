@@ -14,6 +14,10 @@ from vision_workbench.store import DatasetStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Sentinel for set_history_record_rev: remove the rev field instead of
+# replacing its value.
+_DELETE = object()
+
 
 class StoreHarness(unittest.TestCase):
     def setUp(self) -> None:
@@ -49,6 +53,30 @@ class StoreHarness(unittest.TestCase):
     def manifest_labels(self) -> dict[str, str | None]:
         manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
         return {item["sha256"]: item.get("label") for item in manifest["items"]}
+
+    def history_payload(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def write_history_payload(self, payload: dict) -> None:
+        self.store._write_json_atomic(self.store.batches_path, payload)
+
+    def history_entry(self, number: str) -> dict:
+        return next(
+            entry
+            for entry in self.history_payload()["batches"]
+            if entry["batch"] == number
+        )
+
+    def set_history_record_rev(self, number: str, digest: str, value: object) -> None:
+        """Damage one history record's rev; pass _DELETE to remove it."""
+        payload = self.history_payload()
+        entry = next(e for e in payload["batches"] if e["batch"] == number)
+        record = next(r for r in entry["records"] if r["sha256"] == digest)
+        if value is _DELETE:
+            del record["rev"]
+        else:
+            record["rev"] = value
+        self.write_history_payload(payload)
 
 
 class BatchSubmitTest(StoreHarness):
@@ -353,6 +381,118 @@ class BatchUndoTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "fish")
 
 
+class BatchUndoHistoryIntegrityTest(StoreHarness):
+    """Undo must refuse, whole and untouched, a batch with a bad history rev."""
+
+    def test_missing_rev_rejects_whole_undo_and_restores_nothing(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "puppy"))
+        self.set_history_record_rev("b1", d2, _DELETE)
+
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("corrupted", message)
+        self.assertIn("b1", message)
+        self.assertIn(d2, message)  # the sample's full SHA-256
+        self.assertIn("rev", message)
+        self.assertNotIn("Traceback", message)
+
+        # The first, otherwise restorable sample was not restored.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+        manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        revisions = {item["sha256"]: item["rev"] for item in manifest["items"]}
+        self.assertEqual(revisions, {d1: 1, d2: 1})
+
+        # History is exactly as it was: no undone mark, no backfilled rev.
+        entry = self.history_entry("b1")
+        self.assertFalse(entry["undone"])
+        self.assertIsNone(entry["undone_at"])
+        self.assertNotIn("rev", next(r for r in entry["records"] if r["sha256"] == d2))
+
+    def test_every_bad_revision_shape_is_rejected_as_corruption(self) -> None:
+        # bool (True == 1), integral float (1.0 == 1), numeric string,
+        # null and a missing field must all be refused — never coerced,
+        # never reported as "modified after the batch".
+        for index, bad in enumerate((True, False, 1.0, "1", None, _DELETE)):
+            with self.subTest(bad=bad):
+                number = f"b{index}"
+                d = self.add_sample("cat")
+                self.submit(number, (d, "cat", "dog"))
+                self.set_history_record_rev(number, d, bad)
+                with self.assertRaises(BatchError) as ctx:
+                    self.store.undo_batch(number)
+                message = str(ctx.exception)
+                self.assertIn("corrupted", message)
+                self.assertIn(d, message)
+                self.assertNotIn("modified after", message)
+                self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+                self.assertFalse(self.history_entry(number)["undone"])
+
+    def test_boolean_rev_equal_to_current_revision_still_refuses_undo(self) -> None:
+        # The exact old trap: history rev true compares equal to the
+        # current integer revision 1; undo must not run on that basis.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.set_history_record_rev("b1", d, True)
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("corrupted", str(ctx.exception))
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_bad_rev_on_an_unchanged_record_rejects_too(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        # d2 is a no-op in b1; its history row still pins revision zero.
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self.set_history_record_rev("b1", d2, _DELETE)
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("corrupted", str(ctx.exception))
+        self.assertIn(d2, str(ctx.exception))
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+
+    def test_integer_zero_rev_on_unchanged_record_still_undoes(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        # The no-op record legitimately carries rev 0; undo is unaffected
+        # even if that sample is changed by a later batch.
+        self.submit("b2", (d2, "dog", "fish"))
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "fish")
+
+    def test_corrupt_rev_on_already_undone_batch_is_not_masked(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self.set_history_record_rev("b1", d, True)
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("corrupted", str(ctx.exception))
+        # No new undo marker was written and the field was not converted.
+        entry = self.history_entry("b1")
+        self.assertTrue(entry["undone"])
+        self.assertIs(entry["records"][0]["rev"], True)
+
+    def test_corruption_is_distinct_from_later_modification(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "puppy"))
+        # d2 was genuinely modified afterwards: this keeps the old
+        # "modified after the batch" refusal, not a corruption report.
+        self.submit("b2", (d2, "puppy", "fish"))
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("modified after", str(ctx.exception))
+        self.assertNotIn("corrupted", str(ctx.exception))
+
+
 class BatchSplitInteractionTest(StoreHarness):
     def test_label_changes_leave_existing_splits_unchanged(self) -> None:
         d = self.add_sample("cat")
@@ -589,6 +729,24 @@ class BatchCliTest(StoreHarness):
         rejected = self.run_cli("undo", str(self.root), "nope")
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("unknown batch number", rejected.stderr)
+
+    def test_cli_corrupt_history_undo_fails_cleanly(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "puppy"))
+        self.set_history_record_rev("b1", d2, 1.0)
+
+        result = self.run_cli("undo", str(self.root), "b1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("corrupted", result.stderr)
+        self.assertIn("b1", result.stderr)
+        self.assertIn(d2, result.stderr)
+        self.assertIn("rev", result.stderr)
+        # The first sample, which met every restore condition, stays at
+        # its post-batch label — the batch was refused whole.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
 
 
 if __name__ == "__main__":
