@@ -828,6 +828,58 @@ def _scan_file_error(
     return ExportError(f"cannot read source file {path}: {failure.error}")
 
 
+def _assert_target_name_free(target: Path) -> None:
+    """Reject an occupied target name without following a final symlink.
+
+    ``lstat`` inspects the name itself, so a symlink counts as occupied
+    even when it points at a location that does not exist.  Only a proven
+    ``ENOENT`` means the name is free; any other inspection error fails
+    the export too, rather than risking a write at a name that cannot be
+    shown to be free.
+    """
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ExportError(f"cannot inspect target {target}: {error}") from error
+    raise ExportError(f"target already exists: {target}")
+
+
+def _publish_package(temp_path: Path, target: Path) -> None:
+    """Publish the finished package without ever replacing the target name.
+
+    The package is complete and source-verified by the time this runs.
+    The name is re-checked and then claimed with a single ``link(2)``,
+    which creates a new directory entry and fails with ``EEXIST`` when the
+    name is occupied by anything at all — a regular file, a directory or
+    a symlink, including one whose target does not exist.  A file another
+    program creates at the last instant — even an empty one or one
+    byte-identical to the package — is therefore never replaced, unlinked
+    or written through.  The package lives in the same directory as the
+    target, so the link is same-filesystem and a reader can only ever see
+    the complete file; this run's temporary link is removed afterwards,
+    leaving the occupant untouched on conflict.
+    """
+    _assert_target_name_free(target)
+    try:
+        os.link(temp_path, target)
+    except FileExistsError:
+        # The name was claimed in the gap after the check: link refused
+        # it atomically, so the occupant — file or symlink of any kind —
+        # is exactly as the other program left it.
+        raise ExportError(f"target already exists: {target}") from None
+    except OSError as error:
+        raise ExportError(f"cannot write export package: {error}") from error
+    # The target now carries the finished package under its own link.
+    # Drop the temporary link; if even that fails the package is already
+    # published, so the export still succeeds.
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
+
+
 def _write_package(
     target: Path,
     classes: dict[str, str],
@@ -838,11 +890,16 @@ def _write_package(
 ) -> None:
     """Write the ZIP atomically: lock the target name, stream to a temp file.
 
-    The target is never overwritten: an existing target is rejected and a
-    temp file is used until the whole package has been written and fsynced,
-    so a failure or interruption leaves no incomplete target.  An flock on
-    a lock file next to the target serializes concurrent exports to the
-    same path.
+    The target is never overwritten: an occupied target is rejected both
+    when the export starts and once the package is finished, and the
+    finished package is claimed with a non-replacing ``link`` rather than
+    a rename, so a file or symlink (even a dangling one) that another
+    program creates while the images are copied is preserved and the
+    export fails naming the target.  Streaming to a temp file until the
+    whole package has been written, fsynced and source-verified means a
+    failure or interruption leaves neither an incomplete target nor this
+    run's temp file.  An flock on a lock file next to the target
+    serializes concurrent exports to the same path.
     """
     target = Path(target)
     parent = target.parent
@@ -860,8 +917,7 @@ def _write_package(
     temp_path: Path | None = None
     try:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        if os.path.lexists(target):
-            raise ExportError(f"target already exists: {target}")
+        _assert_target_name_free(target)
 
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=parent
@@ -884,9 +940,12 @@ def _write_package(
                 # directory binding confirmed during the lookup must
                 # still hold.  A directory turned into a symlink while
                 # the last entry was streamed is caught here and the
-                # temp file is discarded rather than renamed into place.
+                # temp file is discarded rather than published.
                 source_anchor.verify_all()
-            os.replace(temp_path, target)
+            # Claim the name only now that the package is complete and
+            # every source check passed; link refuses a name occupied at
+            # the last instant instead of replacing its occupant.
+            _publish_package(temp_path, target)
             temp_path = None
             _fsync_directory(parent)
         except BaseException:

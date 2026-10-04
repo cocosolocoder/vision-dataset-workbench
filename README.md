@@ -207,9 +207,25 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   and reason; the package is byte-identical to a normal export of the
   same plan, options and content. For an empty plan (or when every sample
   is skipped) the directory only has to exist and be a directory.
-- The target must not already exist; it is written atomically, so a failure
-  or interruption leaves no incomplete file. Concurrent exports to the
-  same path are serialized and at most one succeeds.
+- The target name is owned only once the whole package has been generated
+  and fsynced and the source verification has passed, so a reader never
+  sees a half-written file.  The name must be free both when the export
+  starts and at the moment the finished package is published: another
+  program that creates a file at the target path while the images are
+  copied or compressed — even an empty file or one byte-identical to the
+  package, and even in the last instant before publication — makes the
+  export fail with the user-given target path as a name-already-taken
+  conflict, a non-zero exit status and no result on standard output.
+  That occupant is never overwritten, unlinked or moved, its content and
+  file type are preserved, and this run's temporary package is removed.
+  A symbolic link at the name counts as occupied too, including one that
+  points at a location that does not exist; whether the link is there at
+  the start or appears during the export, the link itself and its target
+  are left in place and the ZIP is never written through it.  There is no
+  overwrite option and no automatic alternative file name.  A failure or
+  interruption otherwise leaves no incomplete file, and concurrent
+  exports to the same path are serialized so at most one succeeds and the
+  rest fail clearly with the same conflict.
 - Package bytes are deterministic for a given plan, options and source
   content: exporting at a different time, from a copied workspace or to a
   different path yields byte-identical ZIPs, and source modification times
