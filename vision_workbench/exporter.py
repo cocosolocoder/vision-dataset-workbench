@@ -10,6 +10,22 @@ labels, set assignments and recorded source paths.  Later imports, label
 changes or undos never affect an exported package, and exporting never
 writes to the workspace.
 
+Without ``source_dir`` each sample is copied from its recorded source
+path.  A path that is a symbolic link when the export starts is followed
+once, exactly like a single-file import, and the regular file the link
+then names is the object confirmed for this read.  From that point the
+read is pinned with the same inspect / open-no-follow / fstat-prove rule
+as a source-directory copy: the concrete target is lstat()ed, opened with
+``O_NOFOLLOW`` plus ``O_NONBLOCK`` and proved by descriptor to be that
+exact regular file.  Another regular file renamed onto the path in the
+gap — even one with identical content, size and modification time — is
+rejected as a replaced source rather than read, and a named pipe swapped
+into the gap (even with no writer) is opened without blocking and then
+rejected, so the export neither waits for data nor packages pipe bytes.
+Failures name the sample's full digest, the recorded source path and the
+reason; the recorded path is never rewritten and no same-content
+replacement is substituted.
+
 When ``source_dir`` is given, files are read from that directory tree
 instead of the recorded source paths: every regular file under the
 directory (no extension filter; symlinks and other non-regular entries
@@ -135,6 +151,13 @@ def export_split(
     sample is matched to a file with the same full SHA-256 digest.  The
     plan still decides identities, labels, set assignments and package
     file extensions; the lookup is used for this export only.
+
+    Without ``source_dir`` each sample is read from its recorded source
+    path, pinned to the one ordinary regular file confirmed immediately
+    before the read: a symlink present at the start is followed once,
+    while a replacement landing in the confirm-to-open gap — another
+    regular file, even a byte-identical one, or a named pipe, even one
+    with no writer — fails the whole export instead of being read.
 
     The walk is anchored to directory descriptors, so a subdirectory that
     was a real directory when the walk reached it but has become a symlink
@@ -799,7 +822,13 @@ def _hash_regular_file_at(
     """
     try:
         before = confirmed.inspect_regular(name, dir_fd=directory_fd)
-        descriptor = confirmed.open_without_follow(name, dir_fd=directory_fd)
+        # The lookup deliberately keeps its historical plain blocking
+        # open and does not prove the descriptor itself: the copy later
+        # re-pins the exact inode independently, and the source-directory
+        # matching rules must stay unchanged.
+        descriptor = confirmed.open_without_follow(
+            name, dir_fd=directory_fd, nonblocking=False
+        )
     except confirmed.ConfirmationError as failure:
         raise _scan_file_error(failure, path) from failure
     try:
@@ -1032,23 +1061,7 @@ def _write_sample(
         )
     else:
         source = Path(member["source"])
-        try:
-            stat_result = os.stat(source)
-        except OSError as error:
-            raise ExportError(
-                f"sample {digest}: cannot stat source file {source}: {error}"
-            ) from error
-        if not stat.S_ISREG(stat_result.st_mode):
-            raise ExportError(
-                f"sample {digest}: source is not a regular file: {source}"
-            )
-        try:
-            source_stream = source.open("rb")
-        except OSError as error:
-            raise ExportError(
-                f"sample {digest}: cannot read source file {source}: {error}"
-            ) from error
-        source_size = stat_result.st_size
+        source_stream, source_size = _open_recorded_source(member, digest)
 
     # Sizes are unknown to the ZIP layer until the entry has been streamed,
     # and the classic local file header cannot describe a 2 GiB-or-larger
@@ -1085,9 +1098,131 @@ def _write_sample(
     actual = hasher.hexdigest()
     if actual != digest:
         raise ExportError(
-            f"sample {digest}: source file content changed or is corrupt: "
-            f"expected digest {digest}, got {actual}"
+            f"sample {digest}: source file content changed or is corrupt "
+            f"while reading {source}: expected digest {digest}, got {actual}"
         )
+
+
+def _open_recorded_source(
+    member: dict[str, Any], digest: str
+) -> tuple[Any, int]:
+    """Open the plan-recorded source, pinned to one confirmed regular file.
+
+    The export reads the sample bytes from the path saved in the plan.
+    That path may be a symbolic link when the export starts; as for
+    single-file import the link is followed once and the actual file it
+    names at that moment is the object confirmed for this read.  From
+    that point on the read is pinned with the same
+    inspect/open-no-follow/fstat-prove rule as a source-directory copy:
+
+    * the concrete target is lstat()ed and must be a regular file;
+    * it is opened with ``O_NOFOLLOW`` and ``O_NONBLOCK``, so a name
+      swapped in the gap — a symlink or a named pipe with no writer —
+      can neither redirect nor block the open;
+    * the descriptor is fstat()ed and must be the exact regular file the
+      inspection named, so another regular file renamed onto the path in
+      that gap — even one with identical content, size and modification
+      time — is rejected rather than read, and a named pipe or other
+      non-regular object is rejected before any byte is waited on.
+
+    A stream is returned only for the proved descriptor, together with
+    that confirmed file's size; blocking semantics are restored before
+    streaming, so large sources are still read in fixed chunks.
+    """
+    recorded = member["source"]
+    display = Path(recorded)
+    # Follow a symlink given (or recorded) at the start exactly once:
+    # the confirmed object is the actual file the link names now.  A
+    # strict resolution also turns a vanished path or an unsearchable
+    # component into a plain access failure before anything is opened.
+    try:
+        target = os.path.realpath(recorded, strict=True)
+    except OSError as error:
+        raise ExportError(
+            f"sample {digest}: cannot open recorded source file "
+            f"{display}: {error}"
+        ) from error
+    try:
+        opened_file = confirmed.confirm_and_open_regular(target)
+    except confirmed.ConfirmationError as failure:
+        raise _recorded_source_error(failure, display, digest) from failure
+    descriptor = opened_file.descriptor
+    try:
+        return os.fdopen(descriptor, "rb"), opened_file.opened.st_size
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: cannot read source file {display}: {error}"
+        ) from error
+
+
+def _confirmed_object_kind(status: os.stat_result | None) -> str:
+    """Human word for what occupies a confirmed path."""
+    if status is None:
+        return "non-regular object"
+    mode = status.st_mode
+    if stat.S_ISLNK(mode):
+        return "symbolic link"
+    if stat.S_ISREG(mode):
+        return "regular file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISFIFO(mode):
+        return "named pipe"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular file"
+
+
+def _recorded_source_error(
+    failure: confirmed.ConfirmationError, source: Path, digest: str
+) -> ExportError:
+    """Translate a recorded-source confirmation failure into export wording.
+
+    Every message carries the sample's full digest, the path recorded in
+    the plan and the concrete reason.  An object occupying the path at
+    the first inspection that simply is not regular keeps the plain
+    “not a regular file” wording (optionally naming what it is).  An
+    object that replaced the confirmed regular file between that
+    inspection and the proved open — another regular file, even a
+    byte-identical one, a final symbolic link, or a named pipe caught
+    without blocking — says the recorded source was replaced before it
+    was read, naming what sits there now.  Underlying access failures
+    keep their ``OSError`` text.
+    """
+    if failure.reason is confirmed.ConfirmReason.NOT_REGULAR:
+        kind = _confirmed_object_kind(failure.status)
+        return ExportError(
+            f"sample {digest}: source is not a regular file ({kind}): {source}"
+        )
+    if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
+        return ExportError(
+            f"sample {digest}: recorded source was replaced before it was "
+            f"read: {source} is now a symbolic link"
+        )
+    if failure.reason is confirmed.ConfirmReason.WRONG_IDENTITY:
+        kind = _confirmed_object_kind(failure.status)
+        if kind == "regular file":
+            detail = "now names a different regular file than the one confirmed"
+        else:
+            detail = f"is now a {kind}, not the confirmed regular file"
+        return ExportError(
+            f"sample {digest}: recorded source was replaced before it was "
+            f"read: {source} {detail}"
+        )
+    action = {
+        confirmed.ConfirmStage.INSPECT: "stat",
+        confirmed.ConfirmStage.OPEN: "open",
+        confirmed.ConfirmStage.PROVE: "read",
+    }.get(failure.stage, "open")
+    detail = failure.error if failure.error is not None else "unknown error"
+    return ExportError(
+        f"sample {digest}: cannot {action} source file {source}: {detail}"
+    )
 
 
 def _open_resolved_source(

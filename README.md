@@ -139,7 +139,21 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   literally named `unlabeled` is exported normally.
 - Source files are streamed and verified against the saved content digest
   while copying: a missing, non-regular, unreadable or changed source
-  fails the whole export with the sample digest and reason.
+  fails the whole export with the sample digest and reason. Without
+  `--source-dir` the bytes read must come from the one ordinary regular
+  file confirmed immediately before that read: a source path that is a
+  symbolic link when the export starts is followed once and its target
+  is the confirmed file, but between the confirmation and the actual
+  open the path may not be remapped — another regular file renamed onto
+  it is rejected as a replaced source even when its content, size and
+  modification time match exactly (a matching final digest never masks
+  the replacement), and a named pipe swapped into that gap, even one
+  with no writer, fails immediately and explicitly rather than making
+  the export wait for data or streaming pipe content into the package.
+  Such a failure names the sample's full SHA-256, the recorded source
+  path and the concrete reason, leaves the target unpublished and this
+  run's temporary package removed, and never rewrites the recorded
+  source path or substitutes another same-content file.
 - A single sample at or above 2 GiB (2,147,483,648 bytes of uncompressed
   content) is written as a ZIP64 entry automatically; large and ordinary
   samples may coexist in one plan and one package, and the large entry is

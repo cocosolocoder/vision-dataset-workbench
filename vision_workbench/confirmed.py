@@ -4,7 +4,8 @@ This is the single file-confirmation rule shared by every entry point
 that turns a path into sample bytes:
 
 * single-file import (``DatasetStore.add``),
-* whole-directory import (``DatasetStore.import_directory``), and
+* whole-directory import (``DatasetStore.import_directory``),
+* recorded-source export (``export`` without ``--source-dir``), and
 * ``--source-dir`` export, both when the source tree is looked up and
   when the selected copy is streamed into the package.
 
@@ -14,18 +15,29 @@ The rule:
    (``lstat`` / ``fstatat``); the object found there must be a regular
    file.  Callers that arrive through their own non-symlink walk
    (directory import, source-dir export) only ever confirm such paths,
-   while single-file import resolves a symlink given as its argument
-   before calling in here, so following links at the start stays an
-   entry-point decision.
+   single-file import resolves a symlink given as its argument before
+   calling in here, and recorded-source export resolves the recorded
+   path once (following a symlink present at the start) before the same
+   confirmation, so following links at the start stays an entry-point
+   decision.
 2. The path is opened with ``O_NOFOLLOW`` (relative to a pinned
    directory descriptor when the caller has one), so a symlink swapped
-   onto the path after the inspection cannot redirect the open.
+   onto the path after the inspection cannot redirect the open.  The
+   open also carries ``O_NONBLOCK``: an object swapped in after the
+   inspection — a named pipe with no writer, in particular — is opened
+   (or refused) immediately instead of making the caller wait for data,
+   and the descriptor is proved to be a regular file on the very next
+   step, before any byte is read.
 3. The opened descriptor is ``fstat()``ed and proved to be a regular
    file carrying the exact ``(device, inode)`` identity that was
    confirmed (or, for the export copy, the identity recorded during the
    lookup): a different regular file renamed onto the path — even one
    with identical content, size and modification time — is rejected
-   just like a symlink, even one pointing at the original file.
+   just like a symlink, even one pointing at the original file, and a
+   named pipe or other non-regular object caught by the non-blocking
+   open is rejected the same way.  Only then is the descriptor's
+   blocking mode restored, so the files callers actually stream behave
+   exactly like an ordinary blocking open.
 
 What differs between entry points deliberately stays outside this
 module:
@@ -46,6 +58,7 @@ on.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import os
 import stat
@@ -59,6 +72,13 @@ READ_CHUNK_SIZE = 1024 * 1024
 
 # Open without following a final symlink; 0 on platforms lacking the flag.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# Open without waiting for a writer/reader or carrier: the descriptor is
+# proved to be a regular file before any read, so an object swapped onto
+# the path after the inspection — a named pipe with no writer in
+# particular — is opened (and then rejected) immediately instead of
+# making the confirmation wait for data.  Cleared again once the open is
+# proved regular, so streaming sees an ordinary blocking descriptor.
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class ConfirmStage(str, Enum):
@@ -140,18 +160,36 @@ def inspect_regular(
 
 
 def open_without_follow(
-    path: str | os.PathLike[str], *, dir_fd: int | None = None
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: int | None = None,
+    nonblocking: bool = True,
 ) -> int:
     """Open ``path`` read-only with ``O_NOFOLLOW``, never following a link.
 
+    With ``nonblocking`` (the default) the open also carries
+    ``O_NONBLOCK``: it never waits for another process, so a named pipe
+    (or other carrier) swapped onto the path in the gap after the
+    inspection is opened immediately even with no writer present,
+    rather than blocking before the descriptor can be proved.  Callers
+    that pair this open with :func:`prove_opened_regular` get an
+    ordinary blocking descriptor back once the open is proved regular.
     A final symlink swapped in after the inspection makes the open fail
-    with ``ELOOP``, which is reported as :class:`ConfirmReason.NOW_SYMLINK`
-    rather than a generic access error; every other open failure carries
-    the original :class:`OSError`.  The descriptor belongs to the caller
-    on success.
+    with ``ELOOP``, which is reported as
+    :class:`ConfirmReason.NOW_SYMLINK` rather than a generic access
+    error; every other open failure carries the original
+    :class:`OSError`.  The descriptor belongs to the caller on success.
+
+    ``nonblocking=False`` restores the plain blocking
+    ``O_RDONLY|O_NOFOLLOW`` open for callers that deliberately keep the
+    historical lookup-open semantics (the source-directory scan); such
+    callers must not rely on the descriptor being proved here.
     """
+    flags = os.O_RDONLY | _O_NOFOLLOW
+    if nonblocking:
+        flags |= _O_NONBLOCK
     try:
-        return os.open(path, os.O_RDONLY | _O_NOFOLLOW, dir_fd=dir_fd)
+        return os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:
         reason = (
             ConfirmReason.NOW_SYMLINK
@@ -163,6 +201,24 @@ def open_without_follow(
         ) from error
 
 
+def _clear_nonblocking(descriptor: int) -> None:
+    """Restore ordinary blocking semantics on a proved descriptor.
+
+    The non-blocking flag only existed to keep the open itself from
+    waiting on a swapped non-regular carrier; streaming the now-proved
+    regular file must behave like an ordinary blocking open.  Clearing
+    access flags on a regular file never blocks.
+    """
+    try:
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        fcntl.fcntl(descriptor, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    except OSError as error:
+        _close_quietly(descriptor)
+        raise ConfirmationError(
+            ConfirmReason.ACCESS_ERROR, ConfirmStage.PROVE, error=error
+        ) from error
+
+
 def prove_opened_regular(
     descriptor: int, confirmed: os.stat_result
 ) -> os.stat_result:
@@ -171,8 +227,13 @@ def prove_opened_regular(
     The descriptor is ``fstat()``ed and must be a regular file carrying
     ``confirmed``'s ``(device, inode)``; this covers the object that is
     actually read, not just one look at the path before it was opened.
-    On any rejection the descriptor is closed here, so no opened file is
-    leaked by a failed confirmation.
+    A named pipe or other non-regular object that the non-blocking open
+    let through after a swap — even one with no writer — is rejected
+    here, before any byte is read and without ever waiting on it.  On
+    success the descriptor's temporary non-blocking mode is cleared, so
+    callers stream an ordinary blocking file.  On any rejection the
+    descriptor is closed here, so no opened file is leaked by a failed
+    confirmation.
     """
     try:
         opened = os.fstat(descriptor)
@@ -189,6 +250,7 @@ def prove_opened_regular(
         raise ConfirmationError(
             ConfirmReason.WRONG_IDENTITY, ConfirmStage.PROVE, status=opened
         )
+    _clear_nonblocking(descriptor)
     return opened
 
 
