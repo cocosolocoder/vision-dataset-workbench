@@ -25,7 +25,7 @@ from .batches import (
     normalize_label,
     parse_batch_file,
     reject_unknown_samples,
-    require_intact_history_revisions,
+    require_intact_history,
     resolve_re_submission,
     result_payload,
     validate_history,
@@ -711,7 +711,11 @@ class DatasetStore:
         undos are idempotent and do not add history.
 
         Integrity comes before either verdict: every record of the target
-        batch must carry a sound pinned revision.  A bad row rejects the
+        batch must carry a sound pinned revision, and every sample must
+        appear at most once in the batch's records — a digest listed twice
+        would otherwise be restored twice, bumping its revision twice and
+        inflating the restored count, so such a batch is refused as
+        corrupted history rather than deduplicated.  A bad row rejects the
         undo even when the batch is already marked undone, so corruption is
         never hidden behind an ``already-undone`` success or confused with
         a sample modified after the batch.
@@ -726,11 +730,12 @@ class DatasetStore:
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
 
-            # Validate the target batch's pinned revisions before the
-            # already-undone short-circuit and the later-modification
-            # checks: a corrupt history record is refusal, not an undo, a
-            # no-op or an unknown batch, and nothing is rewritten.
-            require_intact_history_revisions(entry)
+            # Validate the target batch's integrity (pinned revisions and
+            # unique samples) before the already-undone short-circuit and
+            # the later-modification checks: a corrupt history record is
+            # refusal, not an undo, a no-op or an unknown batch, and
+            # nothing is rewritten.
+            require_intact_history(entry)
 
             if entry["undone"]:
                 return {"batch": number, "status": "already-undone", "restored": 0}

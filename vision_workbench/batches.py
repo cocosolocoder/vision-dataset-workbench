@@ -346,6 +346,78 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
             )
 
 
+def find_duplicate_history_digest(
+    entry: Mapping[str, Any],
+) -> tuple[str, int, int] | None:
+    """Return ``(digest, first_position, second_position)`` for the first
+    sample digest appearing more than once in one batch's record list.
+
+    Only the full content digest matters: the record's labels and whether
+    it actually changed a label are irrelevant, so an exact copy of a
+    changed record and a second listing of a no-op record both count.
+    Positions are 1-based positions in the target batch's record list;
+    the whole list is scanned, so a restorable record at the front can
+    never mask a duplicate behind it.  Returns ``None`` when every digest
+    appears once.
+    """
+    records = entry.get("records")
+    positions: dict[str, int] = {}
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        return None
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            continue
+        digest = record.get("sha256")
+        if digest in positions:
+            return digest, positions[digest], position
+        positions[digest] = position
+    return None
+
+
+def require_no_duplicate_history_samples(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry that lists one sample digest more than once.
+
+    A digest appearing twice in a single batch is integrity damage: the
+    duplicated rows would otherwise be restored twice by an undo, bumping
+    the sample's revision twice and inflating the restored count.  The
+    refusal names the batch number, the sample's full SHA-256 digest and
+    the 1-based positions of its first and second occurrence.  Nothing is
+    merged, deduplicated or recalculated.
+
+    Like :func:`require_intact_history_revisions`, callers must run this
+    before any success-shaped short-circuit (such as an already-undone
+    batch), so corruption can never be masked by a repeated-undo success.
+    """
+    duplicate = find_duplicate_history_digest(entry)
+    if duplicate is not None:
+        digest, first_position, second_position = duplicate
+        number = entry.get("batch")
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}, "
+            f"sample {digest}: digest listed twice in this batch, "
+            f"at record #{first_position} and record #{second_position}"
+        )
+
+
+def require_intact_history(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry undo cannot interpret safely.
+
+    Two integrity conditions are checked over the target batch's whole
+    record list before any undo verdict (including ``already-undone``):
+
+    * every record must carry a sound pinned ``rev``
+      (:func:`require_intact_history_revisions`);
+    * every sample digest must appear at most once
+      (:func:`require_no_duplicate_history_samples`).
+
+    Both checks are read-only: a failure restores nothing and rewrites
+    neither the history nor the manifest.
+    """
+    require_intact_history_revisions(entry)
+    require_no_duplicate_history_samples(entry)
+
+
 def empty_history() -> dict[str, Any]:
     return {"schema_version": BATCH_SCHEMA_VERSION, "batches": []}
 

@@ -411,6 +411,34 @@ still surfaces its bad record instead of returning `already-undone`.
 Damage in a different batch does not matter: only the target batch's
 records are examined, so a valid batch still undoes normally.
 
+A sample's full SHA-256 digest may appear at most once in a successful
+batch's records. When an undo targets a batch that lists one digest
+twice, the command exits with a non-zero status, prints nothing on
+standard output and no traceback, and reports on standard error that the
+**batch history** is corrupted — naming the batch number, the full
+SHA-256 digest of the repeated sample and the 1-based positions of its
+first and second occurrence in the target batch's record list. Equality
+is judged by content digest alone: it does not matter whether the two
+records carry the same labels, whether the record actually changed a
+label, or whether the second row is merely an unchanged copy. The check
+covers the complete record list, so a perfectly restorable record at the
+front never hides a duplicate that appears later, and it runs before the
+repeated-undo short-circuit, so a batch already marked undone still
+surfaces the duplicate instead of returning `already-undone`. The whole
+undo is refused: no sample changes label or gains a label revision, the
+restored count is never recalculated over the merged rows, and neither
+the registration list, the batch history, an existing undo marker nor a
+saved split plan is rewritten or repaired — the duplicated records are
+never deleted or deduplicated on the caller's behalf. This is distinct
+from the "sample modified after the batch" rejection, from an unknown
+batch number and from a successful undo. Only the target batch is
+examined: the same sample participating in two different batches is
+normal, and a duplicate inside another batch never blocks a clean target
+batch from undoing. An intact batch keeps the existing rules — only
+records that actually changed are restored, the later-modification check
+and the restored-count meaning are unchanged, and only an intact batch
+already marked undone returns `already-undone`.
+
 Imports, batch writes and undos are crash-safe: a write-ahead journal
 installs the manifest and the history together, so after an interruption
 the workspace shows either the old state or the complete new state with

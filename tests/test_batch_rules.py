@@ -15,11 +15,14 @@ from vision_workbench.batches import (
     apply_resolutions,
     build_history_entry,
     describe_history_revision_problem,
+    find_duplicate_history_digest,
     no_changes_result,
     normalize_label,
     reject_unknown_samples,
     replay_result,
+    require_intact_history,
     require_intact_history_revisions,
+    require_no_duplicate_history_samples,
     resolve_re_submission,
     result_payload,
     verify_records,
@@ -283,6 +286,98 @@ class HistoryRevisionValidationTest(unittest.TestCase):
                 with self.assertRaises(BatchError) as ctx:
                     require_intact_history_revisions(entry)
                 self.assertIn("d1", str(ctx.exception))
+
+
+class HistoryDuplicateSampleValidationTest(unittest.TestCase):
+    def entry(self, records: list[dict], number: str = "b1") -> dict:
+        return {"batch": number, "records": records}
+
+    def row(self, digest: str, *, changed: bool = True, rev: int = 1,
+            old="cat", new="dog") -> dict:
+        return {"sha256": digest, "old": old, "new": new,
+                "changed": changed, "rev": rev}
+
+    def test_no_duplicates_returns_none(self) -> None:
+        entry = self.entry([self.row("d1"), self.row("d2", changed=False, rev=0)])
+        self.assertIsNone(find_duplicate_history_digest(entry))
+
+    def test_empty_record_list_is_intact(self) -> None:
+        require_no_duplicate_history_samples(self.entry([]))  # must not raise
+
+    def test_exact_copy_of_a_changed_record_is_a_duplicate(self) -> None:
+        duplicate = find_duplicate_history_digest(
+            self.entry([self.row("d1"), self.row("d1")])
+        )
+        self.assertEqual(duplicate, ("d1", 1, 2))
+
+    def test_duplicate_of_an_unchanged_record_is_still_a_duplicate(self) -> None:
+        # Whether the record actually changed a label is irrelevant: a
+        # second copy of a no-op row is just as much corruption.
+        noop = self.row("d2", changed=False, rev=0, old="cat", new="cat")
+        duplicate = find_duplicate_history_digest(
+            self.entry([self.row("d1"), noop, noop])
+        )
+        self.assertEqual(duplicate, ("d2", 2, 3))
+
+    def test_duplicate_with_different_labels_is_still_a_duplicate(self) -> None:
+        # Digest equality alone decides; old/new text never matters.
+        duplicate = find_duplicate_history_digest(
+            self.entry([
+                self.row("d9", old="cat", new="dog"),
+                self.row("d9", old="fish", new=None),
+            ])
+        )
+        self.assertEqual(duplicate, ("d9", 1, 2))
+
+    def test_whole_list_is_scanned(self) -> None:
+        # A restorable record at the front must not mask a later repeat.
+        duplicate = find_duplicate_history_digest(
+            self.entry([self.row("d1"), self.row("d2"), self.row("d1")])
+        )
+        self.assertEqual(duplicate, ("d1", 1, 3))
+
+    def test_first_repeated_digest_is_reported_with_its_positions(self) -> None:
+        duplicate = find_duplicate_history_digest(
+            self.entry([
+                self.row("d2"), self.row("d1"),
+                self.row("d3"), self.row("d2"), self.row("d1"),
+            ])
+        )
+        self.assertEqual(duplicate, ("d2", 1, 4))
+
+    def test_message_names_batch_digest_and_both_positions(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_no_duplicate_history_samples(
+                self.entry([self.row("d1"), self.row("d2"), self.row("d1")],
+                           number="b7")
+            )
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b7'", message)
+        self.assertIn("d1", message)
+        self.assertIn("record #1", message)
+        self.assertIn("record #3", message)
+
+    def test_combined_gate_rejects_bad_rev_and_duplicates(self) -> None:
+        # A bad rev is reported even when no digest repeats ...
+        bad_rev = self.entry([
+            {"sha256": "d1", "changed": True, "rev": True},
+            {"sha256": "d2", "changed": True, "rev": 1},
+        ])
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history(bad_rev)
+        self.assertIn("'rev'", str(ctx.exception))
+
+        # ... and a duplicate is reported when every rev is sound.
+        duplicated = self.entry([self.row("d1"), self.row("d1")])
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history(duplicated)
+        self.assertIn("listed twice", str(ctx.exception))
+
+    def test_combined_gate_passes_an_intact_batch(self) -> None:
+        require_intact_history(
+            self.entry([self.row("d1"), self.row("d2", changed=False, rev=0)])
+        )
 
 
 if __name__ == "__main__":
