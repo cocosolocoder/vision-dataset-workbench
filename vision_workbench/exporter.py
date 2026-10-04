@@ -10,6 +10,24 @@ labels, set assignments and recorded source paths.  Later imports, label
 changes or undos never affect an exported package, and exporting never
 writes to the workspace.
 
+Without ``source_dir`` each sample is read from its plan-recorded
+source path, and the read is pinned to the one regular file confirmed
+immediately before it, using the same confirm/open/prove rule as
+import and source-dir export.  A recorded path that is a symlink when
+the export starts is followed once (its target is the confirmed file);
+the target is then lstat()ed without following links, opened with
+``O_NOFOLLOW`` and ``O_NONBLOCK`` and proved by an fstat() of the
+descriptor against the confirmed device and inode.  A replacement
+landing after that confirmation — another regular file, even one with
+identical content, size and mtime, a symlink, even one pointing back at
+the original, or a named pipe — therefore fails the export: the
+identity mismatch and the link are refused directly, a writerless FIFO
+opens at once under ``O_NONBLOCK`` and is rejected by the regular-file
+proof before any read, and a unix socket is refused by the open itself,
+so the pipe can never stall the export or feed its bytes into the
+package.  The recorded path is never rewritten and no same-content file
+is substituted.
+
 When ``source_dir`` is given, files are read from that directory tree
 instead of the recorded source paths: every regular file under the
 directory (no extension filter; symlinks and other non-regular entries
@@ -1032,23 +1050,7 @@ def _write_sample(
         )
     else:
         source = Path(member["source"])
-        try:
-            stat_result = os.stat(source)
-        except OSError as error:
-            raise ExportError(
-                f"sample {digest}: cannot stat source file {source}: {error}"
-            ) from error
-        if not stat.S_ISREG(stat_result.st_mode):
-            raise ExportError(
-                f"sample {digest}: source is not a regular file: {source}"
-            )
-        try:
-            source_stream = source.open("rb")
-        except OSError as error:
-            raise ExportError(
-                f"sample {digest}: cannot read source file {source}: {error}"
-            ) from error
-        source_size = stat_result.st_size
+        source_stream, source_size = _open_recorded_source(source, digest)
 
     # Sizes are unknown to the ZIP layer until the entry has been streamed,
     # and the classic local file header cannot describe a 2 GiB-or-larger
@@ -1161,6 +1163,175 @@ def _resolved_source_error(
     action = "stat" if failure.stage is confirmed.ConfirmStage.INSPECT else "read"
     return ExportError(
         f"sample {digest}: cannot {action} source file {source}: {failure.error}"
+    )
+
+
+def _open_recorded_source(source: Path, digest: str) -> tuple[Any, int]:
+    """Open the plan-recorded source, pinned to the file confirmed now.
+
+    The recorded path may itself be a symlink when the export starts:
+    the link is resolved once here (exactly as import does), and
+    everything afterwards confirms and pins that target itself, so the
+    object this export confirms is the actual file the link named at
+    resolution time.
+
+    The target is inspected with ``lstat`` without following links,
+    opened with ``O_NOFOLLOW`` and ``O_NONBLOCK`` and proved by an
+    ``fstat`` of the descriptor to carry the exact ``(device, inode)``
+    that was inspected — the same confirm/open/prove rule the
+    source-directory copy uses.  The bytes streamed therefore come from
+    the one regular file confirmed before reading:
+
+    * a different regular file renamed onto the path (or link target)
+      after the inspection — even one with identical content, size and
+      modification time — is refused as a replacement, never accepted on
+      matching digest;
+    * a symlink swapped onto the path after the inspection is refused,
+      even when it points at the original file;
+    * a FIFO (or another non-regular object) swapped into the gap never
+      waits for data: the non-blocking open either returns immediately
+      (a writerless FIFO on Linux) or fails at the open (a unix socket),
+      and the descriptor's fstat proof rejects it as non-regular before
+      any byte is read, so a named pipe can never stall the export and
+      its content can never enter the package.
+
+    Returns a binary stream together with the confirmed file's size.
+    Error messages name the plan-recorded source path, not the resolved
+    link target.
+    """
+    target = _resolve_recorded_source(source, digest)
+    try:
+        opened_file = confirmed.confirm_and_open_regular(target, nonblock=True)
+    except confirmed.ConfirmationError as failure:
+        raise _recorded_source_error(failure, source, target, digest) from failure
+    descriptor = opened_file.descriptor
+    # The non-blocking flag only had to cover the open (so a swapped FIFO
+    # cannot make it stall).  The descriptor is already proved to be a
+    # regular file, where O_NONBLOCK has no effect anyway; clear it so the
+    # streaming read below behaves exactly like the classic blocking open.
+    nonblock_flag = getattr(os, "O_NONBLOCK", 0)
+    if nonblock_flag:
+        try:
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            fcntl.fcntl(descriptor, fcntl.F_SETFL, flags & ~nonblock_flag)
+        except OSError:
+            pass
+    try:
+        return os.fdopen(descriptor, "rb"), opened_file.opened.st_size
+    except OSError as error:
+        os.close(descriptor)
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
+
+
+def _resolve_recorded_source(source: Path, digest: str) -> Path:
+    """Resolve the recorded path once when it is (or leads through) a link.
+
+    A recorded path that is a symlink when the export starts keeps the
+    existing follow-the-link behavior: resolution happens strictly here
+    and the returned target is what the rest of the open pins, so a link
+    swapped in *after* this resolution is never chased.  A path that is
+    missing or already dangling fails naming the recorded source.
+    """
+    try:
+        return source.resolve(strict=True)
+    except OSError as error:
+        raise ExportError(
+            f"sample {digest}: cannot read source file {source}: {error}"
+        ) from error
+
+
+def _object_kind_name(status: os.stat_result | None) -> str | None:
+    """Plain name for a non-regular object type, for failure messages.
+
+    Returns ``None`` for a regular file (the different-inode replacement
+    case — its type is not the problem, only that it is another object)
+    and when no status was obtainable.
+    """
+    if status is None:
+        return None
+    mode = status.st_mode
+    if stat.S_ISREG(mode):
+        return None
+    if stat.S_ISFIFO(mode):
+        return "named pipe"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular object"
+
+
+def _recorded_source_error(
+    failure: confirmed.ConfirmationError,
+    source: Path,
+    target: Path,
+    digest: str,
+) -> ExportError:
+    """Translate a confirmation failure for the plan-recorded source.
+
+    Replacements observed after the initial confirmation — a symlink at
+    the inspection or open, another object proved behind the descriptor
+    (a different regular file or a writerless FIFO that opened at once),
+    or a unix socket whose non-blocking open fails with ``ENXIO`` — say
+    “replaced” and name what the path became; a non-regular object seen
+    at the inspection keeps the “not a regular file” wording with the
+    concrete object kind, and plain access failures keep their
+    underlying ``OSError`` and “cannot stat/read” wording.
+    """
+    if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
+        return ExportError(
+            f"sample {digest}: source file was replaced: "
+            f"{source} is now a symlink"
+        )
+    if failure.reason is confirmed.ConfirmReason.WRONG_IDENTITY:
+        kind = _object_kind_name(failure.status)
+        suffix = f" (now a {kind})" if kind else ""
+        return ExportError(
+            f"sample {digest}: source file was replaced by another object"
+            f"{suffix}: {source}"
+        )
+    if failure.reason is confirmed.ConfirmReason.NOT_REGULAR:
+        kind = _object_kind_name(failure.status)
+        suffix = f" ({kind})" if kind else ""
+        return ExportError(
+            f"sample {digest}: source is not a regular file{suffix}: {source}"
+        )
+    error = failure.error
+    if (
+        error is not None
+        and failure.stage is confirmed.ConfirmStage.OPEN
+        and error.errno == errno.ENXIO
+    ):
+        # The non-blocking open itself refused the swapped object with
+        # ENXIO (on Linux a unix datagram socket; a writerless FIFO opens
+        # at once and is instead caught by the regular-file proof below).
+        # Inspect the path once to name the concrete object in the reason.
+        try:
+            now = os.lstat(target)
+        except OSError:
+            now = None
+        kind = _object_kind_name(now)
+        if kind is not None:
+            return ExportError(
+                f"sample {digest}: source file was replaced: "
+                f"{source} is now a {kind}"
+            )
+        return ExportError(
+            f"sample {digest}: source file was replaced by a non-regular "
+            f"object that cannot be opened: {source}: {error}"
+        )
+    if failure.stage is confirmed.ConfirmStage.INSPECT:
+        return ExportError(
+            f"sample {digest}: cannot stat source file {source}: {error}"
+        )
+    return ExportError(
+        f"sample {digest}: cannot read source file {source}: {error}"
     )
 
 

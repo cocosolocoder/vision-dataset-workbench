@@ -140,6 +140,27 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
 - Source files are streamed and verified against the saved content digest
   while copying: a missing, non-regular, unreadable or changed source
   fails the whole export with the sample digest and reason.
+- Without `--source-dir`, every sample is read from its plan-recorded
+  source path, and the bytes read are pinned to the one ordinary regular
+  file confirmed immediately before the read: a path that is a symlink
+  when the export starts is followed once and its target is the
+  confirmed file, but the target is then `lstat()`ed without following
+  links, opened with `O_NOFOLLOW`/`O_NONBLOCK`, and the opened
+  descriptor is `fstat()`ed and proved to carry the exact device and
+  inode that were confirmed. If the source is replaced after the
+  confirmation but before or while it is opened, the whole export fails
+  with the sample's full SHA-256, the recorded source path and the
+  reason: another regular file renamed onto the path is refused as a
+  replacement even when its content, size and modification time all
+  match the original, and a symlink is refused even when it points back
+  at the original file. A named pipe (or another non-regular object)
+  swapped into the gap never waits for data: the non-blocking open
+  returns at once (or refuses a socket outright) and the descriptor's
+  regular-file proof rejects it before any read, so a writerless pipe
+  can never stall the export and its content can never enter the
+  package. No other same-content file is substituted and the recorded
+  source path is never rewritten;
+  matching content never masks the failure.
 - A single sample at or above 2 GiB (2,147,483,648 bytes of uncompressed
   content) is written as a ZIP64 entry automatically; large and ordinary
   samples may coexist in one plan and one package, and the large entry is

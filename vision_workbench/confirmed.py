@@ -4,9 +4,11 @@ This is the single file-confirmation rule shared by every entry point
 that turns a path into sample bytes:
 
 * single-file import (``DatasetStore.add``),
-* whole-directory import (``DatasetStore.import_directory``), and
+* whole-directory import (``DatasetStore.import_directory``),
 * ``--source-dir`` export, both when the source tree is looked up and
-  when the selected copy is streamed into the package.
+  when the selected copy is streamed into the package, and
+* ordinary (recorded-path) export, when a plan-recorded source is
+  streamed into the package.
 
 The rule:
 
@@ -59,6 +61,12 @@ READ_CHUNK_SIZE = 1024 * 1024
 
 # Open without following a final symlink; 0 on platforms lacking the flag.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# Open in non-blocking mode so a FIFO swapped onto a confirmed path cannot
+# stall the open waiting for a writer: on Linux a read-only O_NONBLOCK open
+# of a writerless FIFO returns immediately (the descriptor is then proved
+# non-regular and closed), and a unix socket fails at the open with ENXIO.
+# 0 where the flag is unavailable (regular files are unaffected by it).
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class ConfirmStage(str, Enum):
@@ -140,18 +148,28 @@ def inspect_regular(
 
 
 def open_without_follow(
-    path: str | os.PathLike[str], *, dir_fd: int | None = None
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: int | None = None,
+    nonblock: bool = False,
 ) -> int:
     """Open ``path`` read-only with ``O_NOFOLLOW``, never following a link.
 
     A final symlink swapped in after the inspection makes the open fail
     with ``ELOOP``, which is reported as :class:`ConfirmReason.NOW_SYMLINK`
     rather than a generic access error; every other open failure carries
-    the original :class:`OSError`.  The descriptor belongs to the caller
-    on success.
+    the original :class:`OSError`.  With ``nonblock`` the open also
+    carries ``O_NONBLOCK``: a regular file opens just the same, while a
+    writerless FIFO opens immediately rather than blocking for a writer
+    (the caller then proves the descriptor non-regular) and a unix
+    socket fails at the open itself with ``ENXIO``.  The descriptor
+    belongs to the caller on success.
     """
+    flags = os.O_RDONLY | _O_NOFOLLOW
+    if nonblock:
+        flags |= _O_NONBLOCK
     try:
-        return os.open(path, os.O_RDONLY | _O_NOFOLLOW, dir_fd=dir_fd)
+        return os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:
         reason = (
             ConfirmReason.NOW_SYMLINK
@@ -212,15 +230,19 @@ def confirm_and_open_regular(
     *,
     dir_fd: int | None = None,
     expected: tuple[int, int] | None = None,
+    nonblock: bool = False,
 ) -> ConfirmedOpen:
     """Inspect, open without following links, and prove the descriptor.
 
     Returns the open descriptor together with the pre-open inspection
     and the descriptor's own status.  The descriptor is owned by the
-    caller; every failure path closes it.
+    caller; every failure path closes it.  ``nonblock`` is passed to
+    :func:`open_without_follow` so a FIFO that lands on the path after
+    the inspection can never block the open: it opens at once and the
+    descriptor proof below rejects it as non-regular.
     """
     confirmed_status = inspect_regular(path, dir_fd=dir_fd, expected=expected)
-    descriptor = open_without_follow(path, dir_fd=dir_fd)
+    descriptor = open_without_follow(path, dir_fd=dir_fd, nonblock=nonblock)
     opened = prove_opened_regular(descriptor, confirmed_status)
     return ConfirmedOpen(descriptor, confirmed_status, opened)
 
