@@ -432,6 +432,42 @@ rather than as `already-undone`. The later-modification conflict, an
 unknown batch number and a successful undo are all distinct from this
 refusal.
 
+A batch history is likewise corrupted when a record's **`changed` flag
+contradicts the before/after labels saved on that same record**. Undo treats
+a flagged-changed row as a sample to restore from `new` back to `old` and to
+count, and a flagged-unchanged row as one it never restores, so the flag must
+match the record's own stored labels:
+
+- the before and after labels are judged equal when both are unlabeled
+  (`null` and the empty string spell the same state, so swapping them is not
+  a change), and otherwise compared as the exact original strings — case,
+  leading or trailing whitespace, Chinese text and path separators keep
+  their meaning, and a real class literally named `unlabeled` is a label and
+  never equals the unlabeled state;
+- differing before/after labels therefore require `changed: true`, and
+  identical labels require `changed: false`.
+
+The decision uses only the labels stored in the history record; it never
+substitutes the sample's current label, so a row that recorded `cat` → `dog`
+but is flagged unchanged is corruption even if the sample has since been
+changed back to `cat`. Such a hidden change would otherwise leave the sample
+at `dog` while the batch is recorded as undone, and a false change on
+identical labels would count and "restore" a sample the batch never touched.
+The whole undo is refused: the error names the batch number, the sample's
+full SHA-256 digest, the record's 1-based position inside the target batch
+and the exact contradiction (false flag with differing labels, or true flag
+with identical labels), with nothing on standard output and no traceback.
+Every record in the batch is examined, so a restorable record at the front
+is never partially restored first, and nothing is auto-corrected, dropped or
+rewritten — no sample label or revision changes, neither the registration
+list nor the batch history is rewritten, and no undo marker or undo time is
+added. As with the other integrity damage, it is reported even when the
+batch is already marked undone rather than as `already-undone`, is distinct
+from the later-modification conflict and an unknown batch number, and only
+the target batch is examined — the same contradiction in another batch does
+not stop a valid batch from undoing normally and restoring exactly the
+samples it actually changed.
+
 The same sample participating in two *different* batches over time is
 normal and stays legal; only a repeat inside the one target batch is an
 error. Damage in a different batch does not matter: only the target batch's

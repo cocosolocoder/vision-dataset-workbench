@@ -14,11 +14,14 @@ from vision_workbench.batches import (
     BatchResolution,
     apply_resolutions,
     build_history_entry,
+    describe_history_change_problem,
     describe_history_revision_problem,
+    history_labels_equal,
     no_changes_result,
     normalize_label,
     reject_unknown_samples,
     replay_result,
+    require_intact_history_changes,
     require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
@@ -386,6 +389,161 @@ class HistoryRecordUniquenessValidationTest(unittest.TestCase):
                 )
             )
         self.assertIn("'renumber-9'", str(ctx.exception))
+
+
+class HistoryChangeFlagValidationTest(unittest.TestCase):
+    def test_null_and_empty_string_are_the_same_unlabeled_label(self) -> None:
+        self.assertTrue(history_labels_equal(None, None))
+        self.assertTrue(history_labels_equal(None, ""))
+        self.assertTrue(history_labels_equal("", None))
+        self.assertTrue(history_labels_equal("", ""))
+
+    def test_everything_else_compares_as_the_exact_string(self) -> None:
+        self.assertTrue(history_labels_equal("cat", "cat"))
+        self.assertFalse(history_labels_equal("cat", "Cat"))
+        self.assertFalse(history_labels_equal("cat", "cat "))
+        self.assertFalse(history_labels_equal(" cat", "cat"))
+        self.assertFalse(history_labels_equal("a/b", "a\\b"))
+        self.assertTrue(history_labels_equal("猫", "猫"))
+        self.assertFalse(history_labels_equal("猫", "狗"))
+        # A literal class named "unlabeled" is not the unlabeled state.
+        self.assertFalse(history_labels_equal("unlabeled", None))
+        self.assertFalse(history_labels_equal("unlabeled", ""))
+
+    def row(self, *, old, new, changed) -> dict:
+        return {"sha256": "d1", "old": old, "new": new, "changed": changed}
+
+    def test_consistent_rows_have_no_problem(self) -> None:
+        self.assertIsNone(
+            describe_history_change_problem(self.row(old="cat", new="dog", changed=True))
+        )
+        self.assertIsNone(
+            describe_history_change_problem(self.row(old="cat", new="cat", changed=False))
+        )
+        # null and "" swapped is not a change, either way around.
+        self.assertIsNone(
+            describe_history_change_problem(self.row(old=None, new="", changed=False))
+        )
+        self.assertIsNone(
+            describe_history_change_problem(self.row(old="", new=None, changed=False))
+        )
+
+    def test_hidden_real_change_is_reported_with_both_labels(self) -> None:
+        # cat -> dog but flagged unchanged: undo would leave "dog" behind.
+        problem = describe_history_change_problem(
+            self.row(old="cat", new="dog", changed=False)
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("'changed' is false", problem)
+        self.assertIn("'cat'", problem)
+        self.assertIn("'dog'", problem)
+
+    def test_false_change_on_equal_labels_is_reported(self) -> None:
+        problem = describe_history_change_problem(
+            self.row(old="cat", new="cat", changed=True)
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("'changed' is true", problem)
+        self.assertIn("'cat'", problem)
+
+    def test_unchanged_unlabeled_spelling_mismatch_is_not_a_change(self) -> None:
+        # null/"" are the same state, so changed=true would overstate it.
+        problem = describe_history_change_problem(
+            self.row(old=None, new="", changed=True)
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("identical", problem)
+
+    def test_literal_unlabeled_versus_null_is_a_real_change(self) -> None:
+        problem = describe_history_change_problem(
+            self.row(old="unlabeled", new=None, changed=False)
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("differ", problem)
+        self.assertIsNone(
+            describe_history_change_problem(
+                self.row(old="unlabeled", new=None, changed=True)
+            )
+        )
+
+    def test_case_whitespace_separator_differences_are_real_changes(self) -> None:
+        for old, new in (("cat", "Cat"), ("cat", "cat "), ("a/b", "a\\b")):
+            with self.subTest(old=old, new=new):
+                self.assertIsNotNone(
+                    describe_history_change_problem(
+                        self.row(old=old, new=new, changed=False)
+                    )
+                )
+
+    def entry(self, records: list[dict], *, number: str = "b1") -> dict:
+        return {"batch": number, "records": records}
+
+    def test_require_passes_for_consistent_batch(self) -> None:
+        require_intact_history_changes(
+            self.entry(
+                [
+                    {"sha256": "d1", "old": "cat", "new": "dog",
+                     "changed": True, "rev": 1},
+                    {"sha256": "d2", "old": None, "new": "",
+                     "changed": False, "rev": 0},
+                ]
+            )
+        )
+
+    def test_require_empty_record_list_passes(self) -> None:
+        require_intact_history_changes(self.entry([]))
+
+    def test_require_names_batch_digest_position_and_reason(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_changes(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d2", "old": "cat", "new": "dog",
+                         "changed": False, "rev": 1},
+                    ],
+                    number="renumber-7",
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'renumber-7'", message)
+        self.assertIn("d2", message)
+        self.assertIn("record #2", message)
+        self.assertIn("'changed' is false", message)
+
+    def test_require_false_change_names_its_position(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_changes(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "cat",
+                         "changed": True, "rev": 0},
+                    ]
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("'changed' is true", message)
+
+    def test_front_rows_never_mask_a_later_contradiction(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_changes(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d2", "old": "dog", "new": "fish",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d3", "old": "fish", "new": "guppy",
+                         "changed": False, "rev": 1},
+                    ]
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("d3", message)
+        self.assertIn("record #3", message)
 
 
 if __name__ == "__main__":

@@ -391,6 +391,92 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
             )
 
 
+def history_labels_equal(old: Any, new: Any) -> bool:
+    """Whether two stored history labels describe the same category.
+
+    The decision uses the labels saved in the history record itself, never
+    a sample's current label: ``null`` and the empty string both mean
+    unlabeled and are therefore equal, while every other value is compared
+    as the exact original string — case, surrounding whitespace, Chinese
+    text and path separators all keep their meaning, and a real class
+    literally named ``unlabeled`` never equals unlabeled.
+    """
+    return normalize_label(old) == normalize_label(new)
+
+
+def describe_history_change_problem(record: Mapping[str, Any]) -> str | None:
+    """Describe why a history record's ``changed`` flag contradicts old/new.
+
+    The flag must agree with the before/after labels saved on that same
+    record: differing labels require ``changed: true`` and equal labels
+    require ``changed: false``.  Returns ``None`` when the flag is
+    consistent.  The stored labels are validated upstream as strings or
+    ``None`` and the flag as a boolean, so no type guessing happens here.
+    """
+    actually_changed = not history_labels_equal(record["old"], record["new"])
+    old_label = normalize_label(record["old"])
+    new_label = normalize_label(record["new"])
+    if actually_changed and not record["changed"]:
+        return (
+            f"'changed' is false but the before/after labels differ: "
+            f"{render_label(old_label)!r} -> {render_label(new_label)!r}"
+        )
+    if not actually_changed and record["changed"]:
+        return (
+            f"'changed' is true but the before/after labels are identical: "
+            f"{render_label(old_label)!r}"
+        )
+    return None
+
+
+def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose ``changed`` flags belie old/new labels.
+
+    Undo restores a sample based on what the history row says the batch
+    did: a row marked changed is restored from ``new`` back to ``old`` and
+    counted, while a row marked unchanged is never restored.  So the flag
+    must match the before/after labels saved on that row — judging from the
+    record's own stored labels rather than any sample's current label:
+
+    * differing old/new (``null`` and ``""`` being the same unlabeled
+      spelling) require ``changed: true``;
+    * identical old/new require ``changed: false``.
+
+    A row that claims a change with identical labels would make undo count
+    and restore a sample the batch never touched; a row that hides a real
+    change would leave the sample at its post-batch label while the batch
+    is recorded undone.  Both are batch-history corruption: the error names
+    the batch number, the sample's full SHA-256 digest and the record's
+    1-based position inside the target batch, together with the exact
+    contradiction, and nothing is repaired.
+
+    The whole record list is scanned in order, so a restorable row at the
+    front can never mask a contradiction further back.
+
+    Callers must run this before any success-shaped short-circuit (such as
+    an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        problem = describe_history_change_problem(record)
+        if problem is not None:
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, "
+                f"sample {record.get('sha256')}, record #{position}: {problem}"
+            )
+
+
 def empty_history() -> dict[str, Any]:
     return {"schema_version": BATCH_SCHEMA_VERSION, "batches": []}
 
