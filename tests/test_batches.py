@@ -353,6 +353,134 @@ class BatchUndoTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "fish")
 
 
+class BatchUndoUnlabeledSpellingTest(StoreHarness):
+    """Undo treats the two saved unlabeled spellings (null and "") as equal."""
+
+    def _history_on_disk(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def _write_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _respell_labels(self, number: str, key: str) -> None:
+        """Rewrite one batch's saved null old/new labels as "" (or back)."""
+        history = self._history_on_disk()
+        entry = next(e for e in history["batches"] if e["batch"] == number)
+        for record in entry["records"]:
+            if record[key] is None:
+                record[key] = ""
+            elif record[key] == "":
+                record[key] = None
+        self._write_history(history)
+
+    def _manifest_revs(self) -> dict[str, int]:
+        manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        return {item["sha256"]: item.get("rev", 0) for item in manifest["items"]}
+
+    def test_empty_string_new_matches_null_current_and_restores(self) -> None:
+        # The batch cleared d1 (history explicitly saves new: "") and
+        # relabeled d2; d3 was a no-op record.  d1 is currently registered
+        # as null — the same unlabeled state, spelled differently.
+        d1 = self.add_sample("猫")
+        d2 = self.add_sample("狗")
+        d3 = self.add_sample("鱼")
+        self.submit("b1", (d1, "猫", None), (d2, "狗", "犬"), (d3, "鱼", "鱼"))
+        self._respell_labels("b1", "new")
+        revs_before = self._manifest_revs()
+
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 2)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "猫")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "狗")
+        # The no-op record was not restored and its revision is untouched.
+        self.assertEqual(self.store.lookup_label(d3)["label"], "鱼")
+        revs_after = self._manifest_revs()
+        self.assertEqual(revs_after[d3], revs_before[d3])
+        # Category queries reflect the restored labels.
+        self.assertEqual(self.store.find_by_label("猫")["count"], 1)
+        self.assertEqual(self.store.find_by_label("狗")["count"], 1)
+        self.assertEqual(self.store.find_by_label("犬")["count"], 0)
+        # The batch is still listed, now marked undone.
+        history = self.store.history()
+        self.assertEqual(len(history), 1)
+        self.assertTrue(history[0]["undone"])
+
+    def test_null_new_matches_empty_string_current(self) -> None:
+        # Reverse direction: history saved null, the manifest stores "".
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", None))
+        # Respell the manifest's current unlabeled label as "".
+        manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        for item in manifest["items"]:
+            if item["sha256"] == d:
+                item["label"] = ""
+        self.store.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+
+    def test_empty_string_old_restores_to_unlabeled(self) -> None:
+        d = self.add_sample(None)
+        self.submit("b1", (d, None, "猫"))
+        self._respell_labels("b1", "old")
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertIsNone(self.store.lookup_label(d)["label"])
+        # The restored label is stored in the canonical null spelling.
+        self.assertIsNone(self.manifest_labels()[d])
+
+    def test_changed_sample_with_other_category_still_rejected(self) -> None:
+        d1 = self.add_sample("猫")
+        d2 = self.add_sample("狗")
+        self.submit("b1", (d1, "猫", None), (d2, "狗", "犬"))
+        self._respell_labels("b1", "new")
+        self.submit("b2", (d2, "犬", "鸟"))
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("modified after", str(ctx.exception))
+        # Everything is left exactly as it was.
+        self.assertIsNone(self.store.lookup_label(d1)["label"])
+        self.assertEqual(self.store.lookup_label(d2)["label"], "鸟")
+        self.assertFalse(self.store.history()[0]["undone"])
+
+    def test_modified_then_back_to_unlabeled_still_rejected(self) -> None:
+        d = self.add_sample("猫")
+        self.submit("b1", (d, "猫", None))
+        self._respell_labels("b1", "new")
+        # Later modifications bump the revision even though the label is
+        # unlabeled again, matching the saved "".
+        self.submit("b2", (d, None, "鸟"))
+        self.submit("b3", (d, "鸟", None))
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("modified after", str(ctx.exception))
+        self.assertIsNone(self.store.lookup_label(d)["label"])
+        self.assertFalse(self.store.history()[0]["undone"])
+
+    def test_literal_unlabeled_class_does_not_match_empty_string_new(self) -> None:
+        # A real class literally named "unlabeled" is not the unlabeled
+        # state: a record whose saved new is "" must not match it.
+        d = self.add_sample("猫")
+        self.submit("b1", (d, "猫", "unlabeled"))
+        history = self._history_on_disk()
+        history["batches"][0]["records"][0]["new"] = ""
+        self._write_history(history)
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("modified after", str(ctx.exception))
+        self.assertEqual(self.store.lookup_label(d)["label"], "unlabeled")
+        self.assertFalse(self.store.history()[0]["undone"])
+
+
 class BatchUndoCorruptHistoryTest(StoreHarness):
     def _history_on_disk(self) -> dict:
         return json.loads(self.store.batches_path.read_text(encoding="utf-8"))

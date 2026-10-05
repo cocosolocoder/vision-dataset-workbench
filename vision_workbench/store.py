@@ -710,8 +710,11 @@ class DatasetStore:
 
         Only samples the batch actually changed are checked: each must have
         the same label revision it had right after the batch (no later
-        modification, even one that restored the same label).  Repeated
-        undos are idempotent and do not add history.
+        modification, even one that restored the same label) and must still
+        carry the after-label saved in history — where ``null`` and ``""``
+        are the same unlabeled spelling, so a record that explicitly saved
+        either one matches a sample currently registered under the other.
+        Repeated undos are idempotent and do not add history.
 
         Integrity comes before either verdict: the target batch must list
         every sample exactly once, carry a sound pinned revision on each
@@ -762,8 +765,14 @@ class DatasetStore:
                 current = normalize_label(item.get("label"))
                 # record["rev"] is now known to be a genuine non-negative
                 # integer, so a boolean/decimal/string can never compare
-                # equal to the sample's current revision.
-                if item_revision(item) != record["rev"] or current != record["new"]:
+                # equal to the sample's current revision.  The after-label
+                # saved in history is normalized before comparing: ``null``
+                # and ``""`` are the same unlabeled spelling, so a record
+                # that explicitly saved "" still matches a sample currently
+                # registered as null (and vice versa).
+                if item_revision(item) != record["rev"] or current != normalize_label(
+                    record["new"]
+                ):
                     raise BatchError(
                         f"cannot undo batch {number!r}: sample {record['sha256']} "
                         "was modified after the batch"
@@ -774,7 +783,10 @@ class DatasetStore:
                 if not record["changed"]:
                     continue
                 item = items[record["sha256"]]
-                item["label"] = record["old"]
+                # Restore the before-label saved in history, normalized so
+                # an explicitly saved "" is stored as the canonical null
+                # spelling of unlabeled, like every other label write.
+                item["label"] = normalize_label(record["old"])
                 item["rev"] = item_revision(item) + 1
                 restored += 1
 
