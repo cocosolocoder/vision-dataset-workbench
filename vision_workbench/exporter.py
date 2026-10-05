@@ -31,8 +31,17 @@ instead of the recorded source paths: every regular file under the
 directory (no extension filter; symlinks and other non-regular entries
 are skipped and symlinked directories are never descended) is read in
 full and identified by content digest, and each exported sample is
-matched to a file whose full SHA-256 matches the plan.  The selected
-copy is pinned through the open (lstat without symlink follow,
+matched to a file whose full SHA-256 matches the plan.  Every one of
+those reads is pinned with the shared inspect / open-no-follow /
+fstat-prove rule relative to the pinned parent directory descriptor,
+and the open also carries ``O_NONBLOCK``: a confirmed regular file
+swapped for a named pipe before the open — even one with no writer, and
+even one whose writer would supply bytes matching a planned sample —
+fails the export immediately instead of blocking the lookup or
+contributing pipe bytes, and another regular file renamed onto the name
+in that gap — even one with identical content, size and modification
+time — is rejected as a replacement.  The selected copy is then pinned
+again through the package open (lstat without symlink follow,
 ``O_NOFOLLOW`` and an fstat of the descriptor), so the bytes read come
 from the exact regular file confirmed at lookup time; a replacement
 landing after the lookup — another regular file, even with identical
@@ -148,8 +157,12 @@ def export_split(
     tree instead of the plan's recorded source paths: the directory is
     walked (regular files only, no extension filter, never through
     symlinks), every regular file is hashed in full, and each exported
-    sample is matched to a file with the same full SHA-256 digest.  The
-    plan still decides identities, labels, set assignments and package
+    sample is matched to a file with the same full SHA-256 digest.  Each
+    lookup read is pinned to the exact regular file confirmed for it
+    (inspect, ``O_NOFOLLOW`` plus ``O_NONBLOCK`` open, fstat proof), so a
+    file swapped for a named pipe or another regular file before its open
+    fails the export instead of being waited on or hashed.  The plan
+    still decides identities, labels, set assignments and package
     file extensions; the lookup is used for this export only.
 
     Without ``source_dir`` each sample is read from its recorded source
@@ -804,55 +817,80 @@ def _hash_regular_file_at(
 ) -> tuple[str, int, int]:
     """Read one directory-relative file in full, pinned through the open.
 
-    The name is inspected with ``fstatat`` relative to the pinned
-    directory descriptor and opened with ``openat`` plus
-    ``O_NOFOLLOW``, so a symlink swapped in after the inspection cannot
-    redirect the read (the open fails with ``ELOOP``) and the bytes can
-    only come from an entry reached through the confirmed directory.
-    The recorded identity is the ``fstatat`` result; the copy later
-    independently re-pins the exact inode (including the fstat proof)
-    before its bytes are streamed into the package, so this lookup
-    deliberately does not prove the descriptor itself.  Any failure
-    raises with the path and reason.  Returns ``(digest, device,
-    inode)``.
+    The regular-file confirmation the walk just made is enforced on the
+    object actually read, with the same inspect / open-no-follow /
+    fstat-prove rule every other entry point uses: the name is inspected
+    with ``fstatat`` relative to the pinned directory descriptor, opened
+    with ``openat`` plus ``O_NOFOLLOW`` and ``O_NONBLOCK``, and the
+    descriptor is proved by ``fstat`` to be that exact regular file
+    before any byte is read.  A swap landing between the confirmation
+    and the open is therefore rejected instead of read: a named pipe —
+    even one with no writer, and even one whose writer would supply
+    bytes matching a planned sample — is opened without blocking and
+    refused before its data is waited on or hashed, another regular file
+    renamed onto the name — even one with identical content, size and
+    modification time — fails the identity proof, and a symlink makes
+    the open fail outright.  Any failure raises with the path and
+    reason.  Returns ``(digest, device, inode)`` of the confirmed file.
 
-    The confirm/open rule and the chunked hashing come from
+    The confirm/open/prove rule and the chunked hashing come from
     :mod:`confirmed`, shared with import; only the export wording is
     assembled here.
     """
     try:
-        before = confirmed.inspect_regular(name, dir_fd=directory_fd)
-        # The lookup deliberately keeps its historical plain blocking
-        # open and does not prove the descriptor itself: the copy later
-        # re-pins the exact inode independently, and the source-directory
-        # matching rules must stay unchanged.
-        descriptor = confirmed.open_without_follow(
-            name, dir_fd=directory_fd, nonblocking=False
-        )
+        opened_file = confirmed.confirm_and_open_regular(name, dir_fd=directory_fd)
     except confirmed.ConfirmationError as failure:
         raise _scan_file_error(failure, path) from failure
     try:
-        digest = confirmed.hash_descriptor(descriptor)
+        digest = confirmed.hash_descriptor(opened_file.descriptor)
     except OSError as error:
         raise ExportError(f"cannot read source file {path}: {error}") from error
-    return digest, before.st_dev, before.st_ino
+    confirmed_status = opened_file.confirmed
+    return digest, confirmed_status.st_dev, confirmed_status.st_ino
 
 
 def _scan_file_error(
     failure: confirmed.ConfirmationError, path: Path
 ) -> ExportError:
-    """Translate a shared confirmation failure into the scan's wording."""
+    """Translate a shared confirmation failure into the scan's wording.
+
+    Every message names the file that could not be read and the concrete
+    reason.  A name the walk typed as a regular file that is a symlink
+    or another non-regular object at the re-inspection, or whose opened
+    descriptor proves to be a different object than the one confirmed —
+    a named pipe caught by the non-blocking open, or another regular
+    file renamed onto the name — is reported as a source that changed
+    under the lookup, never as a missing content match.
+    """
     if failure.stage is confirmed.ConfirmStage.INSPECT:
         if failure.reason is confirmed.ConfirmReason.ACCESS_ERROR:
             return ExportError(
                 f"cannot inspect entry {path}: {failure.error}"
             )
-        # A symlink or any other non-regular object at a name the walk
-        # had just typed as a regular file: the entry changed.
+        if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
+            return ExportError(
+                f"cannot read source file {path}: path is now a symlink"
+            )
+        # Any other non-regular object at a name the walk had just typed
+        # as a regular file: the entry changed.
         return ExportError(f"cannot read source file {path}: not a regular file")
     if failure.reason is confirmed.ConfirmReason.NOW_SYMLINK:
         return ExportError(
             f"cannot read source file {path}: path is now a symlink"
+        )
+    if failure.reason is confirmed.ConfirmReason.WRONG_IDENTITY:
+        # The opened object is not the regular file just confirmed: the
+        # entry was replaced in the confirm-to-open gap.  Name what sits
+        # there now — a named pipe (or other non-regular object) caught
+        # by the non-blocking open, or a different regular file.
+        kind = _confirmed_object_kind(failure.status)
+        if kind == "regular file":
+            detail = "now names a different regular file than the one confirmed"
+        else:
+            detail = f"is now a {kind}, not the confirmed regular file"
+        return ExportError(
+            f"cannot read source file {path}: source was replaced before "
+            f"it was read: {detail}"
         )
     return ExportError(f"cannot read source file {path}: {failure.error}")
 

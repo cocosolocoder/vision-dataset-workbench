@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import zipfile
 from contextlib import contextmanager
@@ -479,11 +480,24 @@ class ResolvedCopySwapTest(SourceDirHarness):
         # export succeeds using the originally confirmed file.
         replacement = self.moved / "swap.jpg"
         replacement.write_bytes(b"abc")
+        real_scan = exporter_mod._scan_source_directory
         real_fstat = os.fstat
+        state = {"scan_done": False}
+
+        def scan_wrapper(root):
+            resolver = real_scan(root)
+            state["scan_done"] = True
+            return resolver
 
         def racing_fstat(descriptor, *args, **kwargs):
             result = real_fstat(descriptor, *args, **kwargs)
-            if stat.S_ISREG(result.st_mode) and (result.st_dev, result.st_ino) == (
+            # Only the copy phase is raced here: the lookup pins its own
+            # reads now, so the swap must land inside the copy's open,
+            # after the selected file's descriptor is already taken.
+            if state["scan_done"] and stat.S_ISREG(result.st_mode) and (
+                result.st_dev,
+                result.st_ino,
+            ) == (
                 os.lstat(self.selected).st_dev,
                 os.lstat(self.selected).st_ino,
             ):
@@ -491,7 +505,9 @@ class ResolvedCopySwapTest(SourceDirHarness):
                     os.replace(replacement, self.selected)
             return result
 
-        with patch.object(exporter_mod.os, "fstat", side_effect=racing_fstat):
+        with patch.object(
+            exporter_mod, "_scan_source_directory", side_effect=scan_wrapper
+        ), patch.object(exporter_mod.os, "fstat", side_effect=racing_fstat):
             result, target = self.export(source_dir=self.moved)
         self.assertEqual(result["exported"], 1)
         with zipfile.ZipFile(target) as archive:
@@ -505,6 +521,309 @@ class ResolvedCopySwapTest(SourceDirHarness):
         result, target = self.export(target=via_dir, source_dir=self.moved)
         self.assertEqual(result["exported"], 1)
         self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
+
+
+class ScanFileSwapTest(SourceDirHarness):
+    """A regular file swapped during the lookup itself fails the export.
+
+    The lookup confirms every regular file it reads, and the confirmation
+    must constrain the object actually opened: a named pipe or another
+    regular file swapped into the confirm-to-open gap — for any file in
+    the tree, whether the plan needs it or not — fails the export naming
+    the changed path, instead of blocking on the pipe, hashing the
+    replacement's bytes, or silently falling back to another copy.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.digest = self.add_sample("cat", b"abc")
+        self.create_plan()
+        self.moved = self.root.parent / "moved"
+        self.moved.mkdir()
+        self.selected = self.moved / "a.jpg"
+        self.selected.write_bytes(b"abc")
+        self.target = self.root.parent / "out.zip"
+
+    @contextmanager
+    def _swap_during_scan_inspect(self, basename: str, mutate):
+        """Run ``mutate`` between the lookup's inspect and open of a file.
+
+        The hook fires when the scan confirms ``basename`` (a name
+        relative to whatever directory the walk is reading), after the
+        no-follow inspection has typed it as a regular file and before
+        the open that follows.
+        """
+        real_inspect = exporter_mod.confirmed.inspect_regular
+        state = {"fired": False}
+
+        def racing_inspect(path, *args, **kwargs):
+            result = real_inspect(path, *args, **kwargs)
+            if (
+                not state["fired"]
+                and kwargs.get("dir_fd") is not None
+                and os.fspath(path) == basename
+            ):
+                state["fired"] = True
+                mutate()
+            return result
+
+        with patch.object(
+            exporter_mod.confirmed, "inspect_regular", side_effect=racing_inspect
+        ):
+            yield state
+
+    def _assert_failed_cleanly(self, caught: Exception, changed: Path) -> None:
+        message = str(caught.exception)
+        self.assertIn(str(changed), message)
+        self.assertFalse(self.target.exists())
+        leftovers = [
+            entry.name
+            for entry in self.root.parent.iterdir()
+            if entry.name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_identical_file_swapped_in_gap_fails(self) -> None:
+        # A second same-content copy is present the whole time: it must
+        # not be used as a fallback once the confirmed file changes.
+        (self.moved / "b.jpg").write_bytes(b"abc")
+        original = os.lstat(self.selected)
+        replacement = self.moved / "replacement.jpg"
+        replacement.write_bytes(b"abc")
+        # Same content, size and modification time as the confirmed file.
+        os.utime(
+            replacement,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        def swap() -> None:
+            os.replace(replacement, self.selected)
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        plan_before = (self.store.splits_directory / "baseline.json").read_bytes()
+        with self._swap_during_scan_inspect("a.jpg", swap) as state:
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self.assertTrue(state["fired"])
+        message = str(caught.exception)
+        self.assertIn("replaced", message)
+        self.assertIn("different regular file", message)
+        self._assert_failed_cleanly(caught, self.selected)
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            (self.store.splits_directory / "baseline.json").read_bytes(),
+            plan_before,
+        )
+
+    def test_symlink_swapped_in_gap_fails(self) -> None:
+        holder = self.moved / "holder.jpg"
+        os.link(self.selected, holder)  # same inode, so the content is there
+
+        def swap() -> None:
+            self.selected.unlink()
+            self.selected.symlink_to(holder)
+
+        with self._swap_during_scan_inspect("a.jpg", swap) as state:
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self.assertTrue(state["fired"])
+        self.assertIn("symlink", str(caught.exception))
+        self._assert_failed_cleanly(caught, self.selected)
+
+    def test_unrelated_file_swapped_in_gap_fails(self) -> None:
+        # The changed file is not needed by the plan at all; the export
+        # must still fail naming it, not fall back to the plan's copy.
+        unrelated = self.moved / "z-unrelated.jpg"
+        unrelated.write_bytes(b"junk")
+        replacement = self.moved / "replacement.jpg"
+        replacement.write_bytes(b"other-junk")
+
+        def swap() -> None:
+            os.replace(replacement, unrelated)
+
+        with self._swap_during_scan_inspect("z-unrelated.jpg", swap) as state:
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=self.target, source_dir=self.moved)
+        self.assertTrue(state["fired"])
+        message = str(caught.exception)
+        self.assertIn("replaced", message)
+        self.assertNotIn("no file with matching content", message)
+        self._assert_failed_cleanly(caught, unrelated)
+
+    def test_unrelated_file_swapped_after_all_samples_found_fails(self) -> None:
+        # The plan's only sample is read before the changed file (the
+        # walk is sorted for this test to make that order deterministic):
+        # finding every sample earlier does not excuse the later change.
+        unrelated = self.moved / "z-unrelated.jpg"
+        unrelated.write_bytes(b"junk")
+        replacement = self.moved / "replacement.jpg"
+        replacement.write_bytes(b"other-junk")
+
+        hashed: list[str] = []
+        real_hash = exporter_mod.confirmed.hash_descriptor
+
+        def hash_spy(descriptor, *args, **kwargs):
+            result = real_hash(descriptor, *args, **kwargs)
+            hashed.append(result)
+            return result
+
+        real_scandir = os.scandir
+
+        def sorted_scandir(*args, **kwargs):
+            return sorted(real_scandir(*args, **kwargs), key=lambda entry: entry.name)
+
+        def swap() -> None:
+            os.replace(replacement, unrelated)
+
+        with self._swap_during_scan_inspect("z-unrelated.jpg", swap) as state:
+            with patch.object(
+                exporter_mod.confirmed, "hash_descriptor", side_effect=hash_spy
+            ), patch.object(exporter_mod.os, "scandir", side_effect=sorted_scandir):
+                with self.assertRaises(ExportError) as caught:
+                    self.export(target=self.target, source_dir=self.moved)
+        self.assertTrue(state["fired"])
+        # Every planned sample really had been found before the change.
+        self.assertIn(self.digest, hashed)
+        self._assert_failed_cleanly(caught, unrelated)
+
+
+class ScanFifoSwapMustNotWaitTest(SourceDirHarness):
+    """A named pipe swapped into the lookup's confirm-to-open gap.
+
+    Run in a subprocess like the recorded-source FIFO tests: a
+    regression that opens the swapped pipe with plain blocking semantics
+    would otherwise hang this test process waiting for a writer that
+    never comes; the subprocess timeout turns that hang into an
+    ordinary, fast failure instead.
+    """
+
+    DRIVER = textwrap.dedent(
+        """
+        import os
+        import sys
+        import threading
+        from pathlib import Path
+        from unittest import mock
+
+        from vision_workbench import exporter, confirmed
+
+        workspace = sys.argv[1]
+        plan = sys.argv[2]
+        basename = sys.argv[3]
+        source_dir = sys.argv[4]
+        target = sys.argv[5]
+        mode = sys.argv[6]
+
+        def swap_to_fifo() -> None:
+            victim = Path(source_dir) / basename
+            victim.unlink()
+            os.mkfifo(victim)  # a blocking open would hang here
+            if mode == "writer":
+                # A writer offering exactly the plan sample's bytes: the
+                # pipe must still never be treated as the image source.
+                def writer() -> None:
+                    try:
+                        with open(victim, "wb") as stream:
+                            stream.write(b"abc")
+                    except (BrokenPipeError, OSError):
+                        pass
+
+                threading.Thread(target=writer, daemon=True).start()
+
+        real_inspect = confirmed.inspect_regular
+        state = {"fired": False}
+
+        def racing_inspect(path, *args, **kwargs):
+            result = real_inspect(path, *args, **kwargs)
+            if (
+                not state["fired"]
+                and kwargs.get("dir_fd") is not None
+                and os.fspath(path) == basename
+            ):
+                state["fired"] = True
+                swap_to_fifo()
+            return result
+
+        with mock.patch.object(
+            exporter.confirmed, "inspect_regular", side_effect=racing_inspect
+        ):
+            sys.argv = [
+                "vision-workbench",
+                "export",
+                workspace,
+                plan,
+                target,
+                "--source-dir",
+                source_dir,
+            ]
+            from vision_workbench.__main__ import main
+
+            raise SystemExit(main())
+        """
+    )
+
+    def _run_driver(self, mode: str):
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        moved = self.root.parent / "moved"
+        moved.mkdir()
+        swapped = moved / "a.jpg"
+        swapped.write_bytes(b"abc")
+        target = self.root.parent / "out.zip"
+        driver = self.root.parent / "driver.py"
+        driver.write_text(self.DRIVER, encoding="utf-8")
+        env = dict(os.environ)
+        repo = str(REPO_ROOT)
+        env["PYTHONPATH"] = (
+            repo + os.pathsep + env["PYTHONPATH"]
+            if env.get("PYTHONPATH")
+            else repo
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(driver),
+                str(self.root),
+                "baseline",
+                "a.jpg",
+                str(moved),
+                str(target),
+                mode,
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        return proc, swapped, target
+
+    def _assert_failed_cleanly(self, proc, swapped: Path, target: Path) -> None:
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("error:", proc.stderr)
+        self.assertIn(str(swapped), proc.stderr)
+        self.assertIn("named pipe", proc.stderr)
+        self.assertIn("replaced", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(target.exists())
+        leftovers = [
+            entry.name
+            for entry in self.root.parent.iterdir()
+            if entry.name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+        # The pipe the swap put there is never consumed or removed.
+        self.assertTrue(stat.S_ISFIFO(os.lstat(swapped).st_mode))
+
+    def test_fifo_swap_between_inspect_and_open_fails_without_waiting(self) -> None:
+        proc, swapped, target = self._run_driver("no-writer")
+        self._assert_failed_cleanly(proc, swapped, target)
+
+    def test_fifo_with_matching_writer_is_still_rejected(self) -> None:
+        proc, swapped, target = self._run_driver("writer")
+        self._assert_failed_cleanly(proc, swapped, target)
 
 
 class DirectoryReplacedBySymlinkTest(SourceDirHarness):
