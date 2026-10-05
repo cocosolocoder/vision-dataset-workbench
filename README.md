@@ -178,18 +178,32 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   to a file whose full SHA-256 matches the plan — a same-named file with
   different content does not qualify. When several files share content,
   the one whose `/`-separated relative path sorts first by Unicode code
-  point is used. The selected copy is pinned to the actual read: the path
-  is lstat()ed without following symlinks, opened without following a
-  final symlink, and the opened descriptor is fstat()ed and proved to be
-  the exact regular file (same device and inode) captured during the
-  lookup — the check covers the object that is really read, not just one
-  look at the path before it opens. If the selected path is replaced
-  after the lookup but before or while it is opened by another regular
-  file — even one with identical content, size and modification time —
-  or by a symlink, even one pointing at the original file, the whole
-  export fails with the sample digest, the selected source path and the
-  reason; no other same-content copy is substituted and the plan's
-  recorded source path is not used as a fallback.
+  point is used. That pinning applies to *every* file read while the
+  tree is looked up, not just to the copies that end up in the package:
+  each entry is lstat()ed without following symlinks, opened without
+  following a final symlink and without blocking, and the opened
+  descriptor is fstat()ed and proved to be the exact regular file
+  (same device and inode) that was confirmed a moment earlier, so the
+  bytes hashed during the lookup come from the object the walk typed.
+  If a confirmed entry is replaced in that gap — by another regular
+  file, even one with identical content, size and modification time,
+  by a symbolic link, or by a named pipe, even one with no writer or
+  one whose writer would supply the planned bytes — the whole export
+  fails immediately, naming that path and what it became; it never
+  waits for a writer and never hashes or matches the new occupant's
+  bytes. The selected copy is then pinned again to the actual read:
+  the path is lstat()ed without following symlinks, opened without
+  following a final symlink, and the opened descriptor is fstat()ed
+  and proved to be the exact regular file (same device and inode)
+  captured during the lookup — the check covers the object that is
+  really read, not just one look at the path before it opens. If the
+  selected path is replaced after the lookup but before or while it
+  is opened by another regular file — even one with identical
+  content, size and modification time — or by a symlink, even one
+  pointing at the original file, the whole export fails with the
+  sample digest, the selected source path and the reason; no other
+  same-content copy is substituted and the plan's recorded source
+  path is not used as a fallback.
 
   The directory walk is itself pinned to directory descriptors rather
   than path strings: each directory is entered with `openat`
@@ -213,7 +227,9 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
 
   Files unrelated to the
   plan are read (an unreadable file anywhere fails the export) but never
-  included. The plan still decides
+  included, and a confirmed entry swapped while the lookup reads it —
+  even one unrelated to the plan, or replaced only after every planned
+  sample was already found — fails the export just the same. The plan still decides
   sample identities, labels, set assignments and package file extensions;
   the lookup is used for this export only and is never written back. A
   missing or non-directory source, an unreadable directory or file, or a

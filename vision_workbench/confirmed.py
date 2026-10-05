@@ -163,31 +163,23 @@ def open_without_follow(
     path: str | os.PathLike[str],
     *,
     dir_fd: int | None = None,
-    nonblocking: bool = True,
 ) -> int:
     """Open ``path`` read-only with ``O_NOFOLLOW``, never following a link.
 
-    With ``nonblocking`` (the default) the open also carries
-    ``O_NONBLOCK``: it never waits for another process, so a named pipe
-    (or other carrier) swapped onto the path in the gap after the
-    inspection is opened immediately even with no writer present,
-    rather than blocking before the descriptor can be proved.  Callers
-    that pair this open with :func:`prove_opened_regular` get an
-    ordinary blocking descriptor back once the open is proved regular.
-    A final symlink swapped in after the inspection makes the open fail
-    with ``ELOOP``, which is reported as
+    The open always carries ``O_NONBLOCK``: it never waits for another
+    process, so a named pipe (or other carrier) swapped onto the path in
+    the gap after the inspection is opened immediately even with no
+    writer present, rather than blocking before the descriptor can be
+    proved.  Callers must pair this open with
+    :func:`prove_opened_regular`, which rejects the non-regular object
+    before any byte is read and then hands back an ordinary blocking
+    descriptor.  A final symlink swapped in after the inspection makes
+    the open fail with ``ELOOP``, which is reported as
     :class:`ConfirmReason.NOW_SYMLINK` rather than a generic access
     error; every other open failure carries the original
     :class:`OSError`.  The descriptor belongs to the caller on success.
-
-    ``nonblocking=False`` restores the plain blocking
-    ``O_RDONLY|O_NOFOLLOW`` open for callers that deliberately keep the
-    historical lookup-open semantics (the source-directory scan); such
-    callers must not rely on the descriptor being proved here.
     """
-    flags = os.O_RDONLY | _O_NOFOLLOW
-    if nonblocking:
-        flags |= _O_NONBLOCK
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
     try:
         return os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:

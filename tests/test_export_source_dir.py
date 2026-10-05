@@ -476,23 +476,41 @@ class ResolvedCopySwapTest(SourceDirHarness):
     def test_swap_after_open_still_reads_confirmed_inode(self) -> None:
         # A replacement landing after the descriptor is open cannot change
         # what is read: the descriptor pins the confirmed inode, so the
-        # export succeeds using the originally confirmed file.
+        # export succeeds using the originally confirmed file.  The lookup
+        # itself proves its descriptors with fstat as well, so the swap is
+        # gated until the scan has finished and fires on the copy's prove.
         replacement = self.moved / "swap.jpg"
         replacement.write_bytes(b"abc")
         real_fstat = os.fstat
+        real_scan = exporter_mod._scan_source_directory
+        state = {"scan_done": False, "fired": False}
+
+        def scan_wrapper(root):
+            resolver = real_scan(root)
+            state["scan_done"] = True
+            return resolver
 
         def racing_fstat(descriptor, *args, **kwargs):
             result = real_fstat(descriptor, *args, **kwargs)
-            if stat.S_ISREG(result.st_mode) and (result.st_dev, result.st_ino) == (
-                os.lstat(self.selected).st_dev,
-                os.lstat(self.selected).st_ino,
+            if (
+                state["scan_done"]
+                and not state["fired"]
+                and stat.S_ISREG(result.st_mode)
+                and (result.st_dev, result.st_ino) == (
+                    os.lstat(self.selected).st_dev,
+                    os.lstat(self.selected).st_ino,
+                )
             ):
-                if replacement.exists():
-                    os.replace(replacement, self.selected)
+                state["fired"] = True
+                os.replace(replacement, self.selected)
             return result
 
-        with patch.object(exporter_mod.os, "fstat", side_effect=racing_fstat):
+        with (
+            patch.object(exporter_mod, "_scan_source_directory", side_effect=scan_wrapper),
+            patch.object(exporter_mod.os, "fstat", side_effect=racing_fstat),
+        ):
             result, target = self.export(source_dir=self.moved)
+        self.assertTrue(state["fired"])
         self.assertEqual(result["exported"], 1)
         with zipfile.ZipFile(target) as archive:
             names = [n for n in archive.namelist() if n.endswith(".jpg")]
