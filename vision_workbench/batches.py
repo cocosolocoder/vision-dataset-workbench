@@ -391,6 +391,68 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
             )
 
 
+def require_intact_history_changed_flags(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose ``changed`` flags contradict old/new labels.
+
+    A history record's ``changed`` flag must match the before/after labels
+    stored on that very record: ``null`` and the empty string both mean
+    unlabeled and differ in no way, while every other pair compares as the
+    exact original strings — case, surrounding whitespace, Chinese text
+    and path separators all keep their literal meaning, and a real class
+    named ``unlabeled`` is never the unlabeled state.  So distinct
+    before/after labels require ``changed: true`` and equal ones require
+    ``changed: false``.
+
+    The decision never consults a sample's *current* label: a contradicting
+    flag is history damage regardless of what the sample is labeled now.
+    Without this refusal a false ``false`` (the sample really went
+    ``cat`` → ``dog``) would leave ``dog`` behind while marking the batch
+    undone, and a false ``true`` (before and after equal) would count a
+    sample that was never modified among the restored samples.
+
+    The whole record list is scanned, so a restorable row at the front can
+    never mask a later contradiction.  On a contradiction the error names
+    the batch number, the sample's full digest, the record's 1-based
+    position in the batch and exactly how the flag contradicts the stored
+    before/after labels; nothing is repaired.
+
+    Callers must run this before any success-shaped short-circuit (such as
+    an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        old = normalize_label(record.get("old"))
+        new = normalize_label(record.get("new"))
+        actually_changed = old != new
+        flagged = record.get("changed")
+        if flagged is not actually_changed:
+            if actually_changed:
+                reason = (
+                    "'changed' is false but the stored before/after labels "
+                    f"differ: {render_label(old)!r} -> {render_label(new)!r}"
+                )
+            else:
+                reason = (
+                    "'changed' is true but the stored before/after labels "
+                    f"are the same label {render_label(old)!r}"
+                )
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, "
+                f"sample {record.get('sha256')}, record #{position}: {reason}"
+            )
+
+
 def empty_history() -> dict[str, Any]:
     return {"schema_version": BATCH_SCHEMA_VERSION, "batches": []}
 

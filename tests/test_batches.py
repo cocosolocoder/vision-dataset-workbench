@@ -386,6 +386,17 @@ class BatchUndoCorruptHistoryTest(StoreHarness):
                 entry["records"].append(dict(entry["records"][index]))
         self._write_history(history)
 
+    def _set_changed_flag(self, number: str, digest: str, changed: object) -> None:
+        """Overwrite one target-batch record's changed flag."""
+        history = self._history_on_disk()
+        for entry in history["batches"]:
+            if entry["batch"] != number:
+                continue
+            for record in entry["records"]:
+                if record["sha256"] == digest:
+                    record["changed"] = changed
+        self._write_history(history)
+
     def test_duplicate_sample_record_rejects_whole_undo_and_restores_nothing(
         self,
     ) -> None:
@@ -662,6 +673,166 @@ class BatchUndoCorruptHistoryTest(StoreHarness):
         self.assertEqual(
             self.store.undo_batch("b1")["status"], "already-undone"
         )
+
+    def test_false_flag_on_a_real_change_rejects_and_restores_nothing(self) -> None:
+        # cat -> dog is a real change, but the history is forged to claim it
+        # did not change.  Undo must refuse: dog stays, the batch is not
+        # marked undone and nothing is rewritten.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_changed_flag("b1", d, False)
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(d, message)
+        self.assertIn("record #1", message)
+        self.assertIn("'changed' is false", message)
+        self.assertNotIn("modified after", message)
+
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        entry = self._history_on_disk()["batches"][0]
+        self.assertFalse(entry["undone"])
+        self.assertIsNone(entry["undone_at"])
+
+    def test_true_flag_on_an_unchanged_record_rejects(self) -> None:
+        # The record never changed a label (dog -> dog) but is forged to
+        # claim it did; an undo trusting it would overstate the restored
+        # count.  The genuinely changed record ahead of it is not restored.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self._set_changed_flag("b1", d2, True)
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn(d2, message)
+        self.assertIn("record #2", message)
+        self.assertIn("'changed' is true", message)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "dog")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+
+    def test_restorable_rows_at_front_never_mask_a_later_flag_contradiction(
+        self,
+    ) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        d3 = self.add_sample("fish")
+        self.submit(
+            "b1",
+            (d1, "cat", "kitten"),
+            (d2, "dog", "puppy"),
+            (d3, "fish", "guppy"),
+        )
+        # Forge the last record to claim it did not change.
+        self._set_changed_flag("b1", d3, False)
+
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn(d3, message)
+        self.assertIn("record #3", message)
+        for digest, label in ((d1, "kitten"), (d2, "puppy"), (d3, "guppy")):
+            self.assertEqual(self.store.lookup_label(digest)["label"], label)
+
+    def test_current_label_is_never_used_to_judge_the_flag(self) -> None:
+        # Even if another batch later moved the sample's current label so
+        # that it equals the stored old label, the contradiction is judged
+        # from the stored before/after labels alone and still reported.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_changed_flag("b1", d, False)
+        # A later batch moves dog -> fish; the later-modification rule must
+        # not mask the structural contradiction either.
+        self.submit("b2", (d, "dog", "fish"))
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("Batch history is corrupted", str(ctx.exception))
+        self.assertIn(d, str(ctx.exception))
+        self.assertEqual(self.store.lookup_label(d)["label"], "fish")
+
+    def test_flag_contradiction_on_already_undone_batch_is_still_rejected(
+        self,
+    ) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self._set_changed_flag("b1", d, False)
+
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn(d, message)
+        self.assertNotIn("already-undone", message)
+        # The existing undone marker is preserved, not rewritten.
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        self.assertTrue(self._history_on_disk()["batches"][0]["undone"])
+
+    def test_flag_contradiction_in_another_batch_does_not_block_undo(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._set_changed_flag("b2", d2, False)
+
+        # Only the target batch's records are examined.
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        with self.assertRaises(BatchError):
+            self.store.undo_batch("b2")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_unknown_batch_stays_unknown_even_with_flag_contradiction(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_changed_flag("b1", d, False)
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("ghost")
+        self.assertIn("unknown batch number", str(ctx.exception))
+
+    def test_null_and_empty_spellings_keep_a_valid_undo(self) -> None:
+        # null/"" interchange is not a modification, so correct flags still
+        # undo normally with an accurate restored count.
+        d1 = self.add_sample(None)
+        d2 = self.add_sample("cat")
+        self.submit("b1", (d1, None, "cat"), (d2, "cat", None))
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 2)
+        self.assertIsNone(self.store.lookup_label(d1)["label"])
+        self.assertEqual(self.store.lookup_label(d2)["label"], "cat")
+
+    def test_truly_unchanged_record_is_not_restored_even_if_later_changed(
+        self,
+    ) -> None:
+        # The pre-existing no-op rule is untouched by the new check: a
+        # genuinely unchanged record restores nothing, and its sample being
+        # changed by a later batch does not block the undo.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self.submit("b2", (d2, "dog", "fish"))
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "fish")
 
 
 class BatchSplitInteractionTest(StoreHarness):
@@ -948,6 +1119,25 @@ class BatchCliTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "dog")
         manifest = json.loads(self.store.manifest_path.read_text("utf-8"))
         self.assertEqual(manifest["items"][0]["rev"], 1)
+
+    def test_cli_contradictory_changed_flag_undo_fails_cleanly(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        history_path = self.store.batches_path
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        # The sample really went cat -> dog; forge the flag to "unchanged".
+        history["batches"][0]["records"][0]["changed"] = False
+        history_path.write_text(json.dumps(history), encoding="utf-8")
+
+        rejected = self.run_cli("undo", str(self.root), "b1")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("Batch history is corrupted", rejected.stderr)
+        self.assertIn("b1", rejected.stderr)
+        self.assertIn(d, rejected.stderr)
+        self.assertIn("record #1", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
 
 
 if __name__ == "__main__":

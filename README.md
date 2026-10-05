@@ -432,6 +432,38 @@ rather than as `already-undone`. The later-modification conflict, an
 unknown batch number and a successful undo are all distinct from this
 refusal.
 
+A batch history is likewise corrupted when a record's **`changed` marker
+contradicts the before/after labels stored on that same record**. Whether a
+record actually changed something is decided solely from its own stored
+`old` and `new`: `null` and the empty string both mean *unlabeled* and their
+interchange is not a modification, while every other pair compares as the
+exact original strings — case, leading or trailing whitespace, Chinese text
+and path separators all keep their literal meaning, and a real class
+literally named `unlabeled` is not the unlabeled state. Distinct before/after
+labels therefore require `changed: true` and identical ones require
+`changed: false`; a sample's current label is never substituted for the
+stored pair to decide what happened at the time. A record really going
+`cat` → `dog` but marked not changed would otherwise leave `dog` in place
+while the batch was recorded as undone, and an unchanged record marked
+changed would count a sample that was never modified among the restored
+samples. When an undo targets such a batch, the command exits non-zero with
+nothing on standard output and no traceback, and reports on standard error
+that the **batch history** is corrupted — naming the batch number, the
+sample's full SHA-256 digest, the record's 1-based position within the batch
+and exactly how the marker contradicts the stored before/after labels. No
+record earlier in the batch is restored first: every sample keeps its label
+and label revision, neither the registration list nor the batch history is
+rewritten, and no undo marker or undo time is added; nothing is
+auto-corrected, dropped or treated as "no change". As with a bad revision or
+a duplicated digest, the check runs before the repeated-undo short-circuit
+(a batch already marked undone still reports the damage rather than
+`already-undone`), is distinct from the later-modification rejection and an
+unknown batch number, examines only the target batch (the same damage in
+another batch never blocks a valid undo), and does not relax any existing
+rule — a genuinely unchanged record still restores nothing even when its
+sample was later changed by another batch, and a successful undo restores
+only the samples the batch actually changed, reporting an accurate count.
+
 The same sample participating in two *different* batches over time is
 normal and stays legal; only a repeat inside the one target batch is an
 error. Damage in a different batch does not matter: only the target batch's

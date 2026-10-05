@@ -25,6 +25,7 @@ from .batches import (
     normalize_label,
     parse_batch_file,
     reject_unknown_samples,
+    require_intact_history_changed_flags,
     require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
@@ -712,11 +713,13 @@ class DatasetStore:
         undos are idempotent and do not add history.
 
         Integrity comes before either verdict: the target batch must list
-        every sample exactly once and carry a sound pinned revision on each
-        record.  A duplicated digest or a bad row rejects the undo even when
-        the batch is already marked undone, so corruption is never hidden
-        behind an ``already-undone`` success or confused with a sample
-        modified after the batch.
+        every sample exactly once, carry a sound pinned revision on each
+        record, and have every record's ``changed`` flag agree with the
+        before/after labels stored on that record.  A duplicated digest, a
+        bad row, or a flag contradicting its stored labels rejects the undo
+        even when the batch is already marked undone, so corruption is
+        never hidden behind an ``already-undone`` success or confused with
+        a sample modified after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -728,13 +731,16 @@ class DatasetStore:
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
 
-            # Validate the target batch's integrity — one row per sample and
-            # sound pinned revisions — before the already-undone
-            # short-circuit and the later-modification checks: a duplicated
-            # or corrupt history record is refusal, not an undo, a no-op or
-            # an unknown batch, and nothing is rewritten.
+            # Validate the target batch's integrity — one row per sample,
+            # sound pinned revisions, and changed flags that match the
+            # stored before/after labels — before the already-undone
+            # short-circuit and the later-modification checks: a duplicated,
+            # corrupt or internally contradictory history record is refusal,
+            # not an undo, a no-op or an unknown batch, and nothing is
+            # rewritten.
             require_intact_history_records(entry)
             require_intact_history_revisions(entry)
+            require_intact_history_changed_flags(entry)
 
             if entry["undone"]:
                 return {"batch": number, "status": "already-undone", "restored": 0}
