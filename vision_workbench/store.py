@@ -26,6 +26,7 @@ from .batches import (
     parse_batch_file,
     reject_unknown_samples,
     require_intact_history_changes,
+    require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
@@ -713,13 +714,14 @@ class DatasetStore:
         undos are idempotent and do not add history.
 
         Integrity comes before either verdict: the target batch must list
-        every sample exactly once, carry a sound pinned revision on each
-        record, and have every record's ``changed`` flag agree with the
-        before/after labels saved on that same record.  A duplicated digest,
-        a bad row or a flag that contradicts its labels rejects the undo
-        even when the batch is already marked undone, so corruption is never
-        hidden behind an ``already-undone`` success or confused with a
-        sample modified after the batch.
+        every sample exactly once, carry the saved before/after labels and
+        a sound pinned revision on each record, and have every record's
+        ``changed`` flag agree with the before/after labels saved on that
+        same record.  A duplicated digest, a missing label field, a bad row
+        or a flag that contradicts its labels rejects the undo even when
+        the batch is already marked undone, so corruption is never hidden
+        behind an ``already-undone`` success or confused with a sample
+        modified after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -732,12 +734,15 @@ class DatasetStore:
                 raise BatchError(f"unknown batch number: {number!r}")
 
             # Validate the target batch's integrity — one row per sample,
-            # sound pinned revisions, and a changed flag that matches the
-            # stored before/after labels — before the already-undone
+            # both before/after label fields present, sound pinned
+            # revisions, and a changed flag that matches the stored
+            # before/after labels — before the already-undone
             # short-circuit and the later-modification checks: a duplicated,
-            # inconsistent or corrupt history record is refusal, not an
-            # undo, a no-op or an unknown batch, and nothing is rewritten.
+            # incomplete, inconsistent or corrupt history record is
+            # refusal, not an undo, a no-op or an unknown batch, and
+            # nothing is rewritten.
             require_intact_history_records(entry)
+            require_intact_history_labels(entry)
             require_intact_history_revisions(entry)
             require_intact_history_changes(entry)
 

@@ -354,6 +354,65 @@ def require_intact_history_records(entry: Mapping[str, Any]) -> None:
         seen[digest] = position
 
 
+def describe_missing_history_labels(record: Mapping[str, Any]) -> str | None:
+    """Describe which of a history record's label fields are absent.
+
+    Every batch-history sample record must carry ``old`` and ``new``
+    explicitly: the before/after labels saved when the batch was applied.
+    Only an absent key is damage — an explicit ``null`` or empty string is
+    a stored unlabeled spelling, never a missing field, and a record with
+    both fields missing is not an unlabeled-to-unlabeled no-op.  Returns
+    ``None`` when both fields are present.
+    """
+    missing = [key for key in ("old", "new") if key not in record]
+    if not missing:
+        return None
+    if len(missing) == 2:
+        return "missing 'old' and 'new' label fields"
+    return f"missing '{missing[0]}' label field"
+
+
+def require_intact_history_labels(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records lack a saved before/after label.
+
+    Undo restores and classifies every sample from the ``old``/``new``
+    labels saved on its history row, so each record of the target batch —
+    changed or not, wherever it sits in the list — must spell out both
+    fields.  A missing field is batch-history corruption, not a label to
+    infer: the sample's current label is never substituted, the record is
+    never repaired or dropped, and a row missing both fields is not read
+    as an unlabeled-to-unlabeled no-op.  The error names the batch number,
+    the sample's full SHA-256 digest, the record's 1-based position inside
+    the target batch and whether ``old``, ``new`` or both are absent.
+
+    The whole record list is scanned in order, so restorable rows at the
+    front can never mask a damaged row further back and no sample is
+    restored before the damage is found.
+
+    Callers must run this before any success-shaped short-circuit (such as
+    an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        problem = describe_missing_history_labels(record)
+        if problem is not None:
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, "
+                f"sample {record.get('sha256')}, record #{position}: {problem}"
+            )
+
+
 def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose records lack a sound pinned ``rev``.
 
