@@ -16,12 +16,14 @@ from vision_workbench.batches import (
     build_history_entry,
     describe_history_change_problem,
     describe_history_revision_problem,
+    describe_missing_history_labels,
     history_labels_equal,
     no_changes_result,
     normalize_label,
     reject_unknown_samples,
     replay_result,
     require_intact_history_changes,
+    require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
     resolve_re_submission,
@@ -538,6 +540,120 @@ class HistoryChangeFlagValidationTest(unittest.TestCase):
                          "changed": True, "rev": 1},
                         {"sha256": "d3", "old": "fish", "new": "guppy",
                          "changed": False, "rev": 1},
+                    ]
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("d3", message)
+        self.assertIn("record #3", message)
+
+
+class HistoryLabelPresenceValidationTest(unittest.TestCase):
+    def test_both_labels_present_is_no_problem(self) -> None:
+        self.assertIsNone(
+            describe_missing_history_labels({"sha256": "d1", "old": "cat", "new": "dog"})
+        )
+
+    def test_null_and_empty_string_are_saved_labels_not_missing(self) -> None:
+        # Explicit null and "" both mean unlabeled; neither is a gap.
+        self.assertIsNone(
+            describe_missing_history_labels({"sha256": "d1", "old": None, "new": ""})
+        )
+        self.assertIsNone(
+            describe_missing_history_labels({"sha256": "d1", "old": "", "new": None})
+        )
+        # A literal class named "unlabeled" is an ordinary saved label.
+        self.assertIsNone(
+            describe_missing_history_labels(
+                {"sha256": "d1", "old": "unlabeled", "new": None}
+            )
+        )
+
+    def test_each_missing_label_is_named(self) -> None:
+        self.assertEqual(
+            describe_missing_history_labels({"sha256": "d1", "new": "dog"}),
+            "missing 'old' label",
+        )
+        self.assertEqual(
+            describe_missing_history_labels({"sha256": "d1", "old": "cat"}),
+            "missing 'new' label",
+        )
+
+    def test_both_missing_is_not_an_unlabeled_noop(self) -> None:
+        # Two absent keys are two gaps, not an unlabeled->unlabeled record.
+        self.assertEqual(
+            describe_missing_history_labels({"sha256": "d1"}),
+            "missing 'old' and 'new' labels",
+        )
+
+    def entry(self, records: list[dict], *, number: str = "b1") -> dict:
+        return {"batch": number, "records": records}
+
+    def test_require_passes_for_complete_records(self) -> None:
+        require_intact_history_labels(
+            self.entry(
+                [
+                    {"sha256": "d1", "old": "cat", "new": "dog",
+                     "changed": True, "rev": 1},
+                    {"sha256": "d2", "old": None, "new": "",
+                     "changed": False, "rev": 0},
+                ]
+            )
+        )
+
+    def test_require_empty_record_list_passes(self) -> None:
+        require_intact_history_labels(self.entry([]))
+
+    def test_require_names_batch_digest_position_and_missing_label(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_labels(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d2", "new": "puppy",
+                         "changed": True, "rev": 1},
+                    ],
+                    number="renumber-3",
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'renumber-3'", message)
+        self.assertIn("d2", message)
+        self.assertIn("record #2", message)
+        self.assertIn("missing 'old' label", message)
+
+    def test_require_names_both_missing_labels(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_labels(
+                self.entry([{"sha256": "d1", "changed": False, "rev": 0}])
+            )
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("missing 'old' and 'new' labels", message)
+
+    def test_unchanged_record_is_checked_too(self) -> None:
+        # A no-op row missing 'new' is damage even though undo would
+        # never restore it.
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_labels(
+                self.entry([{"sha256": "d1", "old": "cat",
+                             "changed": False, "rev": 0}])
+            )
+        self.assertIn("missing 'new' label", str(ctx.exception))
+
+    def test_front_rows_never_mask_a_later_gap(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_labels(
+                self.entry(
+                    [
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d2", "old": "dog", "new": "fish",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d3", "old": "fish",
+                         "changed": True, "rev": 1},
                     ]
                 )
             )

@@ -391,6 +391,70 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
             )
 
 
+def describe_missing_history_labels(record: Mapping[str, Any]) -> str | None:
+    """Describe which of a history record's before/after labels are absent.
+
+    Every batch-history sample record must spell out both ``old`` (the
+    label before the batch) and ``new`` (the label after it).  Only key
+    presence is judged here: an explicitly saved ``null`` or empty string
+    is a recorded unlabeled label, never a missing field.  Returns
+    ``None`` when both keys are present.
+    """
+    missing = [key for key in ("old", "new") if key not in record]
+    if not missing:
+        return None
+    if len(missing) == 2:
+        return "missing 'old' and 'new' labels"
+    return f"missing {missing[0]!r} label"
+
+
+def require_intact_history_labels(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records lack a saved before/after label.
+
+    Undo restores and counts samples purely from what the target batch's
+    history rows say: a changed row is restored from ``new`` back to
+    ``old``, an unchanged row is left alone.  That is only meaningful
+    when every row explicitly carries both labels, so a row missing
+    ``old``, ``new`` or both is batch-history corruption — never an
+    unlabeled-to-unlabeled no-op to skip, and never something to guess
+    from the sample's current label.  The error names the batch number,
+    the sample's full SHA-256 digest, the record's 1-based position
+    inside the target batch and which of ``old``/``new`` (or both) is
+    absent; nothing is repaired, rewritten or restored.
+
+    An explicitly saved ``null`` or empty string stays legal: both mean
+    unlabeled, as does a literal class named ``unlabeled`` stay an
+    ordinary label.  Only a missing key is damage.
+
+    The whole record list is scanned in order — unchanged rows and rows
+    behind restorable ones included — so a complete row at the front can
+    never mask a damaged one further back, and no sample is restored
+    before the damage is found.
+
+    Callers must run this before any success-shaped short-circuit (such
+    as an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    number = entry.get("batch")
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(
+            f"Batch history is corrupted: batch {number!r}: missing records"
+        )
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+        problem = describe_missing_history_labels(record)
+        if problem is not None:
+            raise BatchError(
+                f"Batch history is corrupted: batch {number!r}, "
+                f"sample {record.get('sha256')}, record #{position}: {problem}"
+            )
+
+
 def history_labels_equal(old: Any, new: Any) -> bool:
     """Whether two stored history labels describe the same category.
 
