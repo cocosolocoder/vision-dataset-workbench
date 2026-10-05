@@ -17,7 +17,7 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 BATCH_SCHEMA_VERSION = 1
 
@@ -309,6 +309,54 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
     return None
 
 
+# ---------------------------------------------------------------------------
+# Undo-time integrity checks
+#
+# Every ``require_intact_history_*`` check scans the same record list of
+# the same target batch entry, so the shared mechanics live in two
+# helpers: ``_iter_history_records`` reads the list once, rejects a
+# missing list or a non-object row and yields ``(position, record)``
+# pairs; ``_corruption_prefix`` and ``_record_ref`` assemble the common
+# "Batch history is corrupted: batch ..." message parts.  The checks
+# themselves stay separate passes and keep their original order —
+# duplicate digests, then revisions, then labels, then changed flags —
+# each reporting its first problem in record order.
+# ---------------------------------------------------------------------------
+
+
+def _corruption_prefix(entry: Mapping[str, Any]) -> str:
+    """Shared prefix of every batch-history corruption message."""
+    return f"Batch history is corrupted: batch {entry.get('batch')!r}"
+
+
+def _record_ref(record: Mapping[str, Any], position: int | None = None) -> str:
+    """Locate a history record by sample digest and optional 1-based position."""
+    ref = f"sample {record.get('sha256')}"
+    if position is not None:
+        ref += f", record #{position}"
+    return ref
+
+
+def _iter_history_records(
+    entry: Mapping[str, Any],
+) -> Iterator[tuple[int, Mapping[str, Any]]]:
+    """Yield ``(position, record)`` for each row of a batch history entry.
+
+    This is the shared front half of every integrity check: the entry
+    must carry a record list and every row must be an object.  Positions
+    are 1-based, matching the record numbers used in error messages.
+    """
+    prefix = _corruption_prefix(entry)
+    records = entry.get("records")
+    if not isinstance(records, list):
+        # validate_history() already rules this out; defend direct callers.
+        raise BatchError(f"{prefix}: missing records")
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise BatchError(f"{prefix}: malformed record")
+        yield position, record
+
+
 def require_intact_history_records(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose records are not one row per sample.
 
@@ -331,23 +379,12 @@ def require_intact_history_records(entry: Mapping[str, Any]) -> None:
     an already-undone batch), so corruption can never be masked by a
     repeated-undo success.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
     seen: dict[str, int] = {}
-    for position, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
+    for position, record in _iter_history_records(entry):
         digest = record.get("sha256")
         if digest in seen:
             raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, sample {digest} "
+                f"{_corruption_prefix(entry)}, sample {digest} "
                 f"appears more than once, at record #{seen[digest]} and "
                 f"record #{position}"
             )
@@ -369,25 +406,14 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
     an already-undone batch), so corruption can never be masked by a
     repeated-undo success.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for record in records:
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
+    for _position, record in _iter_history_records(entry):
         problem = describe_history_revision_problem(
             record.get("rev"), present="rev" in record
         )
         if problem is not None:
             raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}: {problem}"
+                f"{_corruption_prefix(entry)}, "
+                f"{_record_ref(record)}: {problem}"
             )
 
 
@@ -435,23 +461,12 @@ def require_intact_history_labels(entry: Mapping[str, Any]) -> None:
     as an already-undone batch), so corruption can never be masked by a
     repeated-undo success.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for position, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
+    for position, record in _iter_history_records(entry):
         problem = describe_missing_history_labels(record)
         if problem is not None:
             raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}, record #{position}: {problem}"
+                f"{_corruption_prefix(entry)}, "
+                f"{_record_ref(record, position)}: {problem}"
             )
 
 
@@ -521,23 +536,12 @@ def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
     an already-undone batch), so corruption can never be masked by a
     repeated-undo success.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for position, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
+    for position, record in _iter_history_records(entry):
         problem = describe_history_change_problem(record)
         if problem is not None:
             raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}, record #{position}: {problem}"
+                f"{_corruption_prefix(entry)}, "
+                f"{_record_ref(record, position)}: {problem}"
             )
 
 
