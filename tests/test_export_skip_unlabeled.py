@@ -320,6 +320,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                     self.member(test_skip, UNLABELED),
                 ],
             },
+            ratios=("1/2", "1/4", "1/4"),
         )
 
         result, target = self.export("mixed", skip=True)
@@ -457,6 +458,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 ],
                 "test": [],
             },
+            ratios=("5/7", "2/7", "0"),
         )
 
         result, target = self.export("mixed", skip=True)
@@ -505,7 +507,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 "validation": [],
                 "test": test_skips,
             },
-            ratios=("1/3", "1/3", "1/3"),
+            ratios=("1/3", "0", "2/3"),
         )
 
         result, target = self.export("mixed", skip=True)
@@ -551,7 +553,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 entries.append(self.member(digest, UNLABELED))
             members[set_name] = entries
 
-        plan = self.write_plan("all-unlabeled", members)
+        plan = self.write_plan("all-unlabeled", members, ratios=("1/3", "1/6", "1/2"))
 
         result, target = self.export("all-unlabeled", skip=True)
         self.assertEqual(result["exported"], 0)
@@ -596,6 +598,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 ],
                 "test": [],
             },
+            ratios=("1/3", "2/3", "0"),
         )
         target = self.root.parent / "mixed.zip"
         with self.assertRaises(ExportError) as caught:
@@ -704,6 +707,7 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 "validation": [],
                 "test": [],
             },
+            ratios=("1", "0", "0"),
         )
         plan_path = self.store.splits_directory / "mixed.json"
         manifest_before = self.store.manifest_path.read_bytes()
@@ -746,6 +750,7 @@ class SkipUnlabeledCliTest(SkipUnlabeledHarness):
                 "validation": [self.member(val_skip, UNLABELED)],
                 "test": [],
             },
+            ratios=("3/4", "1/4", "0"),
         )
 
         target = self.root.parent / "cli.zip"

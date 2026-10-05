@@ -138,6 +138,70 @@ def _validated_distribution(distribution: Any, description: str) -> dict[str, An
     return distribution
 
 
+def _format_expectation(expected: Fraction) -> str:
+    """Render an expected count exactly: an integer or an exact fraction."""
+    if expected.denominator == 1:
+        return str(expected.numerator)
+    return f"{expected.numerator}/{expected.denominator}"
+
+
+def _validate_split_proportions(
+    plan_name: Any,
+    ratios: tuple[Fraction, Fraction, Fraction],
+    total: int,
+    set_totals: dict[str, int],
+    category_totals: Counter[str],
+    set_distributions: dict[str, Counter[str]],
+) -> None:
+    """Reject a plan whose saved members break the saved ratio contract.
+
+    The statistics already agree with the members at this point, but that
+    alone does not prove the proportions held: members moved between sets
+    together with adjusted counts would otherwise read and export as a
+    sound plan.  The same rule construction guarantees is enforced here,
+    using only the members, labels and ratios saved in the plan:
+
+    * for the plan as a whole (``total`` members) and, separately,
+    * for every category (its members summed across the three sets),
+
+    each set's actual count must satisfy
+    ``|actual - range_total * ratio| < 1`` exactly.  An integral
+    expectation therefore has to be met exactly, while a non-integral one
+    accepts either floor or ceil (the rounding direction is free); a
+    discrepancy of exactly one is always rejected.  Ratios are exact
+    rationals, so a decimal and the equal fraction give the same answer.
+    """
+
+    def fail(set_name: str, scope: str, actual: int, expected: Fraction) -> None:
+        raise SplitError(
+            f"Split plan {plan_name!r} is corrupted: {set_name} violates the "
+            f"saved ratio for {scope}: actual count {actual}, expected "
+            f"{_format_expectation(expected)}"
+        )
+
+    # Whole-plan counts first.
+    for j, set_name in enumerate(SET_NAMES):
+        actual = set_totals[set_name]
+        expected = Fraction(total) * ratios[j]
+        if abs(Fraction(actual) - expected) >= 1:
+            fail(set_name, "the overall count", actual, expected)
+
+    # Then each category on its own: a balanced total can still hide a
+    # class whose samples were shifted between sets.
+    for category in sorted(category_totals, key=_category_sort_key):
+        category_total = category_totals[category]
+        scope = "the unlabeled category" if category == "" else f"category {category!r}"
+        for j, set_name in enumerate(SET_NAMES):
+            actual = set_distributions[set_name].get(category, 0)
+            expected = Fraction(category_total) * ratios[j]
+            if abs(Fraction(actual) - expected) >= 1:
+                fail(set_name, scope, actual, expected)
+
+
+def _category_sort_key(category: str) -> tuple[int, str]:
+    return (0, "") if category == "" else (1, category)
+
+
 class DatasetStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -1082,7 +1146,7 @@ class DatasetStore:
                 raise SplitError(f"Split plan record is missing ratio for {set_name}")
             ratio_values.append(value)
         try:
-            validate_ratios(ratio_values)
+            ratio_fractions = validate_ratios(ratio_values)
         except SplitError as error:
             raise SplitError(f"Split plan record has invalid ratios: {error}") from error
 
@@ -1100,6 +1164,8 @@ class DatasetStore:
 
         seen: set[str] = set()
         overall: Counter[str] = Counter()
+        set_totals: dict[str, int] = {}
+        set_distributions: dict[str, Counter[str]] = {}
         for set_name in SET_NAMES:
             set_payload = sets.get(set_name)
             if not isinstance(set_payload, dict):
@@ -1132,6 +1198,8 @@ class DatasetStore:
                 seen.add(digest)
                 distribution[member["label"]] += 1
                 overall[member["label"]] += 1
+            set_totals[set_name] = len(members)
+            set_distributions[set_name] = distribution
             if set_payload["samples"] != len(members):
                 raise SplitError(f"Split plan record has a bad count for {set_name}")
             if dict(sorted(distribution.items())) != dict(
@@ -1146,6 +1214,15 @@ class DatasetStore:
             sorted(overall_distribution.items())
         ):
             raise SplitError("Split plan record has a mismatched class distribution")
+
+        _validate_split_proportions(
+            data.get("name"),
+            ratio_fractions,
+            samples["total"],
+            set_totals,
+            overall,
+            set_distributions,
+        )
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         """Write via a temp file + fsync + atomic replace.

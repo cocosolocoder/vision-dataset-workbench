@@ -110,6 +110,46 @@ python3 -m vision_workbench split show ./workspace baseline
   requests conflict; plans with different names all save, and a plan is
   only ever read whole or reported as not found.
 
+### Corrupted saved plans
+
+Every command that reads a saved plan — `split show`, `export` (even with
+`--skip-unlabeled`) and `split create` under an existing name — re-checks
+the plan against the proportions it was created with, using only the
+members, labels and ratios saved in the plan file. Statistics that merely
+agree with the member list are not enough: a member moved into another
+set together with adjusted counts still violates the rule and is
+rejected as a corrupted plan.
+
+For the dataset **as a whole** (every member in the plan) and, separately,
+for **each category** (that category's members summed across the three
+sets; the unlabeled category and a real class literally named
+`unlabeled` are counted independently), each set's count must satisfy
+
+```
+|actual − range-total × set-ratio| < 1
+```
+
+with exact rational arithmetic. An integral expectation has to match
+exactly; a non-integral one accepts either floor or ceil (the rounding
+direction is not fixed); a difference of exactly one is always rejected,
+and a decimal ratio and the equal fraction always give the same verdict.
+A balanced total never hides one mis-allocated class.
+
+On a violation the command exits non-zero, prints nothing on standard
+output and no traceback, and reports on standard error that the split
+plan is corrupted — naming the plan, the offending set, whether the
+overall count or which category is wrong, and the actual and expected
+counts. It is reported before any reuse/conflict verdict, so such a plan
+is never shown as a normal result, exported, reported as already
+existing, or treated as an ordinary name conflict. Nothing is rewritten:
+the plan, the current sample records and the label history are left
+untouched, an export leaves no package or temporary package, and the
+members and ratios are never silently redistributed or "repaired". The
+empty plan stays legal, a zero-ratio set must be empty, and classes with
+only one or two samples follow the same count rule. The judgement reads
+the saved plan alone, so later imports, label changes, or moved/deleted
+source images never invalidate an otherwise legal plan.
+
 ## Exporting a split plan
 
 A saved split plan can be exported as a portable, offline ZIP package:

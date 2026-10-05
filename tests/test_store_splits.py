@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from vision_workbench.splits import SET_NAMES, SplitError
 from vision_workbench.store import DatasetStore
@@ -32,6 +35,62 @@ class StoreHarness(unittest.TestCase):
         result = self.store.add(path, label)
         self.assertTrue(result.added)
         return result.digest
+
+    def digest(self, token: str) -> str:
+        return hashlib.sha256(f"plan-{token}".encode()).hexdigest()
+
+    def write_plan(
+        self,
+        name: str,
+        members_by_set: dict[str, list[tuple[str, str]]],
+        ratios: tuple[str, str, str] = ("1", "0", "0"),
+        seed: int = 0,
+    ) -> Path:
+        """Write a plan whose statistics exactly match its members.
+
+        Members are ``(digest, label)`` pairs; the recorded source points
+        at a path that need not exist, since proportion validation never
+        opens sources.  This builds internally-consistent statistics on
+        purpose, so tests isolate the proportion rule from the
+        members-vs-statistics checks.
+        """
+        set_payloads: dict[str, Any] = {}
+        overall: Counter[str] = Counter()
+        for set_name in SET_NAMES:
+            members = [
+                {
+                    "sha256": digest,
+                    "label": label,
+                    "source": str(self.root.parent / f"{digest}.jpg"),
+                }
+                for digest, label in members_by_set.get(set_name, [])
+            ]
+            distribution = Counter(member["label"] for member in members)
+            overall.update(distribution)
+            set_payloads[set_name] = {
+                "samples": len(members),
+                "distribution": dict(sorted(distribution.items())),
+                "members": members,
+            }
+        plan = {
+            "schema_version": 1,
+            "name": name,
+            "seed": seed,
+            "ratios": {
+                set_name: ratios[index] for index, set_name in enumerate(SET_NAMES)
+            },
+            "samples": {
+                "total": sum(overall.values()),
+                "distribution": dict(sorted(overall.items())),
+            },
+            "sets": set_payloads,
+        }
+        plan_path = self.store.splits_directory / f"{name}.json"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        return plan_path
 
 
 class SplitPlanStoreTest(StoreHarness):
@@ -312,6 +371,188 @@ class SplitPlanStoreTest(StoreHarness):
         self.assertTrue(result.created)
 
 
+class SavedPlanProportionTest(StoreHarness):
+    """A saved plan whose members no longer obey the saved ratios is corrupt.
+
+    The statistics in these plans always agree with the members; what is
+    wrong is the allocation relative to the ratios, which no stat-vs-member
+    comparison can detect on its own.
+    """
+
+    def assert_corrupt(self, name: str, *fragments: str) -> SplitError:
+        with self.assertRaises(SplitError) as caught:
+            self.store.get_split(name)
+        message = str(caught.exception)
+        self.assertIn("corrupted", message)
+        self.assertIn(name, message)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return caught.exception
+
+    def test_member_moved_into_zero_ratio_set_is_rejected(self) -> None:
+        # Ratios 1/0/0, four members, one shifted into validation with the
+        # statistics updated to stay consistent.
+        self.write_plan(
+            "zero",
+            {
+                "train": [(self.digest("t1"), "cat"), (self.digest("t2"), "cat"),
+                          (self.digest("t3"), "cat")],
+                "validation": [(self.digest("v1"), "cat")],
+                "test": [],
+            },
+            ratios=("1", "0", "0"),
+        )
+        self.assert_corrupt(
+            "zero", "train", "overall", "actual count 3", "expected 4"
+        )
+
+    def test_overall_balanced_but_class_imbalanced_is_rejected(self) -> None:
+        # 10 members under 1/2,1/4,1/4: totals 5/3/2 satisfy the overall
+        # rule, but all four cats landed in train while dog fills the rest.
+        self.write_plan(
+            "class-shift",
+            {
+                "train": [(self.digest(f"c{i}"), "cat") for i in range(4)]
+                + [(self.digest("d1"), "dog")],
+                "validation": [(self.digest(f"dv{i}"), "dog") for i in range(3)],
+                "test": [(self.digest(f"dt{i}"), "dog") for i in range(2)],
+            },
+            ratios=("1/2", "1/4", "1/4"),
+        )
+        error = self.assert_corrupt("class-shift", "category 'cat'", "actual count 4")
+        # The overall totals are fine, so the complaint must be class-level.
+        self.assertNotIn("overall", str(error))
+
+    def test_discrepancy_of_exactly_one_is_rejected(self) -> None:
+        # Two members under 1/4,1/4,1/2: train (1 vs 1/2) and validation
+        # (1 vs 1/2) are within <1, but test is 0 instead of its exact 1.
+        self.write_plan(
+            "exact-one",
+            {
+                "train": [(self.digest("a"), "x")],
+                "validation": [(self.digest("b"), "x")],
+                "test": [],
+            },
+            ratios=("1/4", "1/4", "1/2"),
+        )
+        self.assert_corrupt("exact-one", "test", "actual count 0", "expected 1")
+
+    def test_integer_expectation_must_match_exactly(self) -> None:
+        # Six members under halves/quarters: train must be the exact 3.
+        self.write_plan(
+            "integral",
+            {
+                "train": [(self.digest(f"a{i}"), "x") for i in range(2)],
+                "validation": [(self.digest(f"b{i}"), "x") for i in range(2)],
+                "test": [(self.digest(f"c{i}"), "x") for i in range(2)],
+            },
+            ratios=("1/2", "1/4", "1/4"),
+        )
+        self.assert_corrupt("integral", "train", "actual count 2", "expected 3")
+
+    def test_floor_or_ceil_both_accepted_for_non_integer_expectation(self) -> None:
+        # Five members under 1/2,1/2,0: train expectation 2.5; either side.
+        for train_count in (2, 3):
+            name = f"round-{train_count}"
+            train = [(self.digest(f"{name}-{i}"), "x") for i in range(train_count)]
+            validation = [
+                (self.digest(f"{name}-v{i}"), "x")
+                for i in range(5 - train_count)
+            ]
+            self.write_plan(
+                name,
+                {"train": train, "validation": validation, "test": []},
+                ratios=("1/2", "1/2", "0"),
+            )
+            self.assertEqual(self.store.get_split(name)["name"], name)
+
+    def test_decimal_and_equal_fraction_agree(self) -> None:
+        members = {
+            "train": [(self.digest("a1"), "x"), (self.digest("a2"), "x")],
+            "validation": [(self.digest("b1"), "x"), (self.digest("b2"), "x"),
+                           (self.digest("b3"), "x")],
+            "test": [],
+        }
+        self.write_plan("frac", members, ratios=("1/2", "1/2", "0"))
+        self.assertEqual(self.store.get_split("frac")["name"], "frac")
+        # The same allocation must also be legal when the ratio is a decimal.
+        self.write_plan("dec", members, ratios=("0.5", "0.5", "0"))
+        self.assertEqual(self.store.get_split("dec")["name"], "dec")
+
+    def test_empty_plan_stays_valid(self) -> None:
+        self.write_plan(
+            "empty",
+            {"train": [], "validation": [], "test": []},
+            ratios=("1/2", "1/4", "1/4"),
+        )
+        plan = self.store.get_split("empty")
+        self.assertEqual(plan["samples"]["total"], 0)
+
+    def test_zero_ratio_set_must_be_empty_even_for_tiny_classes(self) -> None:
+        # A single-sample class may only land in a set with a non-zero share.
+        self.write_plan(
+            "tiny",
+            {"train": [(self.digest("a"), "x")], "validation": [], "test": []},
+            ratios=("0", "1", "0"),
+        )
+        self.assert_corrupt("tiny", "train", "actual count 1", "expected 0")
+
+    def test_unlabeled_and_literal_unlabeled_checked_separately(self) -> None:
+        # One unlabeled ("") member and one literal "unlabeled" member, each
+        # a single-sample stratum, both in train under 1/0/0: a legal plan
+        # in which the two categories stay distinct.
+        self.write_plan(
+            "sepmix",
+            {"train": [(self.digest("u"), ""), (self.digest("l"), "unlabeled")],
+             "validation": [], "test": []},
+            ratios=("1", "0", "0"),
+        )
+        self.assertEqual(self.store.get_split("sepmix")["name"], "sepmix")
+
+        # Overall-balanced layout (2/2/0 under 1/2,1/2,0) but both unlabeled
+        # members were moved into validation and both literal ones into
+        # train.  Each single-label stratum of two expects one per set; the
+        # unlabeled category is counted on its own (never merged with the
+        # literal "unlabeled" class) and is the first category to fail.
+        self.write_plan(
+            "sepbad",
+            {
+                "train": [(self.digest("l1"), "unlabeled"),
+                          (self.digest("l2"), "unlabeled")],
+                "validation": [(self.digest("u1"), ""), (self.digest("u2"), "")],
+                "test": [],
+            },
+            ratios=("1/2", "1/2", "0"),
+        )
+        message = str(self.assert_corrupt("sepbad", "unlabeled", "actual count 0"))
+        self.assertNotIn("overall", message)
+
+    def test_failed_read_does_not_rewrite_plan(self) -> None:
+        plan_path = self.write_plan(
+            "keep",
+            {"train": [(self.digest("a"), "x")],
+             "validation": [(self.digest("b"), "x")],
+             "test": []},
+            ratios=("1", "0", "0"),
+        )
+        corrupted = plan_path.read_text(encoding="utf-8")
+        with self.assertRaises(SplitError):
+            self.store.get_split("keep")
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+    def test_judgement_uses_only_saved_plan(self) -> None:
+        # A genuinely created plan stays readable after the source images
+        # vanish and labels change: the decision never consults the manifest.
+        digest = self.add_sample("cat")
+        plan = self.store.create_split("valid", 0, [1, 0, 0]).plan
+        Path(plan["sets"]["train"]["members"][0]["source"]).unlink()
+        self.store.submit_batch(
+            {"batch": "b1", "changes": [{"sha256": digest, "old": "cat", "new": "dog"}]}
+        )
+        self.assertEqual(self.store.get_split("valid")["samples"]["distribution"],
+                         {"cat": 1})
+
+
 class CliTest(StoreHarness):
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -412,6 +653,77 @@ class CliTest(StoreHarness):
         body = json.loads(summary.stdout)
         self.assertEqual(body["items"], 1)
         self.assertEqual(body["labels"], {"cat": 1})
+
+    def corrupt_proportion_plan(self) -> tuple[Path, bytes]:
+        # Four members, ratios 1/0/0, but one was moved into validation and
+        # the statistics were kept consistent with the members.
+        plan_path = self.write_plan(
+            "broken",
+            {
+                "train": [(self.digest("t1"), "cat"), (self.digest("t2"), "cat"),
+                          (self.digest("t3"), "cat")],
+                "validation": [(self.digest("v1"), "cat")],
+                "test": [],
+            },
+            ratios=("1", "0", "0"),
+        )
+        return plan_path, plan_path.read_bytes()
+
+    def test_cli_show_export_and_create_reject_proportion_corruption(self) -> None:
+        plan_path, corrupted_bytes = self.corrupt_proportion_plan()
+
+        shown = self.run_cli("split", "show", str(self.root), "broken")
+        self.assertEqual(shown.returncode, 1)
+        self.assertEqual(shown.stdout, "")
+        self.assertIn("corrupted", shown.stderr)
+        self.assertIn("broken", shown.stderr)
+        self.assertIn("train", shown.stderr)
+        self.assertIn("expected 4", shown.stderr)
+        self.assertNotIn("Traceback", shown.stderr)
+
+        target = self.root.parent / "broken.zip"
+        exported = self.run_cli("export", str(self.root), "broken", str(target))
+        self.assertEqual(exported.returncode, 1)
+        self.assertEqual(exported.stdout, "")
+        self.assertIn("corrupted", exported.stderr)
+        self.assertIn("broken", exported.stderr)
+        self.assertIn("train", exported.stderr)
+        self.assertNotIn("Traceback", exported.stderr)
+        # No package and no leftover temporary package from this run.
+        self.assertFalse(target.exists())
+        leftovers = [
+            p.name
+            for p in target.parent.iterdir()
+            if p.name.startswith(".broken.zip")
+        ]
+        self.assertEqual(leftovers, [])
+
+        # --skip-unlabeled must still validate the full saved plan.
+        skipped = self.run_cli(
+            "export", str(self.root), "broken", str(target), "--skip-unlabeled"
+        )
+        self.assertEqual(skipped.returncode, 1)
+        self.assertEqual(skipped.stdout, "")
+        self.assertIn("corrupted", skipped.stderr)
+        self.assertFalse(target.exists())
+
+        # Creating under the same name reports corruption, not "already
+        # exists" or an ordinary name conflict.
+        recreated = self.run_cli(
+            "split", "create", str(self.root), "broken",
+            "--seed", "0", "--train", "1", "--validation", "0", "--test", "0",
+        )
+        self.assertEqual(recreated.returncode, 1)
+        self.assertEqual(recreated.stdout, "")
+        self.assertIn("corrupted", recreated.stderr)
+        self.assertNotIn("already exists", recreated.stderr)
+
+        # Nothing was rewritten: plan, manifest, batch history unchanged.
+        self.assertEqual(plan_path.read_bytes(), corrupted_bytes)
+        self.assertEqual(
+            json.loads(self.store.manifest_path.read_text(encoding="utf-8"))["items"],
+            [],
+        )
 
 
 if __name__ == "__main__":
