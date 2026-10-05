@@ -138,6 +138,53 @@ def _validated_distribution(distribution: Any, description: str) -> dict[str, An
     return distribution
 
 
+def _check_split_proportions(
+    name: Any,
+    ratios: tuple[Fraction, Fraction, Fraction],
+    set_counts: dict[str, int],
+    set_distributions: dict[str, Counter[str]],
+    overall: Counter[str],
+) -> None:
+    """Require the saved members to still obey the plan's own ratios.
+
+    The check derives solely from the plan's recorded members, labels and
+    ratios — never from the current manifest — so later imports, label
+    changes or source-file moves cannot invalidate a legitimately created
+    plan, and a hand-edited member list cannot pass by keeping only the
+    statistics consistent.  For every set, both its total member count and
+    each category's member count must differ from ``range total × ratio``
+    by strictly less than one (the range total is all members for the
+    overall count, and the category's members across the three sets for a
+    category count).  Counts are integers, so an integral expectation
+    demands exact equality while a fractional one accepts either
+    neighbouring integer; a difference of exactly one always fails.  An
+    empty plan trivially satisfies every ratio, and a zero ratio forces
+    its set to be empty.
+    """
+    total = sum(set_counts.values())
+    for index, set_name in enumerate(SET_NAMES):
+        ratio = ratios[index]
+        actual_total = set_counts[set_name]
+        expected_total = Fraction(total) * ratio
+        if abs(Fraction(actual_total) - expected_total) >= 1:
+            raise SplitError(
+                f"Split plan {name!r} is corrupted: set {set_name!r} holds "
+                f"{actual_total} of {total} samples overall, but its saved "
+                f"ratio expects {expected_total} "
+                "(the difference must be less than 1)"
+            )
+        for category in sorted(overall):
+            actual = set_distributions[set_name].get(category, 0)
+            expected = Fraction(overall[category]) * ratio
+            if abs(Fraction(actual) - expected) >= 1:
+                raise SplitError(
+                    f"Split plan {name!r} is corrupted: set {set_name!r} "
+                    f"holds {actual} of the {overall[category]} samples in "
+                    f"category {category!r}, but its saved ratio expects "
+                    f"{expected} (the difference must be less than 1)"
+                )
+
+
 class DatasetStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -1082,7 +1129,7 @@ class DatasetStore:
                 raise SplitError(f"Split plan record is missing ratio for {set_name}")
             ratio_values.append(value)
         try:
-            validate_ratios(ratio_values)
+            parsed_ratios = validate_ratios(ratio_values)
         except SplitError as error:
             raise SplitError(f"Split plan record has invalid ratios: {error}") from error
 
@@ -1100,6 +1147,8 @@ class DatasetStore:
 
         seen: set[str] = set()
         overall: Counter[str] = Counter()
+        set_counts: dict[str, int] = {}
+        set_distributions: dict[str, Counter[str]] = {}
         for set_name in SET_NAMES:
             set_payload = sets.get(set_name)
             if not isinstance(set_payload, dict):
@@ -1140,12 +1189,17 @@ class DatasetStore:
                 raise SplitError(
                     f"Split plan record has a mismatched distribution for {set_name}"
                 )
+            set_counts[set_name] = len(members)
+            set_distributions[set_name] = distribution
         if samples["total"] != len(seen):
             raise SplitError("Split plan record has a mismatched sample total")
         if dict(sorted(overall.items())) != dict(
             sorted(overall_distribution.items())
         ):
             raise SplitError("Split plan record has a mismatched class distribution")
+        _check_split_proportions(
+            data["name"], parsed_ratios, set_counts, set_distributions, overall
+        )
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         """Write via a temp file + fsync + atomic replace.

@@ -98,9 +98,19 @@ class SkipUnlabeledHarness(unittest.TestCase):
         name: str,
         sets: dict[str, list[dict[str, str]]],
         seed: int = 7,
-        ratios: tuple[str, str, str] = ("1/3", "1/3", "1/3"),
+        ratios: tuple[str, str, str] | None = None,
     ) -> dict[str, Any]:
-        """Write a valid split plan with exact per-set member lists."""
+        """Write a valid split plan with exact per-set member lists.
+
+        ``ratios`` defaults to the exact proportions of the given member
+        lists, so a crafted plan always satisfies the saved-ratio rule
+        that plan reads enforce; pass explicit ratios to pin them.
+        """
+        if ratios is None:
+            total = sum(len(sets.get(set_name, [])) for set_name in SET_NAMES)
+            ratios = tuple(
+                f"{len(sets.get(set_name, []))}/{total}" for set_name in SET_NAMES
+            )  # type: ignore[assignment]
         set_payloads: dict[str, Any] = {}
         overall: Counter[str] = Counter()
         for set_name in SET_NAMES:
@@ -505,7 +515,6 @@ class SkipUnlabeledExportTest(SkipUnlabeledHarness):
                 "validation": [],
                 "test": test_skips,
             },
-            ratios=("1/3", "1/3", "1/3"),
         )
 
         result, target = self.export("mixed", skip=True)
