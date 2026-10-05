@@ -762,8 +762,13 @@ class DatasetStore:
                 current = normalize_label(item.get("label"))
                 # record["rev"] is now known to be a genuine non-negative
                 # integer, so a boolean/decimal/string can never compare
-                # equal to the sample's current revision.
-                if item_revision(item) != record["rev"] or current != record["new"]:
+                # equal to the sample's current revision.  The stored
+                # after-label is normalized before comparing: history may
+                # explicitly save either unlabeled spelling (null or ""),
+                # and both match a sample currently unlabeled either way.
+                if item_revision(item) != record["rev"] or current != normalize_label(
+                    record["new"]
+                ):
                     raise BatchError(
                         f"cannot undo batch {number!r}: sample {record['sha256']} "
                         "was modified after the batch"
