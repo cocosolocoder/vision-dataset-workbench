@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from fractions import Fraction
 from typing import Any, Sequence
 
@@ -22,6 +23,11 @@ from typing import Any, Sequence
 UNLABELED = object()
 
 SET_NAMES = ("train", "validation", "test")
+
+# A sample identity: exactly 64 lowercase hexadecimal characters, the
+# format every registered sample's SHA-256 digest carries.
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_HEX_CHARACTERS = frozenset("0123456789abcdefABCDEF")
 
 
 class SplitError(ValueError):
@@ -51,6 +57,35 @@ def category_name(key: Any) -> str:
 
 def _sort_key(key: Any) -> tuple[int, str]:
     return (0 if key is UNLABELED else 1, category_name(key))
+
+
+def digest_problem(value: Any) -> str | None:
+    """Why ``value`` is not a valid sample identity, or ``None`` if it is.
+
+    A saved plan member's ``sha256`` is valid only as exactly 64
+    lowercase hexadecimal characters — the identity format registered
+    samples carry.  Nothing is normalized or repaired: truncation,
+    padding, surrounding whitespace, uppercase letters and
+    non-hexadecimal characters are each reported, never silently
+    accepted by trimming, padding or case conversion.
+    """
+    if not isinstance(value, str):
+        return f"expected a string, got {type(value).__name__}"
+    if not value:
+        return "the string is empty"
+    if value != value.strip():
+        return "the digest has leading or trailing whitespace"
+    if len(value) != 64:
+        return f"expected exactly 64 hexadecimal characters, got {len(value)}"
+    if _DIGEST_RE.fullmatch(value) is None:
+        if all(character in _HEX_CHARACTERS for character in value):
+            return "hexadecimal letters must be lowercase"
+        bad = sorted(
+            {character for character in value if character not in _HEX_CHARACTERS}
+        )
+        listed = ", ".join(repr(character) for character in bad)
+        return f"contains non-hexadecimal character(s): {listed}"
+    return None
 
 
 def validate_name(name: str) -> str:

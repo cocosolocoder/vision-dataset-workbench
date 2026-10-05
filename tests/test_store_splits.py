@@ -553,6 +553,228 @@ class SavedPlanProportionTest(StoreHarness):
                          {"cat": 1})
 
 
+class SavedPlanDigestTest(StoreHarness):
+    """A saved member whose sha256 is not a full digest marks the plan corrupt.
+
+    The identity must be exactly 64 lowercase hexadecimal characters — the
+    format registered samples carry.  Viewing, exporting and same-name
+    creation all reject such a plan, naming the plan, the set, the member's
+    1-based position in that set and the concrete problem; the saved value
+    is never trimmed, padded, truncated or case-folded into acceptance.
+    """
+
+    def write_digest_plan(
+        self,
+        name: str,
+        bad_set: str,
+        bad_value: Any,
+        bad_label: str = "cat",
+        bad_position: int = 1,
+    ) -> Path:
+        """Write a statistically sound plan carrying one bad member identity.
+
+        Every set holds two members under third ratios, so the corrupted
+        member can sit at either position of any set with the plan's
+        statistics and proportions otherwise fully consistent.
+        """
+        members_by_set: dict[str, list[tuple[str, str]]] = {}
+        for set_name in SET_NAMES:
+            pair = [
+                (self.digest(f"{set_name}-a"), "cat"),
+                (self.digest(f"{set_name}-b"), "cat"),
+            ]
+            if set_name == bad_set:
+                pair[bad_position - 1] = (bad_value, bad_label)
+            members_by_set[set_name] = pair
+        return self.write_plan(
+            name, members_by_set, ratios=("1/3", "1/3", "1/3")
+        )
+
+    def assert_digest_corrupt(
+        self, name: str, set_name: str, position: int, *fragments: str
+    ) -> str:
+        with self.assertRaises(SplitError) as caught:
+            self.store.get_split(name)
+        message = str(caught.exception)
+        self.assertIn("corrupted", message)
+        self.assertIn(name, message)
+        self.assertIn(f"member {position}", message)
+        self.assertIn(set_name, message)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_truncated_digest_rejected(self) -> None:
+        self.write_digest_plan("trunc", "validation", self.digest("v")[:63])
+        self.assert_digest_corrupt("trunc", "validation", 1, "64")
+
+    def test_uppercase_digest_rejected(self) -> None:
+        self.write_digest_plan("upper", "train", self.digest("u").upper())
+        self.assert_digest_corrupt("upper", "train", 1, "lowercase")
+
+    def test_non_hexadecimal_digest_rejected(self) -> None:
+        self.write_digest_plan("nonhex", "test", "z" * 64)
+        self.assert_digest_corrupt("nonhex", "test", 1, "non-hexadecimal")
+
+    def test_empty_digest_rejected(self) -> None:
+        self.write_digest_plan("empty", "train", "")
+        self.assert_digest_corrupt("empty", "train", 1, "empty")
+
+    def test_missing_digest_field_rejected(self) -> None:
+        plan_path = self.write_digest_plan("missing", "train", self.digest("t"))
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        del payload["sets"]["validation"]["members"][0]["sha256"]
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_digest_corrupt("missing", "validation", 1, "string")
+
+    def test_non_string_digest_rejected(self) -> None:
+        for bad in (123, None, True, ["ab"], {"sha256": "ab"}):
+            with self.subTest(bad=bad):
+                self.write_digest_plan("typed", "test", bad)
+                self.assert_digest_corrupt("typed", "test", 1, "string")
+                (self.store.splits_directory / "typed.json").unlink()
+
+    def test_surrounding_whitespace_rejected(self) -> None:
+        for bad in (f" {self.digest('w')}", f"{self.digest('w')}\n"):
+            with self.subTest(bad=bad):
+                self.write_digest_plan("padded", "train", bad)
+                self.assert_digest_corrupt("padded", "train", 1, "whitespace")
+                (self.store.splits_directory / "padded.json").unlink()
+
+    def test_later_set_and_position_not_masked_by_valid_members(self) -> None:
+        # Valid members in train and validation — and a valid first member
+        # in test itself — must not hide the corrupted second test member.
+        self.write_digest_plan(
+            "late", "test", self.digest("t")[:40], bad_position=2
+        )
+        self.assert_digest_corrupt("late", "test", 2, "64")
+
+    def test_unlabeled_member_identity_also_checked(self) -> None:
+        self.write_digest_plan("unlab", "validation", "not-a-digest", bad_label="")
+        self.assert_digest_corrupt("unlab", "validation", 1)
+
+    def test_same_name_create_reports_corruption_not_conflict(self) -> None:
+        plan_path = self.write_digest_plan("dup", "train", "not-a-digest")
+        corrupted = plan_path.read_text(encoding="utf-8")
+        with self.assertRaises(SplitError) as caught:
+            self.store.create_split("dup", 0, [1, 0, 0])
+        message = str(caught.exception)
+        self.assertIn("corrupted", message)
+        self.assertNotIn("already exists", message)
+        # The corrupted plan is preserved, not overwritten or rewritten.
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+    def test_rejection_preserves_plan_manifest_and_history(self) -> None:
+        digest = self.add_sample("cat")
+        self.store.submit_batch(
+            {"batch": "b1", "changes": [{"sha256": digest, "old": "cat", "new": "dog"}]}
+        )
+        plan_path = self.write_digest_plan("keep", "test", "x" * 63)
+        corrupted = plan_path.read_text(encoding="utf-8")
+        manifest_before = self.store.manifest_path.read_text(encoding="utf-8")
+        history_before = self.store.batches_path.read_text(encoding="utf-8")
+        with self.assertRaises(SplitError):
+            self.store.get_split("keep")
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+        self.assertEqual(
+            self.store.manifest_path.read_text(encoding="utf-8"), manifest_before
+        )
+        self.assertEqual(
+            self.store.batches_path.read_text(encoding="utf-8"), history_before
+        )
+
+    def test_valid_plan_not_condemned_by_later_workspace_changes(self) -> None:
+        # Image moves/deletes, label changes and new imports after creation
+        # must not turn a well-formed old plan into a "corrupted" one.
+        digest = self.add_sample("cat")
+        self.store.create_split("old", 0, [1, 0, 0])
+        source = Path(
+            self.store.get_split("old")["sets"]["train"]["members"][0]["source"]
+        )
+        source.unlink()
+        self.store.submit_batch(
+            {"batch": "b1", "changes": [{"sha256": digest, "old": "cat", "new": "dog"}]}
+        )
+        self.add_sample("bird")
+        viewed = self.store.get_split("old")
+        self.assertEqual(viewed["name"], "old")
+        # Same-name creation with changed inputs is an ordinary conflict,
+        # never a corruption report.
+        with self.assertRaises(SplitError) as caught:
+            self.store.create_split("old", 0, [1, 0, 0])
+        self.assertIn("already exists", str(caught.exception))
+        self.assertNotIn("corrupted", str(caught.exception))
+
+
+class SavedPlanDigestCliTest(StoreHarness):
+    """The three plan-reading commands reject a digest-corrupted plan."""
+
+    def run_cli(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "vision_workbench", *arguments],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def write_corrupted_plan(self, name: str = "bad") -> Path:
+        return self.write_plan(
+            name,
+            {
+                "train": [(self.digest("t"), "cat")],
+                "validation": [("z" * 64, "cat")],
+                "test": [],
+            },
+            ratios=("1/2", "1/2", "0"),
+        )
+
+    def assert_clean_failure(self, result: subprocess.CompletedProcess) -> None:
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("corrupted", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_show_rejects_corrupted_digest(self) -> None:
+        plan_path = self.write_corrupted_plan()
+        corrupted = plan_path.read_text(encoding="utf-8")
+        result = self.run_cli("split", "show", str(self.root), "bad")
+        self.assert_clean_failure(result)
+        for fragment in ("bad", "validation", "member 1", "non-hexadecimal"):
+            self.assertIn(fragment, result.stderr)
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+    def test_export_rejects_corrupted_digest_even_skipping_unlabeled(self) -> None:
+        plan_path = self.write_corrupted_plan()
+        corrupted = plan_path.read_text(encoding="utf-8")
+        target = self.root.parent / "out.zip"
+        result = self.run_cli(
+            "export", str(self.root), "bad", str(target), "--skip-unlabeled"
+        )
+        self.assert_clean_failure(result)
+        self.assertIn("bad", result.stderr)
+        self.assertFalse(target.exists())
+        # No target package and no leftover temporary package or lock.
+        leftovers = [
+            path.name
+            for path in self.root.parent.iterdir()
+            if path.name.startswith(".out.zip")
+        ]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+    def test_same_name_create_reports_corruption(self) -> None:
+        plan_path = self.write_corrupted_plan()
+        corrupted = plan_path.read_text(encoding="utf-8")
+        result = self.run_cli(
+            "split", "create", str(self.root), "bad",
+            "--seed", "0", "--train", "1", "--validation", "0", "--test", "0",
+        )
+        self.assert_clean_failure(result)
+        self.assertNotIn("already exists", result.stderr)
+        self.assertEqual(plan_path.read_text(encoding="utf-8"), corrupted)
+
+
 class CliTest(StoreHarness):
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(

@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 from vision_workbench.exporter import ExportError, export_split
-from vision_workbench.splits import SET_NAMES
+from vision_workbench.splits import SET_NAMES, SplitError
 from vision_workbench.store import DatasetStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -353,8 +353,28 @@ class SourceFailureTest(ExportHarness):
         payload["sets"]["train"]["members"][0]["sha256"] = "not-a-digest"
         plan_path.write_text(json.dumps(payload), encoding="utf-8")
         target = self.root.parent / "out.zip"
-        with self.assertRaises(ExportError):
+        # The plan is rejected when it is read (SplitError) or, at the
+        # latest, by the exporter's own member check (ExportError).
+        with self.assertRaises((SplitError, ExportError)) as caught:
             export_split(self.store, "baseline", target)
+        self.assertIn("corrupted", str(caught.exception))
+        self.assertFalse(target.exists())
+
+    def test_skip_unlabeled_does_not_skip_identity_corruption(self) -> None:
+        self.add_sample(None)
+        self.create_plan()
+        plan_path = self.store.splits_directory / "baseline.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        # The unlabeled member itself carries the corrupted identity.
+        for set_payload in payload["sets"].values():
+            for member in set_payload["members"]:
+                if member["label"] == "":
+                    member["sha256"] = member["sha256"].upper()
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+        target = self.root.parent / "out.zip"
+        with self.assertRaises((SplitError, ExportError)) as caught:
+            export_split(self.store, "baseline", target, skip_unlabeled=True)
+        self.assertIn("corrupted", str(caught.exception))
         self.assertFalse(target.exists())
 
 

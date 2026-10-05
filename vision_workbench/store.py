@@ -40,6 +40,7 @@ from .splits import (
     assign,
     category_key,
     category_name,
+    digest_problem,
     validate_name,
     validate_ratios,
 )
@@ -1182,14 +1183,30 @@ class DatasetStore:
                 f"its class distribution for {set_name}",
             )
             distribution: Counter[str] = Counter()
-            for member in members:
-                if (
-                    not isinstance(member, dict)
-                    or not isinstance(member.get("sha256"), str)
-                    or not isinstance(member.get("label"), str)
-                    or not isinstance(member.get("source"), str)
+            for position, member in enumerate(members, start=1):
+                if not isinstance(member, dict):
+                    raise SplitError(
+                        f"Split plan record has a bad member in {set_name}"
+                    )
+                # Every member's identity must be a full lowercase SHA-256
+                # digest, exactly as registered samples carry it — checked
+                # for all three sets and for unlabeled members alike, so a
+                # sound member earlier in the plan never masks a corrupted
+                # one later.  The saved value is judged as-is; nothing is
+                # trimmed, padded, truncated or case-folded into place.
+                problem = digest_problem(member.get("sha256"))
+                if problem is not None:
+                    raise SplitError(
+                        f"Split plan {data.get('name')!r} is corrupted: "
+                        f"member {position} of set {set_name} has an invalid "
+                        f"sha256: {problem}"
+                    )
+                if not isinstance(member.get("label"), str) or not isinstance(
+                    member.get("source"), str
                 ):
-                    raise SplitError(f"Split plan record has a bad member in {set_name}")
+                    raise SplitError(
+                        f"Split plan record has a bad member in {set_name}"
+                    )
                 digest = member["sha256"]
                 if digest in seen:
                     raise SplitError(
