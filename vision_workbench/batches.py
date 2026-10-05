@@ -17,7 +17,7 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 BATCH_SCHEMA_VERSION = 1
 
@@ -309,49 +309,139 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
     return None
 
 
-def require_intact_history_records(entry: Mapping[str, Any]) -> None:
-    """Reject a batch entry whose records are not one row per sample.
+# ---------------------------------------------------------------------------
+# Undo-time integrity checks
+#
+# Every check targets exactly one batch entry and judges its whole record
+# list before the caller may restore a label or take an already-undone
+# short-circuit.  The checks share a single reading of the target entry
+# (:func:`_history_check_context`) and a single way of turning a finding
+# into the standard corruption message (:func:`_corrupted`), so the four
+# damage kinds never re-derive the batch number, re-walk the list,
+# re-test that a row is an object or re-assemble the same batch/sample
+# error context on their own.
+#
+# The kinds keep a fixed, whole-batch precedence:
+#
+#   1. a sample digest appearing more than once in the target batch;
+#   2. an illegal or missing pinned history revision (``rev``);
+#   3. a missing before/after label (``old``/``new``);
+#   4. a ``changed`` flag contradicting the labels saved on its own row.
+#
+# Each kind is one complete pass over every record — unchanged rows and
+# rows behind restorable ones included — so when several kinds are
+# damaged at once the earliest kind in the list wins even if a later
+# kind's damage sits on an earlier record, instead of a row-by-row walk
+# reporting whichever problem it meets first.  Within one kind the
+# damaged records are still reported in record order.
+# ---------------------------------------------------------------------------
 
-    Undo pins every stored record to a sample content digest, so a digest
-    may occur at most once in the target batch: a duplicated row — even a
-    byte-for-byte copy, or a copy of a record that never changed a label —
-    would otherwise restore the same sample more than once, bump its label
-    revision repeatedly and inflate the restored count.  Duplicates are
-    therefore batch-history corruption, never records to merge or
-    de-duplicate.  The decision is independent of the labels, the
-    before/after labels and the record's ``changed`` flag: the content
-    digest alone decides.
 
-    The whole record list is scanned, so rows preceding the repeat are
-    checked too and a restorable row at the front can never mask a later
-    duplicate.  On a repeat the error names the batch number, the sample's
-    full digest and both 1-based record positions; nothing is repaired.
+def _history_check_context(entry: Mapping[str, Any]) -> tuple[Any, list[Any]]:
+    """Return the target batch's ``(number, records)`` once for every check.
 
-    Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    ``validate_history`` already guarantees a records list, but a check
+    can be handed a hand-built entry directly, so a missing or non-list
+    ``records`` field is reported here once instead of defended in every
+    check separately.
     """
     number = entry.get("batch")
     records = entry.get("records")
     if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
         raise BatchError(
             f"Batch history is corrupted: batch {number!r}: missing records"
         )
-    seen: dict[str, int] = {}
+    return number, records
+
+
+def _corrupted(number: Any, detail: str) -> BatchError:
+    """Build the standard target-batch corruption error for ``detail``."""
+    return BatchError(f"Batch history is corrupted: batch {number!r}, {detail}")
+
+
+def _iter_duplicate_errors(
+    number: Any, records: list[Any]
+) -> Iterator[BatchError]:
+    """Yield the non-object-row error and every repeated-digest error, in order.
+
+    Undo pins every stored record to a sample content digest, so a digest
+    may occur at most once in the target batch; the content digest alone
+    decides, independently of the labels, the before/after labels and the
+    ``changed`` flag.  A repeat names both 1-based record positions,
+    keeping the first occurrence when the same digest appears yet again.
+    """
+    seen: dict[Any, int] = {}
     for position, record in enumerate(records, start=1):
         if not isinstance(record, dict):
-            raise BatchError(
+            yield BatchError(
                 f"Batch history is corrupted: batch {number!r}: malformed record"
             )
+            continue
         digest = record.get("sha256")
         if digest in seen:
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, sample {digest} "
-                f"appears more than once, at record #{seen[digest]} and "
-                f"record #{position}"
+            yield _corrupted(
+                number,
+                f"sample {digest} appears more than once, at record "
+                f"#{seen[digest]} and record #{position}",
             )
+            # Keep the first position, so a third row still names #1.
+            continue
         seen[digest] = position
+
+
+def _iter_record_errors(
+    number: Any,
+    records: list[Any],
+    describe: Callable[[Mapping[str, Any], int], str | None],
+) -> Iterator[BatchError]:
+    """Yield one corruption error per damaged record, in record order.
+
+    ``describe`` receives an object record and its 1-based position and
+    returns that check's damage detail (batch/sample framing added here),
+    or ``None`` when the record is sound.  A non-object row is the same
+    damage for every check, so it is detected here once rather than in
+    each check.
+    """
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            yield BatchError(
+                f"Batch history is corrupted: batch {number!r}: malformed record"
+            )
+            continue
+        problem = describe(record, position)
+        if problem is not None:
+            yield _corrupted(number, problem)
+
+
+def _raise_first(errors: Iterator[BatchError]) -> None:
+    """Raise the first record-order damage from a check's error iterator."""
+    for error in errors:
+        raise error
+
+
+def require_intact_history_records(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records are not one row per sample.
+
+    A duplicated row — even a byte-for-byte copy, or a copy of a record
+    that never changed a label — would restore the same sample more than
+    once, bump its label revision repeatedly and inflate the restored
+    count, so it is batch-history corruption, never a row to merge or
+    de-duplicate.  The whole list is scanned, so a restorable row at the
+    front can never mask a later duplicate.  See
+    :func:`require_intact_history` for the checks' shared contract.
+    """
+    number, records = _history_check_context(entry)
+    _raise_first(_iter_duplicate_errors(number, records))
+
+
+def _revision_damage(record: Mapping[str, Any], position: int) -> str | None:
+    """Detail for one record's illegal or missing pinned ``rev``."""
+    problem = describe_history_revision_problem(
+        record.get("rev"), present="rev" in record
+    )
+    if problem is None:
+        return None
+    return f"sample {record.get('sha256')}: {problem}"
 
 
 def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
@@ -359,36 +449,13 @@ def require_intact_history_revisions(entry: Mapping[str, Any]) -> None:
 
     Every record — changed or not — must carry ``rev`` as a genuine
     non-negative integer, since undo pins each changed sample to the
-    revision it had at the end of the batch.  This is integrity damage,
-    unlike the *manifest's* optional revision (see
-    :func:`item_revision`, which keeps the legacy missing-means-zero
-    behaviour): a bad row is reported with the batch number, the sample's
-    full digest and the exact ``rev`` problem, and nothing is repaired.
-
-    Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    revision it had at the end of the batch; unlike the manifest's
+    optional revision, a bad or missing row is integrity damage, never a
+    coerced zero.  See :func:`require_intact_history` for the checks'
+    shared contract.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for record in records:
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
-        problem = describe_history_revision_problem(
-            record.get("rev"), present="rev" in record
-        )
-        if problem is not None:
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}: {problem}"
-            )
+    number, records = _history_check_context(entry)
+    _raise_first(_iter_record_errors(number, records, _revision_damage))
 
 
 def describe_missing_history_labels(record: Mapping[str, Any]) -> str | None:
@@ -408,51 +475,31 @@ def describe_missing_history_labels(record: Mapping[str, Any]) -> str | None:
     return f"missing {missing[0]!r} label"
 
 
+def _missing_labels_damage(record: Mapping[str, Any], position: int) -> str | None:
+    """Detail for one record's missing before/after label, with its position."""
+    problem = describe_missing_history_labels(record)
+    if problem is None:
+        return None
+    return (
+        f"sample {record.get('sha256')}, record #{position}: {problem}"
+    )
+
+
 def require_intact_history_labels(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose records lack a saved before/after label.
 
     Undo restores and counts samples purely from what the target batch's
-    history rows say: a changed row is restored from ``new`` back to
-    ``old``, an unchanged row is left alone.  That is only meaningful
-    when every row explicitly carries both labels, so a row missing
-    ``old``, ``new`` or both is batch-history corruption — never an
-    unlabeled-to-unlabeled no-op to skip, and never something to guess
-    from the sample's current label.  The error names the batch number,
-    the sample's full SHA-256 digest, the record's 1-based position
-    inside the target batch and which of ``old``/``new`` (or both) is
-    absent; nothing is repaired, rewritten or restored.
-
-    An explicitly saved ``null`` or empty string stays legal: both mean
-    unlabeled, as does a literal class named ``unlabeled`` stay an
-    ordinary label.  Only a missing key is damage.
-
-    The whole record list is scanned in order — unchanged rows and rows
-    behind restorable ones included — so a complete row at the front can
-    never mask a damaged one further back, and no sample is restored
-    before the damage is found.
-
-    Callers must run this before any success-shaped short-circuit (such
-    as an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    history rows say, so every row must explicitly carry both ``old`` and
+    ``new``; a missing key is corruption, never an unlabeled-to-unlabeled
+    no-op and never something guessed from the current label.  An
+    explicitly saved ``null`` or empty string stays legal (both mean
+    unlabeled), as does a literal class named ``unlabeled``.  The error
+    names the batch number, the sample's full digest, the record's
+    1-based position and which label is absent.  See
+    :func:`require_intact_history` for the checks' shared contract.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for position, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
-        problem = describe_missing_history_labels(record)
-        if problem is not None:
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}, record #{position}: {problem}"
-            )
+    number, records = _history_check_context(entry)
+    _raise_first(_iter_record_errors(number, records, _missing_labels_damage))
 
 
 def history_labels_equal(old: Any, new: Any) -> bool:
@@ -493,52 +540,76 @@ def describe_history_change_problem(record: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _change_flag_damage(record: Mapping[str, Any], position: int) -> str | None:
+    """Detail for one record's ``changed`` flag contradicting its labels."""
+    problem = describe_history_change_problem(record)
+    if problem is None:
+        return None
+    return (
+        f"sample {record.get('sha256')}, record #{position}: {problem}"
+    )
+
+
 def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose ``changed`` flags belie old/new labels.
 
-    Undo restores a sample based on what the history row says the batch
-    did: a row marked changed is restored from ``new`` back to ``old`` and
-    counted, while a row marked unchanged is never restored.  So the flag
-    must match the before/after labels saved on that row — judging from the
-    record's own stored labels rather than any sample's current label:
-
-    * differing old/new (``null`` and ``""`` being the same unlabeled
-      spelling) require ``changed: true``;
-    * identical old/new require ``changed: false``.
-
-    A row that claims a change with identical labels would make undo count
-    and restore a sample the batch never touched; a row that hides a real
-    change would leave the sample at its post-batch label while the batch
-    is recorded undone.  Both are batch-history corruption: the error names
-    the batch number, the sample's full SHA-256 digest and the record's
-    1-based position inside the target batch, together with the exact
-    contradiction, and nothing is repaired.
-
-    The whole record list is scanned in order, so a restorable row at the
-    front can never mask a contradiction further back.
-
-    Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    A row marked changed is restored from ``new`` back to ``old`` and
+    counted; a row marked unchanged is never restored.  So the flag must
+    match the labels saved on that same row, judged from the record's own
+    stored labels (never a sample's current label): differing old/new
+    require ``changed: true`` and identical old/new require
+    ``changed: false`` (``null`` and ``""`` are the same unlabeled
+    spelling).  The error names the batch number, the sample's full
+    digest, the record's 1-based position and the exact contradiction.
+    See :func:`require_intact_history` for the checks' shared contract.
     """
-    number = entry.get("batch")
-    records = entry.get("records")
-    if not isinstance(records, list):
-        # validate_history() already rules this out; defend direct callers.
-        raise BatchError(
-            f"Batch history is corrupted: batch {number!r}: missing records"
-        )
-    for position, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}: malformed record"
-            )
-        problem = describe_history_change_problem(record)
-        if problem is not None:
-            raise BatchError(
-                f"Batch history is corrupted: batch {number!r}, "
-                f"sample {record.get('sha256')}, record #{position}: {problem}"
-            )
+    number, records = _history_check_context(entry)
+    _raise_first(_iter_record_errors(number, records, _change_flag_damage))
+
+
+# The four whole-batch passes in their fixed precedence.  Each pass reads
+# the very same (number, records) pair produced once by
+# :func:`_history_check_context`; adding a new damage kind means adding
+# one describe/pass pair here, not another hand-written scan.
+def _history_integrity_passes(
+    number: Any, records: list[Any]
+) -> list[Iterator[BatchError]]:
+    return [
+        _iter_duplicate_errors(number, records),
+        _iter_record_errors(number, records, _revision_damage),
+        _iter_record_errors(number, records, _missing_labels_damage),
+        _iter_record_errors(number, records, _change_flag_damage),
+    ]
+
+
+def require_intact_history(entry: Mapping[str, Any]) -> None:
+    """Validate one target batch's history before an undo may proceed.
+
+    The entry's whole record list is judged against every damage kind,
+    each as a complete pass:
+
+      1. repeated sample digests within the batch,
+      2. illegal or missing pinned revisions (``rev``),
+      3. missing before/after labels (``old``/``new``),
+      4. ``changed`` flags contradicting the labels saved on their rows.
+
+    When several kinds are damaged at once, the kinds are reported in
+    exactly that order across the whole batch — a damaged later kind on
+    an early record never jumps ahead of an earlier kind whose damage
+    sits further back — and within one kind the records keep their stored
+    order.  Nothing is repaired, rewritten or restored, and no label is
+    written before every record has passed the checks still ahead of it,
+    so a restorable row at the front can never mask later damage.
+
+    Callers must run this before any success-shaped short-circuit (an
+    already-undone batch included) and before checking whether a
+    restorable sample was modified after the batch, so corruption is
+    never hidden behind ``already-undone`` or confused with a later
+    modification.
+    """
+    number, records = _history_check_context(entry)
+    for errors in _history_integrity_passes(number, records):
+        _raise_first(errors)
 
 
 def empty_history() -> dict[str, Any]:

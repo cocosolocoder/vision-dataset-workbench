@@ -25,10 +25,7 @@ from .batches import (
     normalize_label,
     parse_batch_file,
     reject_unknown_samples,
-    require_intact_history_changes,
-    require_intact_history_labels,
-    require_intact_history_records,
-    require_intact_history_revisions,
+    require_intact_history,
     resolve_re_submission,
     result_payload,
     validate_history,
@@ -799,17 +796,15 @@ class DatasetStore:
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
 
-            # Validate the target batch's integrity — one row per sample,
-            # sound pinned revisions, both before/after labels saved, and
-            # a changed flag that matches those labels — before the
-            # already-undone short-circuit and the later-modification
-            # checks: a duplicated, inconsistent or corrupt history record
-            # is refusal, not an undo, a no-op or an unknown batch, and
+            # Validate the target batch's integrity as one whole-batch
+            # pass per damage kind — one row per sample, sound pinned
+            # revisions, both before/after labels saved, and a changed
+            # flag matching those labels — before the already-undone
+            # short-circuit and the later-modification checks: any
+            # duplicated, inconsistent or corrupt history record is
+            # refusal, not an undo, a no-op or an unknown batch, and
             # nothing is rewritten.
-            require_intact_history_records(entry)
-            require_intact_history_revisions(entry)
-            require_intact_history_labels(entry)
-            require_intact_history_changes(entry)
+            require_intact_history(entry)
 
             if entry["undone"]:
                 return {"batch": number, "status": "already-undone", "restored": 0}
