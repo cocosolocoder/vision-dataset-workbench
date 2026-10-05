@@ -96,7 +96,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import stat
 import tempfile
 import zipfile
@@ -105,7 +104,7 @@ from pathlib import Path
 from typing import Any
 
 from . import confirmed
-from .splits import SET_NAMES
+from .splits import SET_NAMES, SplitError, invalid_digest_reason
 
 EXPORT_SCHEMA_VERSION = 1
 
@@ -115,7 +114,6 @@ _CREATE_SYSTEM_UNIX = 3
 _FILE_ATTR = 0o100644 << 16
 _DIR_ATTR = (0o40755 << 16) | 0x10  # MS-DOS directory flag
 _CHUNK_SIZE = 1024 * 1024
-_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 # Descriptor-relative, no-symlink-follow directory opens: POSIX and
 # available on the platforms this tool runs on (0 where a flag is absent).
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -177,7 +175,16 @@ def export_split(
     before it is entered or while its contents are read fails the export
     naming that path; the link is never followed.
     """
-    plan = store.get_split(plan_name)
+    try:
+        plan = store.get_split(plan_name)
+    except SplitError as error:
+        # Reading a saved plan already enforces the same identity and
+        # proportion rules as "split show"; export reports them through
+        # its own error type while keeping the message (plan name, set,
+        # member position and the concrete problem) intact.  This runs
+        # before the unlabeled check, so --skip-unlabeled can never
+        # bypass a corrupted identity.
+        raise ExportError(str(error)) from error
     members = _collect_members(plan)
 
     unlabeled = [member for member in members if member["label"] == ""]
@@ -272,24 +279,28 @@ def _collect_members(plan: dict[str, Any]) -> list[dict[str, Any]]:
     members: list[dict[str, Any]] = []
     for set_name in SET_NAMES:
         payload = plan["sets"][set_name]
-        for member in payload["members"]:
+        for position, member in enumerate(payload["members"], start=1):
             digest = member.get("sha256")
             label = member.get("label")
             source = member.get("source")
-            if not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest):
+            digest_problem = invalid_digest_reason(digest)
+            if digest_problem is not None:
                 raise ExportError(
                     f"split plan {plan.get('name')!r} is corrupted: "
-                    f"sample {digest!r} is not a full SHA-256 digest"
+                    f"{set_name} member {position} has an invalid 'sha256' "
+                    f"identity {digest!r}: {digest_problem}"
                 )
             if not isinstance(label, str):
                 raise ExportError(
                     f"split plan {plan.get('name')!r} is corrupted: "
-                    f"sample {digest} has a non-string label"
+                    f"{set_name} member {position} (sha256 {digest}) has a "
+                    "non-string label"
                 )
             if not isinstance(source, str) or not source:
                 raise ExportError(
                     f"split plan {plan.get('name')!r} is corrupted: "
-                    f"sample {digest} has no recorded source path"
+                    f"{set_name} member {position} (sha256 {digest}) has no "
+                    "recorded source path"
                 )
             members.append(
                 {

@@ -40,6 +40,7 @@ from .splits import (
     assign,
     category_key,
     category_name,
+    invalid_digest_reason,
     validate_name,
     validate_ratios,
 )
@@ -1182,15 +1183,34 @@ class DatasetStore:
                 f"its class distribution for {set_name}",
             )
             distribution: Counter[str] = Counter()
-            for member in members:
-                if (
-                    not isinstance(member, dict)
-                    or not isinstance(member.get("sha256"), str)
-                    or not isinstance(member.get("label"), str)
-                    or not isinstance(member.get("source"), str)
+            for position, member in enumerate(members, start=1):
+                if not isinstance(member, dict):
+                    raise SplitError(
+                        f"Split plan {data.get('name')!r} is corrupted: "
+                        f"{set_name} member {position} is not a JSON object"
+                    )
+                digest = member.get("sha256")
+                digest_problem = invalid_digest_reason(digest)
+                if digest_problem is not None:
+                    # The identity format is judged from the saved plan
+                    # alone, exactly as the manifest enforces it for
+                    # registered samples: a truncated, padded, uppercase
+                    # or non-hex spelling, an empty or missing field,
+                    # surrounding whitespace or a non-string value is
+                    # corruption, never auto-repaired.  Earlier valid
+                    # members cannot mask a later one.
+                    raise SplitError(
+                        f"Split plan {data.get('name')!r} is corrupted: "
+                        f"{set_name} member {position} has an invalid "
+                        f"'sha256' identity {digest!r}: {digest_problem}"
+                    )
+                if not isinstance(member.get("label"), str) or not isinstance(
+                    member.get("source"), str
                 ):
-                    raise SplitError(f"Split plan record has a bad member in {set_name}")
-                digest = member["sha256"]
+                    raise SplitError(
+                        f"Split plan record has a bad member in {set_name} "
+                        f"at position {position}"
+                    )
                 if digest in seen:
                     raise SplitError(
                         f"Split plan record lists {digest} in more than one set"

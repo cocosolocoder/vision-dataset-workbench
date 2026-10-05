@@ -114,11 +114,24 @@ python3 -m vision_workbench split show ./workspace baseline
 
 Every command that reads a saved plan — `split show`, `export` (even with
 `--skip-unlabeled`) and `split create` under an existing name — re-checks
-the plan against the proportions it was created with, using only the
-members, labels and ratios saved in the plan file. Statistics that merely
-agree with the member list are not enough: a member moved into another
-set together with adjusted counts still violates the rule and is
-rejected as a corrupted plan.
+the saved plan before anything is shown, packaged or reused.
+
+Every member of every set (train, validation and test — including
+unlabeled members and members listed after other, valid ones) must carry
+a `sha256` identity that is **exactly 64 lowercase hexadecimal
+characters**, the same spelling a registered sample uses. An empty
+string, a missing field, a value of any other type (a number, boolean,
+array or null), a truncated or padded digest, an uppercase spelling, a
+non-hexadecimal character, or whitespace before, after or inside the
+digest is corruption. Such a value is never repaired by truncating,
+padding, stripping spaces or changing case — even when the lowercase
+digest happens to name a sample that is currently registered.
+
+In addition, the plan is re-checked against the proportions it was
+created with, using only the members, labels and ratios saved in the
+plan file. Statistics that merely agree with the member list are not
+enough: a member moved into another set together with adjusted counts
+still violates the rule and is rejected as a corrupted plan.
 
 For the dataset **as a whole** (every member in the plan) and, separately,
 for **each category** (that category's members summed across the three
@@ -137,18 +150,24 @@ A balanced total never hides one mis-allocated class.
 
 On a violation the command exits non-zero, prints nothing on standard
 output and no traceback, and reports on standard error that the split
-plan is corrupted — naming the plan, the offending set, whether the
-overall count or which category is wrong, and the actual and expected
-counts. It is reported before any reuse/conflict verdict, so such a plan
-is never shown as a normal result, exported, reported as already
-existing, or treated as an ordinary name conflict. Nothing is rewritten:
-the plan, the current sample records and the label history are left
-untouched, an export leaves no package or temporary package, and the
-members and ratios are never silently redistributed or "repaired". The
-empty plan stays legal, a zero-ratio set must be empty, and classes with
-only one or two samples follow the same count rule. The judgement reads
-the saved plan alone, so later imports, label changes, or moved/deleted
-source images never invalidate an otherwise legal plan.
+plan is corrupted. A bad identity names the plan, the offending set, the
+member's 1-based position inside that set, the bad value and what is
+wrong with it (wrong length, uppercase/non-hexadecimal characters,
+whitespace, empty or not a string); a proportion violation names the
+plan, the offending set, whether the overall count or which category is
+wrong, and the actual and expected counts. Either verdict is reported
+before any reuse/conflict verdict, so such a plan is never shown as a
+normal result, exported, reported as already existing, or treated as an
+ordinary name conflict. Nothing is rewritten: the plan, the current
+sample records and the label history are left untouched, an export
+leaves no package or temporary package, and the members and ratios are
+never silently redistributed, normalized or "repaired". The empty plan
+stays legal, a zero-ratio set must be empty, and classes with only one
+or two samples follow the same count rule. Both judgements read the
+saved plan alone — its images need not still be readable and its
+members need not still appear in the current registration list — so
+later imports, label changes, or moved/deleted source images never
+invalidate an otherwise legal plan.
 
 ## Exporting a split plan
 
