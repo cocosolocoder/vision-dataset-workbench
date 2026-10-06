@@ -459,6 +459,31 @@ the undo. Undo leaves a queryable record; repeating it reports
 
 ### Corrupted batch history
 
+The number an `undo` names must identify **exactly one batch** in the saved
+history list. When the same batch number occurs on a second entry — whether
+the two entries sit next to each other or have other, legitimate batches
+between them — the whole undo is refused as corrupted batch history. The two
+entries' contents never resolve the ambiguity: byte-for-byte identical
+entries are a repeat too, and entries touching different samples, recording
+different label changes or carrying different undo states are refused just
+the same. Undo never picks the first occurrence, the last, the still-active
+one or one not yet undone, and the two entries are never merged, renumbered
+or de-duplicated. The error names the batch number as given and the
+1-based positions of the first and second occurrence in the full history
+list; with three or more occurrences the first two positions are named. The
+command exits non-zero with nothing on standard output and no traceback,
+changes no sample label or label revision, rewrites neither the
+registration list nor the batch history, sets no undo marker or undo time,
+and deletes, renumbers or repairs neither conflicting entry. The full list
+is scanned, so a restorable first occurrence never masks a repeat that
+appears later, and a first occurrence already marked undone surfaces this
+ambiguity instead of returning `already-undone`. Numbers are matched by
+their saved raw string exactly — surrounding whitespace and case are never
+trimmed or folded, so `"b1"` and `" b1"` are different numbers. Only the
+requested number is judged: a duplicate of some *other* number never blocks
+a unique, otherwise valid target from undoing normally, and a number absent
+from the list still returns the ordinary unknown-batch error.
+
 Every sample record stored for a successful batch carries a `rev`: the
 sample's label revision at the moment the batch finished, which an undo
 pins against. That `rev` is mandatory on **every** history record —

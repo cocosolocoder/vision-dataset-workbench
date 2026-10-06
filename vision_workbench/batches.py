@@ -17,7 +17,7 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 BATCH_SCHEMA_VERSION = 1
 
@@ -555,6 +555,46 @@ def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
                 f"{_corruption_prefix(entry)}, "
                 f"{_record_ref(record, position)}: {problem}"
             )
+
+
+def find_unique_history_entry(
+    number: str, batches: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
+    """Find the single history entry whose number is ``number``.
+
+    An undo target must name exactly one batch.  Matching is on the batch
+    number's saved raw string — no trimming of surrounding whitespace and
+    no case folding — so the whole list is scanned with exact equality
+    rather than stopping at the first hit: a second entry carrying the
+    same number, whether adjacent to the first or separated by other
+    batches, makes the target ambiguous.  Such a history is corrupted no
+    matter what the two entries contain — identical record content,
+    different samples, different label changes or differing undo states
+    are all refusal, never a reason to pick the first, the last or the
+    still-active one, and never something to merge.
+
+    Returns the unique entry, or ``None`` when the number does not occur.
+    On a repeat the error names the user-given batch number and the two
+    1-based positions of the conflicting entries in the full history
+    list, so neither record is undone, preferred or repaired.  Callers
+    must run this before every per-entry integrity check and before the
+    already-undone short-circuit: even an entry already marked undone
+    leaves the number ambiguous and must surface this instead.
+    """
+    positions = [
+        position
+        for position, entry in enumerate(batches, start=1)
+        if isinstance(entry, Mapping) and entry.get("batch") == number
+    ]
+    if not positions:
+        return None
+    if len(positions) >= 2:
+        raise BatchError(
+            "Batch history is corrupted: batch number "
+            f"{number!r} appears more than once, at batch #{positions[0]} "
+            f"and batch #{positions[1]}"
+        )
+    return batches[positions[0] - 1]
 
 
 def empty_history() -> dict[str, Any]:
