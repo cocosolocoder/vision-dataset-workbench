@@ -20,6 +20,7 @@ from .batches import (
     apply_resolutions,
     build_history_entry,
     empty_history,
+    find_unique_history_entry,
     item_revision,
     no_changes_result,
     normalize_label,
@@ -813,24 +814,30 @@ class DatasetStore:
         modification, even one that restored the same label).  Repeated
         undos are idempotent and do not add history.
 
-        Integrity comes before either verdict: the target batch must list
-        every sample exactly once, carry a sound pinned revision on each
-        record, explicitly save both before/after labels on each record,
-        and have every record's ``changed`` flag agree with the
-        before/after labels saved on that same record.  A duplicated
-        digest, a bad row, a missing label field or a flag that
-        contradicts its labels rejects the undo even when the batch is
-        already marked undone, so corruption is never hidden behind an
+        Integrity comes before either verdict: the requested number must
+        identify exactly one batch in the whole history list, and that
+        target batch must list every sample exactly once, carry a sound
+        pinned revision on each record, explicitly save both
+        before/after labels on each record, and have every record's
+        ``changed`` flag agree with the before/after labels saved on that
+        same record.  A repeated batch number, a duplicated digest, a bad
+        row, a missing label field or a flag that contradicts its labels
+        rejects the undo even when the first matching batch is already
+        marked undone, so corruption is never hidden behind an
         ``already-undone`` success or confused with a sample modified
         after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
             history = self._read_history()
-            entry = next(
-                (entry for entry in history["batches"] if entry["batch"] == number),
-                None,
-            )
+
+            # Identify the target batch across the whole history list
+            # first: a second entry carrying the requested number makes
+            # the request ambiguous and is batch-history corruption, even
+            # when the two entries are identical or the first is already
+            # marked undone.  Other numbers' repeats are irrelevant and
+            # an absent number stays the existing unknown-batch error.
+            entry = find_unique_history_entry(number, history["batches"])
             if entry is None:
                 raise BatchError(f"unknown batch number: {number!r}")
 

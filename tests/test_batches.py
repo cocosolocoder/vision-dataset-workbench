@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import multiprocessing
 import shutil
@@ -1281,6 +1282,228 @@ class BatchUndoMissingLabelsTest(StoreHarness):
         self.assertIn("missing 'new' label", rejected.stderr)
         self.assertNotIn("Traceback", rejected.stderr)
         self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+
+class BatchUndoDuplicateNumberTest(StoreHarness):
+    """Two saved history entries carrying one batch number."""
+
+    def _history_on_disk(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def _write_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _duplicate_entry(self, number: str, *, adjacent: bool = False) -> None:
+        """Save a verbatim second copy of a number's entry.
+
+        Adjacent puts the copy straight after the original; otherwise it
+        is appended behind the other, legal batches.
+        """
+        history = self._history_on_disk()
+        index = next(i for i, e in enumerate(history["batches"])
+                     if e["batch"] == number)
+        duplicate = copy.deepcopy(history["batches"][index])
+        if adjacent:
+            history["batches"].insert(index + 1, duplicate)
+        else:
+            history["batches"].append(duplicate)
+        self._write_history(history)
+
+    def test_adjacent_identical_entries_reject_whole_undo(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._duplicate_entry("b1", adjacent=True)
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #2", message)
+        self.assertNotIn("already-undone", message)
+
+        # No sample restored, no revision bumped, history never rewritten.
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        entries = self._history_on_disk()["batches"]
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertFalse(entry["undone"])
+            self.assertIsNone(entry["undone_at"])
+
+    def test_repeat_behind_other_batches_names_whole_list_positions(self) -> None:
+        # The duplicate is not adjacent: b1 ... b2 ... b1.  Positions
+        # count across the whole history list, and the first, restorable
+        # occurrence can never mask the second one.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._duplicate_entry("b1")
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("'b1'", message)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #3", message)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+
+    def test_different_samples_under_one_number_are_not_disambiguated(self) -> None:
+        # The second same-number entry touches a different sample with a
+        # different label change: that makes the ambiguity worse, never
+        # better.  No first/last/undone choice is allowed.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        history = self._history_on_disk()
+        history["batches"][1]["batch"] = "b1"  # b2's content under b1's number
+        self._write_history(history)
+
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #2", message)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+
+    def test_repeat_when_first_is_already_undone_is_still_corruption(self) -> None:
+        # The earlier fix's exact trap: the first entry is undone and the
+        # old code answered already-undone; the duplicate must be reported.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self._duplicate_entry("b1")
+        # The second b1 is itself still active (only the first was undone).
+        history = self._history_on_disk()
+        history["batches"][2]["undone"] = False
+        history["batches"][2]["undone_at"] = None
+        self._write_history(history)
+
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #3", message)
+        self.assertNotIn("already-undone", message)
+        # Neither label moves and the saved history (including the first
+        # entry's existing undone marker) is not rewritten.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        entries = self._history_on_disk()["batches"]
+        self.assertTrue(entries[0]["undone"])
+        self.assertIsNotNone(entries[0]["undone_at"])
+        self.assertFalse(entries[2]["undone"])
+        self.assertIsNone(entries[2]["undone_at"])
+
+    def test_three_entries_named_twice_still_single_corruption(self) -> None:
+        # Only the first two positions of the repeat are reported; the
+        # request is still refused exactly once.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._duplicate_entry("b1", adjacent=True)
+        self._duplicate_entry("b1")  # now three b1 entries
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #2", message)
+        self.assertNotIn("history position #3", message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_duplicate_under_another_number_does_not_block_target_undo(self) -> None:
+        # The uniqueness judgement concerns only the number the user
+        # asked for: another number's repeat leaves the unique target
+        # batch undoing normally.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._duplicate_entry("b2")
+
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        # The ambiguous other number is still refused itself.
+        with self.assertRaises(BatchError):
+            self.store.undo_batch("b2")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_numbers_match_as_exact_saved_strings(self) -> None:
+        # Whitespace and case are kept, so visually close entries are
+        # different numbers and each undoes its own batch.
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b1 ", (d2, "dog", "puppy"))  # trailing space
+        self.assertEqual([e["batch"] for e in self.store.history()],
+                         ["b1", "b1 "])
+        result = self.store.undo_batch("b1 ")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "dog")
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+
+    def test_unknown_number_stays_unknown_even_with_a_duplicated_number(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._duplicate_entry("b1")
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("ghost")
+        self.assertIn("unknown batch number", str(ctx.exception))
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_cli_duplicate_number_fails_cleanly_with_nonzero_exit(self) -> None:
+        d = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._duplicate_entry("b1")
+
+        rejected = subprocess.run(
+            [sys.executable, "-m", "vision_workbench", "undo",
+             str(self.root), "b1"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("Batch history is corrupted", rejected.stderr)
+        self.assertIn("b1", rejected.stderr)
+        self.assertIn("history position #1", rejected.stderr)
+        self.assertIn("history position #3", rejected.stderr)
+        self.assertNotIn("already-undone", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(self.store.lookup_label(d)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
 
 
 class BatchSplitInteractionTest(StoreHarness):

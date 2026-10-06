@@ -548,6 +548,32 @@ normal and stays legal; only a repeat inside the one target batch is an
 error. Damage in a different batch does not matter: only the target batch's
 records are examined, so a valid batch still undoes normally.
 
+A batch history is likewise corrupted when the **batch number given to
+`undo` is carried by more than one saved batch entry**. Undo addresses one
+batch by number, so that number must identify exactly one entry in the
+whole history list; a second entry with the same number makes the request
+ambiguous. The two entries are never merged, and the undo never chooses
+the first, the last, the one already marked undone or the one that could
+still be undone — identical content is still a duplicate, and entries that
+touch different samples, record different label changes or carry different
+undo states are duplicates too. Numbers are compared as the exact saved
+strings, so surrounding whitespace and case stay significant (`"b1"` and
+`" B1 "` are different numbers). The whole history list is scanned in
+order: the repeat may sit right next to the first entry or behind other,
+legal batches, and a perfectly restorable first occurrence can never mask
+a repeat further down. The error names the requested batch number and the
+two 1-based positions of the first occurrence and the one that repeats
+it, counted across the whole history list (the first two positions, even
+if the number occurs three times). As with the other integrity damage,
+the command exits non-zero with nothing on standard output and no
+traceback, changes no sample label or label revision, rewrites neither the
+registration list nor the batch history, adds no undo marker or undo time,
+and is reported even when the first occurrence is already marked undone
+rather than as `already-undone`. This check concerns only the number
+asked for: another number appearing twice does not stop a unique, valid
+target batch from undoing normally, and an absent number keeps its usual
+unknown-batch error.
+
 Imports, batch writes and undos are crash-safe: a write-ahead journal
 installs the manifest and the history together, so after an interruption
 the workspace shows either the old state or the complete new state with

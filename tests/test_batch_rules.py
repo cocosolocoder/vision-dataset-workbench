@@ -7,6 +7,7 @@ reject a submission can be tested independently of the workspace save.
 
 from __future__ import annotations
 
+import copy
 import unittest
 
 from vision_workbench.batches import (
@@ -17,6 +18,7 @@ from vision_workbench.batches import (
     describe_history_change_problem,
     describe_history_revision_problem,
     describe_missing_history_labels,
+    find_unique_history_entry,
     history_labels_equal,
     no_changes_result,
     normalize_label,
@@ -431,6 +433,106 @@ class HistoryRecordUniquenessValidationTest(unittest.TestCase):
                 )
             )
         self.assertIn("'renumber-9'", str(ctx.exception))
+
+
+class HistoryEntryNumberUniquenessTest(unittest.TestCase):
+    def entry(
+        self, number: str = "b1", *, undone: bool = False, digest: str = "d"
+    ) -> dict:
+        return {
+            "batch": number,
+            "records": [
+                {"sha256": digest, "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1}
+            ],
+            "changed_count": 1,
+            "undone": undone,
+            "undone_at": "2024-01-01T00:00:00+00:00" if undone else None,
+        }
+
+    def test_unique_number_returns_that_entry(self) -> None:
+        one = self.entry("b1")
+        two = self.entry("b2")
+        self.assertIs(
+            find_unique_history_entry("b1", [one, two]), one
+        )
+
+    def test_absent_number_returns_none(self) -> None:
+        self.assertIsNone(
+            find_unique_history_entry("ghost", [self.entry("b1")])
+        )
+        self.assertIsNone(find_unique_history_entry("b1", []))
+
+    def test_adjacent_identical_entries_are_corruption(self) -> None:
+        # Two byte-for-byte entries with the same number are just as
+        # ambiguous as two different ones: never merge, never pick one.
+        one = self.entry("b1")
+        two = copy.deepcopy(one)
+        with self.assertRaises(BatchError) as ctx:
+            find_unique_history_entry("b1", [one, two])
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #2", message)
+
+    def test_repeat_separated_by_other_batches_names_both_positions(self) -> None:
+        # The second occurrence may sit behind other, legal batches; the
+        # whole list is scanned and positions count across the whole list.
+        entries = [self.entry("b1"), self.entry("b2"), self.entry("b3", digest="e")]
+        entries.append(copy.deepcopy(entries[0]))
+        with self.assertRaises(BatchError) as ctx:
+            find_unique_history_entry("b1", entries)
+        message = str(ctx.exception)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #4", message)
+
+    def test_different_content_under_same_number_is_corruption(self) -> None:
+        # Different samples and different undo states do not disambiguate.
+        one = self.entry("b1", digest="d1")
+        two = self.entry("b1", digest="d2", undone=True)
+        with self.assertRaises(BatchError):
+            find_unique_history_entry("b1", [one, two])
+
+    def test_first_already_undone_still_reports_ambiguity(self) -> None:
+        # An undone first occurrence must not be answered "already-undone";
+        # the later repeat is corruption reported first.
+        one = self.entry("b1", undone=True)
+        two = copy.deepcopy(one)
+        two["undone"] = False
+        two["undone_at"] = None
+        with self.assertRaises(BatchError) as ctx:
+            find_unique_history_entry("b1", [one, two])
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertNotIn("already-undone", message)
+
+    def test_only_the_target_number_matters(self) -> None:
+        # A repeat under a different number neither matches nor blocks the
+        # unique, legal target.
+        repeated = self.entry("other")
+        target = self.entry("b1", digest="z")
+        entries = [repeated, copy.deepcopy(repeated), target]
+        self.assertIs(find_unique_history_entry("b1", entries), target)
+
+    def test_number_compared_as_exact_saved_string(self) -> None:
+        # Surrounding whitespace and case stay significant: a near
+        # duplicate with different text is a different number.
+        one = self.entry("b1")
+        other = self.entry(" B1 ")
+        self.assertIs(find_unique_history_entry("b1", [one, other]), one)
+        self.assertIs(find_unique_history_entry(" B1 ", [one, other]), other)
+
+    def test_three_occurrences_name_only_first_two_positions(self) -> None:
+        entries = [self.entry("b1")]
+        entries.append(copy.deepcopy(entries[0]))
+        entries.append(copy.deepcopy(entries[0]))
+        with self.assertRaises(BatchError) as ctx:
+            find_unique_history_entry("b1", entries)
+        message = str(ctx.exception)
+        self.assertIn("history position #1", message)
+        self.assertIn("history position #2", message)
+        self.assertNotIn("history position #3", message)
 
 
 class HistoryChangeFlagValidationTest(unittest.TestCase):

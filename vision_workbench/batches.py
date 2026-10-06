@@ -557,6 +557,54 @@ def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
             )
 
 
+def find_unique_history_entry(
+    number: str, batches: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Return the single history entry carrying ``number``, or ``None``.
+
+    Undo addresses one batch by number, so the requested number must
+    identify exactly one entry in the whole history list.  A second entry
+    carrying the same number is batch-history corruption — never a signal
+    to pick the first, the last, the undone or the still-active one, and
+    never something to merge: which record should undo restore from, and
+    which one should receive the undo marker?  The decision ignores
+    everything but the number itself: two byte-for-byte identical entries
+    are just as ambiguous as two that touch different samples, record
+    different label changes or carry different undo states.
+
+    Numbers are compared as the exact saved strings: no surrounding
+    whitespace is stripped and case is kept, so ``"b1"`` and ``" B1 "``
+    are different numbers.  The whole list is scanned in order, so a
+    restorable first occurrence can never mask a repeat further down
+    (adjacent or separated by other, legal batches).  On a repeat the
+    error names the requested number and the 1-based positions of the
+    first occurrence and the one that repeats it, counted across the
+    whole history list, and nothing is repaired or rewritten.
+
+    Returns ``None`` when the number is absent; the caller keeps the
+    existing unknown-batch error.  This is a history-list check, not a
+    target-entry check, so it runs before the per-entry integrity passes
+    and before the already-undone short-circuit: a first occurrence
+    already marked undone still surfaces the ambiguity instead of an
+    ``already-undone`` answer.
+    """
+    first_position: int | None = None
+    entry: dict[str, Any] | None = None
+    for position, candidate in enumerate(batches, start=1):
+        if candidate.get("batch") != number:
+            continue
+        if first_position is None:
+            first_position = position
+            entry = candidate
+            continue
+        raise BatchError(
+            f"Batch history is corrupted: batch number {number!r} appears "
+            f"more than once, at history position #{first_position} and "
+            f"history position #{position}"
+        )
+    return entry
+
+
 def empty_history() -> dict[str, Any]:
     return {"schema_version": BATCH_SCHEMA_VERSION, "batches": []}
 
