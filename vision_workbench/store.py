@@ -30,6 +30,7 @@ from .batches import (
     require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
+    require_unique_history_number,
     resolve_re_submission,
     result_payload,
     validate_history,
@@ -750,16 +751,21 @@ class DatasetStore:
 
         1. **Unknown samples** — every named digest must be registered; the
            first unknown one rejects the batch with nothing written.
-        2. **Number identity** — a batch number already in history is
-           refused outright when that history batch is damaged: it may
-           list each sample at most once (a repeated full SHA-256 digest,
-           however the copies differ, is corruption), and every one of
-           its records must explicitly save both the before (``old``)
-           and after (``new``) label (an explicit ``null``/``""`` counts
-           as saved).  The refusals come before either verdict below.
-           An intact known number then replays the first submission's
-           result (same content) or conflicts (different content);
-           neither touches the manifest.
+        2. **Number identity** — the submitted number must identify at
+           most one entry in the full history list.  A second entry
+           carrying that same number, whether adjacent to the first or
+           separated by other batches, is refused outright as damaged
+           history: identical content, different samples, different
+           changes or an already-undone first occurrence never select a
+           winner.  The unique matching history batch is then itself
+           refused when damaged: it may list each sample at most once (a
+           repeated full SHA-256 digest, however the copies differ, is
+           corruption), and every one of its records must explicitly
+           save both the before (``old``) and after (``new``) label (an
+           explicit ``null``/``""`` counts as saved).  These refusals
+           come before either verdict below.  An intact known number
+           then replays the first submission's result (same content) or
+           conflicts (different content); neither touches the manifest.
         3. **Verification/classification** — each current label is read
            once: an expected-old mismatch rejects the batch, and the same
            reading decides whether that record actually changes.
@@ -785,10 +791,16 @@ class DatasetStore:
 
             # Stage 2: a known number is replayed or conflicts; a fresh
             # number proceeds without examining the current labels.
-            # resolve_re_submission first refuses a damaged same-number
-            # entry (a repeated sample digest or a record missing its
-            # saved old/new label) before it can compare or replay
-            # anything.
+            # require_unique_history_number first refuses a number that
+            # occurs on at least two entries anywhere in the full history
+            # list — adjacent or separated by other batches, identical or
+            # different, already undone or not — before this submission
+            # could be matched against a first or active entry.  Only a
+            # unique same-number entry is then handed to
+            # resolve_re_submission, which refuses a damaged one (a
+            # repeated sample digest or a record missing its saved
+            # old/new label) before it can compare or replay anything.
+            require_unique_history_number(number, history["batches"])
             existing = next(
                 (entry for entry in history["batches"] if entry["batch"] == number),
                 None,

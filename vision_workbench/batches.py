@@ -132,11 +132,14 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 # with the conditions that reject a submission, in their original order:
 #
 #   1. reject_unknown_samples  — records naming no registered sample
-#   2. resolve_re_submission   — same-number history: the existing entry
-#                                must list each sample once (corruption
-#                                refusal) and save both labels on every
-#                                record (corruption refusal), then replay
-#                                or conflict
+#   2. resolve_re_submission   — same-number history: the number must
+#                                identify one entry in the full history
+#                                list (require_unique_history_number
+#                                refusal), the existing entry must list
+#                                each sample once (corruption refusal)
+#                                and save both labels on every record
+#                                (corruption refusal), then replay or
+#                                conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -357,7 +360,11 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # Re-submission (``resolve_re_submission``) reuses the two checks that
 # verdict needs, in the same order: duplicate digests, then labels, both
 # running before the same-content replay / different-content conflict
-# decision.
+# decision.  Those are per-entry checks; the coarser
+# ``require_unique_history_number`` check — that the submitted number
+# identifies one entry at all in the full history list — is shared with
+# undo and runs on the submit path even earlier, before the entry is
+# selected (see ``find_unique_history_entry`` below).
 # ---------------------------------------------------------------------------
 
 
@@ -583,6 +590,56 @@ def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
             )
 
 
+def history_number_positions(
+    number: str, batches: Sequence[Mapping[str, Any]]
+) -> list[int]:
+    """1-based positions of every history entry whose number is ``number``.
+
+    Matching is on the batch number's saved raw string — no trimming of
+    surrounding whitespace and no case folding — so ``"b1"``, ``"B1"``
+    and ``" b1"`` never meet.  The whole list is scanned rather than
+    stopping at the first hit, since callers must tell a unique number
+    from a repeated one.
+    """
+    return [
+        position
+        for position, entry in enumerate(batches, start=1)
+        if isinstance(entry, Mapping) and entry.get("batch") == number
+    ]
+
+
+def require_unique_history_number(
+    number: str, batches: Sequence[Mapping[str, Any]]
+) -> None:
+    """Reject a number appearing on at least two full-history entries.
+
+    Both re-submission and undo must resolve a batch number to exactly
+    one history entry.  A second entry carrying the same number makes the
+    number ambiguous no matter what the two entries contain — identical
+    record content, different samples, different label changes or
+    differing undo states are all refusal, never a reason to pick the
+    first, the last or the still-active one, and never something to
+    merge, renumber or de-duplicate.  Whether the entries sit next to
+    each other or have other batches between them is irrelevant.
+
+    On a repeat the error names the user-given batch number and the two
+    1-based positions of the first and second occurrence in the full
+    history list; with three or more occurrences only the first two are
+    named.  Nothing is repaired.  Callers must run this before any
+    same-number verdict (a same-content replay or a different-content
+    conflict) and before the already-undone short-circuit: the entries'
+    content and undo state can never disambiguate the number, and an
+    entry already marked undone leaves it just as ambiguous.
+    """
+    positions = history_number_positions(number, batches)
+    if len(positions) >= 2:
+        raise BatchError(
+            "Batch history is corrupted: batch number "
+            f"{number!r} appears more than once, at batch #{positions[0]} "
+            f"and batch #{positions[1]}"
+        )
+
+
 def find_unique_history_entry(
     number: str, batches: Sequence[Mapping[str, Any]]
 ) -> Mapping[str, Any] | None:
@@ -607,19 +664,12 @@ def find_unique_history_entry(
     already-undone short-circuit: even an entry already marked undone
     leaves the number ambiguous and must surface this instead.
     """
-    positions = [
-        position
-        for position, entry in enumerate(batches, start=1)
-        if isinstance(entry, Mapping) and entry.get("batch") == number
-    ]
+    positions = history_number_positions(number, batches)
     if not positions:
         return None
-    if len(positions) >= 2:
-        raise BatchError(
-            "Batch history is corrupted: batch number "
-            f"{number!r} appears more than once, at batch #{positions[0]} "
-            f"and batch #{positions[1]}"
-        )
+    # Delegate the refusal (and its wording) so submit and undo can never
+    # disagree; the positions are already known to number at least one.
+    require_unique_history_number(number, batches)
     return batches[positions[0] - 1]
 
 

@@ -26,6 +26,7 @@ from vision_workbench.batches import (
     require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
+    require_unique_history_number,
     resolve_re_submission,
     result_payload,
     verify_records,
@@ -412,6 +413,104 @@ class ReSubmissionDuplicateRecordTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "already-applied")
         self.assertEqual(result["changed"], 2)
+
+
+class RequireUniqueHistoryNumberTest(unittest.TestCase):
+    """The full-history number-uniqueness refusal shared by submit/undo."""
+
+    def entry(self, number: str = "b1", **overrides) -> dict:
+        value = {
+            "batch": number,
+            "records": [
+                {"sha256": "d1", "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1}
+            ],
+            "changed_count": 1,
+            "undone": False,
+            "undone_at": None,
+        }
+        value.update(overrides)
+        return value
+
+    def test_absent_and_unique_numbers_pass(self) -> None:
+        require_unique_history_number("b1", [])  # empty history
+        require_unique_history_number("b1", [self.entry("b0")])
+        require_unique_history_number(
+            "b1", [self.entry("b0"), self.entry("b2")]
+        )
+
+    def test_adjacent_identical_entries_are_refused(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b1", [self.entry(), self.entry()])
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("batch #1", message)
+        self.assertIn("batch #2", message)
+
+    def test_entries_separated_by_other_batches_name_real_positions(self) -> None:
+        batches = [
+            self.entry("b1"),
+            self.entry("b2"),
+            self.entry("b1"),
+            self.entry("b3"),
+        ]
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b1", batches)
+        message = str(ctx.exception)
+        self.assertIn("batch #1", message)
+        self.assertIn("batch #3", message)
+        self.assertNotIn("batch #2", message)
+        self.assertNotIn("batch #4", message)
+
+    def test_different_content_never_disambiguates(self) -> None:
+        second = self.entry(
+            records=[{"sha256": "d2", "old": "dog", "new": "fish",
+                      "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b1", [self.entry(), second])
+        self.assertIn("appears more than once", str(ctx.exception))
+
+    def test_differing_undo_states_are_refused_too(self) -> None:
+        undone = self.entry(undone=True, undone_at="2026-01-01T00:00:00+00:00")
+        # First already undone does not let an active second win.
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b1", [undone, self.entry()])
+        self.assertIn("appears more than once", str(ctx.exception))
+        # Neither does an active first plus an undone second.
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b1", [self.entry(), undone])
+        self.assertIn("appears more than once", str(ctx.exception))
+
+    def test_three_or_more_name_only_the_first_two_positions(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number(
+                "b1", [self.entry(), self.entry(), self.entry()]
+            )
+        message = str(ctx.exception)
+        self.assertIn("batch #1", message)
+        self.assertIn("batch #2", message)
+        self.assertNotIn("batch #3", message)
+
+    def test_numbers_match_by_exact_saved_string(self) -> None:
+        # Case and surrounding whitespace stay part of the number.
+        batches = [self.entry("b1"), self.entry("B1"), self.entry(" b1")]
+        require_unique_history_number("b1", batches)
+        require_unique_history_number("B1", batches)
+        require_unique_history_number(" b1", batches)
+        with self.assertRaises(BatchError):
+            require_unique_history_number(
+                "b1", [self.entry("b1"), self.entry("b1")]
+            )
+
+    def test_another_numbers_duplicate_does_not_block_a_unique_number(self) -> None:
+        batches = [self.entry("b2"), self.entry("b2"), self.entry("b1")]
+        require_unique_history_number("b1", batches)  # b1 is unique
+        with self.assertRaises(BatchError) as ctx:
+            require_unique_history_number("b2", batches)
+        self.assertIn("batch #1", str(ctx.exception))
+        self.assertIn("batch #2", str(ctx.exception))
 
 
 class VerifyRecordsTest(unittest.TestCase):

@@ -447,6 +447,35 @@ original result without re-modifying anything (list order and the
 changed in the meantime. The same number with different content is a
 conflict.
 
+Before either verdict, the submitted number must identify **exactly one
+entry** in the full saved history list. When the same batch number
+occurs on a second history entry — whether the two sit next to each
+other or have other, legitimate batches between them — the whole
+submission is refused as corrupted batch history, with the same rule an
+undo uses. The two entries' contents never resolve the ambiguity:
+byte-for-byte identical entries are a repeat too, and entries touching
+different samples, recording different label changes or carrying
+different undo states are refused just the same. Submission never picks
+the first occurrence, the last, the still-active one or one not yet
+undone, and the two entries are never merged, renumbered or
+de-duplicated. The refusal comes before the same-content replay and the
+different-content conflict (and before the no-change short-circuit), so
+matching one entry's content exactly never selects it, and an entry
+already marked undone surfaces the ambiguity instead of replaying. The
+error names the batch number as submitted and the 1-based positions of
+the first and second occurrence in the full history list; with three or
+more occurrences the first two positions are named. The command exits
+non-zero with nothing on standard output and no traceback, changes no
+sample label or label revision, appends no history, and deletes,
+renumbers or repairs neither entry. The full list is scanned, so a
+restorable first occurrence never masks a repeat later. Numbers are
+matched by their saved raw string exactly — surrounding whitespace and
+case are never trimmed or folded, so `"b1"`, `"B1"` and `" b1"` are
+different numbers. Only the submitted number is judged: a duplicate of
+some *other* number neither blocks a new batch number nor reuse of an
+intact, uniquely numbered batch, and this check still runs after the
+unknown-sample rejection, which keeps its precedence.
+
 Before either verdict, the saved batch with that number is checked for
 the same one-row-per-sample integrity an undo relies on: the same full
 SHA-256 digest may appear on at most one of its records. Because
@@ -506,15 +535,16 @@ the undo. Undo leaves a queryable record; repeating it reports
 ### Corrupted batch history
 
 The number an `undo` names must identify **exactly one batch** in the saved
-history list. When the same batch number occurs on a second entry — whether
-the two entries sit next to each other or have other, legitimate batches
-between them — the whole undo is refused as corrupted batch history. The two
-entries' contents never resolve the ambiguity: byte-for-byte identical
-entries are a repeat too, and entries touching different samples, recording
-different label changes or carrying different undo states are refused just
-the same. Undo never picks the first occurrence, the last, the still-active
-one or one not yet undone, and the two entries are never merged, renumbered
-or de-duplicated. The error names the batch number as given and the
+history list. (Re-submitting a batch number is held to the same rule: see
+the number-uniqueness refusal above.) When the same batch number occurs on
+a second entry — whether the two entries sit next to each other or have
+other, legitimate batches between them — the whole undo is refused as
+corrupted batch history. The two entries' contents never resolve the
+ambiguity: byte-for-byte identical entries are a repeat too, and entries
+touching different samples, recording different label changes or carrying
+different undo states are refused just the same. Undo never picks the
+first occurrence, the last, the still-active one or one not yet undone,
+and the two entries are never merged, renumbered or de-duplicated. The error names the batch number as given and the
 1-based positions of the first and second occurrence in the full history
 list; with three or more occurrences the first two positions are named. The
 command exits non-zero with nothing on standard output and no traceback,
