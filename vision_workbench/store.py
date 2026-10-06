@@ -109,6 +109,30 @@ class SplitPlanResult:
     plan: dict[str, Any]
 
 
+def _validate_import_label(label: Any) -> None:
+    """Reject a label that is neither a string nor ``None``.
+
+    Import labels are stored verbatim in the manifest, whose integrity
+    rules accept only a string or ``null`` — so an integer, decimal,
+    boolean, list, dictionary or any other object passed here would be
+    written into the registration list and make every later read report
+    the manifest as corrupted.  The argument is therefore checked before
+    any file is read, any workspace state is created or any registration
+    is committed, and the check runs even when the import would register
+    nothing (a duplicate single file, an empty directory or a directory
+    whose candidates are all already known): an invalid label is a
+    parameter error, never a successful no-op.  Numbers are not converted
+    to category names, and ``False``, ``0`` or ``[]`` are not treated as
+    "no label" — only an omitted label (``None``) means unlabeled, with
+    the empty string kept as the existing alternative spelling.
+    """
+    if label is not None and not isinstance(label, str):
+        raise ValueError(
+            f"invalid label argument: label must be a string or None, "
+            f"got {type(label).__name__} ({label!r})"
+        )
+
+
 def _is_count(value: Any) -> bool:
     """Whether ``value`` can serve as a sample or category count.
 
@@ -233,6 +257,12 @@ class DatasetStore:
                 self._read()
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
+        # The label is validated before anything else — before the
+        # workspace is initialized, the source is resolved or the digest
+        # is compared — so an invalid label fails the call even when the
+        # content is already registered, and nothing is created or
+        # written on the failure path.
+        _validate_import_label(label)
         self.initialize()
         file_path = source.resolve(strict=True)
         if not file_path.is_file():
@@ -295,7 +325,13 @@ class DatasetStore:
         symbolic link before its scan or before its candidates finish
         reading — the link target's images are never imported or even
         reported as duplicates.
+
+        The label is validated before the directory is scanned or any
+        workspace state is created, so an invalid label fails the whole
+        call — with nothing registered — even for an empty directory or
+        one whose candidates are all duplicates.
         """
+        _validate_import_label(label)
         self.initialize()
         source_path = Path(source)
         if not source_path.exists():
