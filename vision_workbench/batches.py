@@ -133,9 +133,9 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 #
 #   1. reject_unknown_samples  — records naming no registered sample
 #   2. resolve_re_submission   — same-number history: the existing entry
-#                                must save both labels on every record
-#                                (corruption refusal), then replay or
-#                                conflict
+#                                must list every sample once and save
+#                                both labels on every record (corruption
+#                                refusal), then replay or conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -176,18 +176,30 @@ def resolve_re_submission(
     changed — while different content conflicts.  Returns the replay
     result, or ``None`` when the number is free.
 
-    Content equality is judged from the labels saved in the existing
-    entry, so that entry must explicitly carry both ``old`` and ``new``
-    on every record first: a row missing either key is batch-history
-    corruption (see :func:`require_intact_history_labels`), never an
-    unlabeled label to guess, and it is reported before either the
-    replay or the conflict verdict — an entry that would otherwise
-    conflict is refused for the damage instead.  Explicitly saved
-    ``null`` and ``""`` stay ordinary unlabeled labels and take part in
-    the comparison as usual.
+    History integrity comes before either verdict, so the saved entry is
+    refused as corruption first in two ways: a full digest appearing on
+    more than one record (see :func:`require_intact_history_records`),
+    and a row missing either saved label (see
+    :func:`require_intact_history_labels`).  The duplicate check runs
+    first: a replayed result is built straight from the saved record
+    list, so a repeated sample would count one label change twice and an
+    already-applied replay could mask a batch the undo path already
+    rejects as damaged.  The digest alone decides — an exact copy, a copy
+    with different before/after labels and a copied no-op row are all
+    repeats, never records to merge or de-duplicate — and the refusal
+    precedes the replay/conflict decision, so it holds even when this
+    submission differs from the saved content or the batch has already
+    been undone.  Only after the list is one row per sample must every
+    row explicitly carry both ``old`` and ``new``: a row missing either
+    key is likewise batch-history damage, never an unlabeled label to
+    guess, and it is reported before either the replay or the conflict
+    verdict — an entry that would otherwise conflict is refused for the
+    damage instead.  Explicitly saved ``null`` and ``""`` stay ordinary
+    unlabeled labels and take part in the comparison as usual.
     """
     if existing is None:
         return None
+    require_intact_history_records(existing)
     require_intact_history_labels(existing)
     if content_key(existing["records"]) == content_key(records):
         return replay_result(existing)
@@ -347,8 +359,9 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # themselves stay separate passes and keep their original order on the
 # undo path — duplicate digests, then revisions, then labels, then
 # changed flags — each reporting its first problem in record order.
-# The label-presence check additionally guards batch re-submission
-# (``resolve_re_submission``), where it runs before the same-content
+# Re-submission (``resolve_re_submission``) reuses the two passes a
+# replay's own statistics depend on, in the same order — duplicate
+# digests, then label presence — both running before the same-content
 # replay / different-content conflict decision.
 # ---------------------------------------------------------------------------
 
@@ -389,24 +402,29 @@ def _iter_history_records(
 def require_intact_history_records(entry: Mapping[str, Any]) -> None:
     """Reject a batch entry whose records are not one row per sample.
 
-    Undo pins every stored record to a sample content digest, so a digest
-    may occur at most once in the target batch: a duplicated row — even a
-    byte-for-byte copy, or a copy of a record that never changed a label —
-    would otherwise restore the same sample more than once, bump its label
-    revision repeatedly and inflate the restored count.  Duplicates are
-    therefore batch-history corruption, never records to merge or
-    de-duplicate.  The decision is independent of the labels, the
-    before/after labels and the record's ``changed`` flag: the content
-    digest alone decides.
+    Both operations that trust a saved entry's record list pin every
+    stored record to a sample content digest, so a digest may occur at
+    most once in the target batch.  Undo would otherwise restore the
+    same sample more than once, bump its label revision repeatedly and
+    inflate the restored count; a same-number re-submission builds its
+    ``already-applied`` replay straight from that same list, so a
+    duplicated row — even a byte-for-byte copy, or a copy of a record
+    that never changed a label — would count one label change twice and
+    let a replay mask a batch the undo path already rejects as damaged.
+    Duplicates are therefore batch-history corruption, never records to
+    merge or de-duplicate.  The decision is independent of the labels,
+    the before/after labels and the record's ``changed`` flag: the
+    content digest alone decides.
 
     The whole record list is scanned, so rows preceding the repeat are
     checked too and a restorable row at the front can never mask a later
     duplicate.  On a repeat the error names the batch number, the sample's
     full digest and both 1-based record positions; nothing is repaired.
 
-    Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    Callers must run this before any success-shaped short-circuit (such
+    as an already-undone batch or a same-number replay), so corruption
+    can never be masked by a repeated-undo success or a replay, and it is
+    reported before a different-content conflict too.
     """
     seen: dict[str, int] = {}
     for position, record in _iter_history_records(entry):

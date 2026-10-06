@@ -448,30 +448,46 @@ changed in the meantime. The same number with different content is a
 conflict.
 
 Before either verdict, the saved batch with that number is checked for
-the same label-field integrity an undo relies on: every one of its
-records must explicitly carry both the before label `old` and the after
-label `new`. A record missing either key — distinguished as missing
-`old`, missing `new`, or missing both — makes the batch history
-corrupted, and the whole repeat submission is refused before it can
-return the original statistics or report a number conflict. The command
-exits non-zero with nothing on standard output and no traceback, and the
-error names the submitted batch number, the offending sample's full
-SHA-256 digest and the record's 1-based position inside that batch. Key
-presence alone decides: an explicitly saved `null` or empty string is a
-recorded unlabeled label and still takes part in same-content
-comparison, and a real class literally named `unlabeled` stays its own
-category; full labels keep their case, whitespace and Chinese text
-exactly. Every record is examined, including unchanged rows and records
-behind otherwise valid ones, so a complete record at the front never
-masks a gap later, and the damage is reported even when the repeat
-content would otherwise conflict or the batch has already been undone.
-The missing value is never reconstructed from this submission or from
-the sample's current label. On refusal nothing changes — sample labels,
-their revisions, the history records, undo markers and saved split plans
-stay as they were, no field is filled in and no new result is appended.
-Only the batch named by the submission is inspected: missing label
-fields in a *different* batch neither block a new batch number nor
-reuse of another batch's intact history.
+the same record integrity an undo relies on, in the same order.
+
+First, its records must list every sample **exactly once**: the same
+full SHA-256 digest may not appear on a second record of that batch. A
+replay rebuilds the original statistics straight from that record list,
+so a duplicated row — an exact copy, a copy carrying different
+before/after labels, or a copy of a record that never changed a label —
+would count one label change twice and return `already-applied` for a
+batch the undo path already rejects as damaged. The digest alone
+decides, regardless of the labels or the `changed` flag; records are
+never merged or de-duplicated. Every record is examined, including rows
+behind other samples, so a valid record at the front never masks a later
+repeat. The error names the submitted batch number, the duplicated
+sample's full SHA-256 digest and the two 1-based record positions (the
+first occurrence and the one that repeats it; with three or more, the
+first two).
+
+Then every remaining record must explicitly carry both the before label
+`old` and the after label `new`. A record missing either key —
+distinguished as missing `old`, missing `new`, or missing both — is
+likewise corrupted batch history. Key presence alone decides: an
+explicitly saved `null` or empty string is a recorded unlabeled label
+and still takes part in same-content comparison, and a real class
+literally named `unlabeled` stays its own category; full labels keep
+their case, whitespace and Chinese text exactly.
+
+Either refusal comes before the same-content replay and the
+different-content conflict, so damage is reported even when the repeat
+content would otherwise conflict or the batch has already been undone;
+it is never downgraded to an ordinary number conflict or a normal
+re-submission result. The command exits non-zero with nothing on
+standard output and no traceback, and no missing value is ever
+reconstructed from this submission or from the sample's current label.
+On refusal nothing changes — sample labels, their revisions, the
+history records, undo markers and saved split plans stay as they were,
+no field is filled in and no new batch record is appended. Only the
+batch named by the submission is inspected: a duplicated digest or
+missing label field in a *different* batch neither blocks a new batch
+number nor reuse of another batch's intact history, and the same sample
+taking part in two different batches over time stays legal.
 
 `history` lists successful batches in submission order: the samples
 involved, their before/after labels, and the number of samples actually

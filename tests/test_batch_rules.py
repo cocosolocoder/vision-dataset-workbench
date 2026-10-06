@@ -298,6 +298,149 @@ class ReSubmissionHistoryDamageTest(unittest.TestCase):
         self.assertIn("different content", str(ctx.exception))
 
 
+class ReSubmissionDuplicateRecordsTest(unittest.TestCase):
+    """Re-submitting a number whose saved history repeats one sample."""
+
+    def entry(self, records: list[dict], *, undone: bool = False) -> dict:
+        return {
+            "batch": "b1",
+            "records": records,
+            "changed_count": sum(1 for r in records if r.get("changed")),
+            "undone": undone,
+            "undone_at": None,
+        }
+
+    def row(self, digest: str, old="cat", new="dog", *, changed=True) -> dict:
+        return {
+            "sha256": digest,
+            "old": old,
+            "new": new,
+            "changed": changed,
+            "rev": 1 if changed else 0,
+        }
+
+    def _assert_corruption(self, error: Exception, digest: str,
+                           first: int, second: int) -> None:
+        message = str(error)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(digest, message)
+        self.assertIn(f"record #{first}", message)
+        self.assertIn(f"record #{second}", message)
+        self.assertNotIn("different content", message)
+        self.assertNotIn("already-applied", message)
+
+    def test_identical_copy_refuses_same_content_replay(self) -> None:
+        entry = self.entry([self.row("d1"), self.row("d1")])
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, 2)
+
+    def test_duplicated_unchanged_record_is_corruption_too(self) -> None:
+        # A copy of a row that never changed a label would still make the
+        # replay count it twice.
+        entry = self.entry(
+            [
+                self.row("d1", "cat", "kitten"),
+                self.row("d2", "dog", "dog", changed=False),
+                self.row("d2", "dog", "dog", changed=False),
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [record("d1", "cat", "kitten"), record("d2", "dog", "dog")],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d2", 2, 3)
+
+    def test_digest_alone_decides_even_when_copy_has_other_labels(self) -> None:
+        # The repeat carries different before/after label text; identity
+        # is the full digest alone.
+        entry = self.entry([self.row("d1"), self.row("d1", "cat", "fish")])
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, 2)
+
+    def test_repeat_behind_other_samples_keeps_whole_list_positions(self) -> None:
+        entry = self.entry(
+            [
+                self.row("d1"),
+                self.row("d2", "dog", "puppy"),
+                self.row("d3", "fish", "guppy"),
+                self.row("d1"),
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [
+                    record("d1", "cat", "dog"),
+                    record("d2", "dog", "puppy"),
+                    record("d3", "fish", "guppy"),
+                ],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d1", 1, 4)
+
+    def test_only_first_two_positions_are_named(self) -> None:
+        entry = self.entry([self.row("d1"), self.row("d1"), self.row("d1")])
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("record #2", message)
+        self.assertNotIn("record #3", message)
+
+    def test_corruption_reported_even_when_content_differs(self) -> None:
+        # The submission would ordinarily be a number conflict; the
+        # duplicate refusal must come first.
+        entry = self.entry([self.row("d1"), self.row("d1")])
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "fish")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, 2)
+
+    def test_corruption_reported_even_when_batch_was_undone(self) -> None:
+        entry = self.entry([self.row("d1"), self.row("d1")], undone=True)
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, 2)
+
+    def test_duplicate_check_precedes_the_missing_label_check(self) -> None:
+        # Both forms of damage at once: the repeat is reported first,
+        # matching the undo path's check order.
+        entry = self.entry(
+            [
+                self.row("d1"),
+                {"sha256": "d1", "new": "fish", "changed": True, "rev": 1},
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        message = str(ctx.exception)
+        self.assertIn("appears more than once", message)
+        self.assertNotIn("missing", message)
+
+    def test_distinct_samples_still_replay(self) -> None:
+        # One row per sample keeps all the ordinary replay rules.
+        entry = self.entry(
+            [
+                self.row("d1"),
+                self.row("d2", "dog", "dog", changed=False),
+            ]
+        )
+        result = resolve_re_submission(
+            "b1",
+            [record("d2", "dog", "dog"), record("d1", "cat", "dog")],
+            entry,
+        )
+        self.assertEqual(
+            result,
+            {"batch": "b1", "status": "already-applied",
+             "changed": 1, "unchanged": 1, "total": 2},
+        )
+
+
 class VerifyRecordsTest(unittest.TestCase):
     def test_mismatch_rejects_and_names_record_and_both_labels(self) -> None:
         records = [
