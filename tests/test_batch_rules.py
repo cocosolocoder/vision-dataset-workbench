@@ -14,6 +14,7 @@ from vision_workbench.batches import (
     BatchResolution,
     apply_resolutions,
     build_history_entry,
+    content_key,
     describe_history_change_problem,
     describe_history_revision_problem,
     describe_missing_history_labels,
@@ -48,6 +49,65 @@ class RejectUnknownSamplesTest(unittest.TestCase):
     def test_all_known_passes(self) -> None:
         records = [record("aaa", "cat", "dog"), record("bbb", None, "cat")]
         reject_unknown_samples(records, {"aaa", "bbb"}.__contains__)
+
+
+class ContentKeyTest(unittest.TestCase):
+    def test_order_does_not_matter(self) -> None:
+        a = [record("d1", "cat", "dog"), record("d2", None, "cat")]
+        b = [record("d2", "", "cat"), record("d1", "cat", "dog")]
+        self.assertEqual(content_key(a), content_key(b))
+
+    def test_null_and_empty_are_the_same_key(self) -> None:
+        self.assertEqual(
+            content_key([record("d1", None, None)]),
+            content_key([record("d1", "", "")]),
+        )
+        self.assertEqual(
+            content_key([record("d1", None, "cat")]),
+            content_key([record("d1", "", "cat")]),
+        )
+        self.assertEqual(
+            content_key([record("d1", "cat", None)]),
+            content_key([record("d1", "cat", "")]),
+        )
+
+    def test_history_rows_with_empty_strings_normalize(self) -> None:
+        # Stored history rows are raw dicts that may carry "" literally;
+        # they must key the same as a normalized null submission.
+        self.assertEqual(
+            content_key([{"sha256": "d1", "old": "", "new": "cat"}]),
+            content_key([record("d1", None, "cat")]),
+        )
+        self.assertEqual(
+            content_key([{"sha256": "d1", "old": "cat", "new": ""}]),
+            content_key([record("d1", "cat", None)]),
+        )
+
+    def test_sample_set_and_real_labels_must_match(self) -> None:
+        base = [record("d1", None, "cat"), record("d2", "cat", None)]
+        # Added sample.
+        self.assertNotEqual(
+            content_key(base),
+            content_key(base + [record("d3", "dog", "dog")]),
+        )
+        # Removed sample.
+        self.assertNotEqual(content_key(base), content_key([base[0]]))
+        # Real label change.
+        self.assertNotEqual(
+            content_key(base),
+            content_key([record("d1", None, "dog"), record("d2", "cat", None)]),
+        )
+
+    def test_literal_unlabeled_and_text_variants_stay_distinct(self) -> None:
+        self.assertNotEqual(
+            content_key([record("d1", "unlabeled", "cat")]),
+            content_key([record("d1", None, "cat")]),
+        )
+        for variant in ("Cat", "cat ", " a", "a\\b"):
+            self.assertNotEqual(
+                content_key([record("d1", "cat", "x")]),
+                content_key([record("d1", variant, "x")]),
+            )
 
 
 class ReSubmissionTest(unittest.TestCase):
@@ -91,6 +151,101 @@ class ReSubmissionTest(unittest.TestCase):
         )
         result = resolve_re_submission("b1", [record("d1", "", "cat")], entry)
         self.assertEqual(result["status"], "already-applied")
+
+    def test_empty_string_saved_in_history_matches_null_resubmission(self) -> None:
+        # Legacy history may legitimately have saved "" for unlabeled; a
+        # later submission using null must read as the same batch.  Covers
+        # both the before and the after label, on set, clear and no-op rows.
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": "", "new": "cat", "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "cat", "new": "", "changed": True, "rev": 1},
+                {"sha256": "d3", "old": None, "new": "", "changed": False, "rev": 0},
+            ],
+            changed_count=2,
+        )
+        result = resolve_re_submission(
+            "b1",
+            [
+                record("d3", "", None),       # unlabeled no-op, other spelling
+                record("d2", "cat", None),    # clear
+                record("d1", None, "cat"),    # set
+            ],
+            entry,
+        )
+        self.assertEqual(
+            result,
+            {"batch": "b1", "status": "already-applied",
+             "changed": 2, "unchanged": 1, "total": 3},
+        )
+
+    def test_null_saved_in_history_matches_empty_string_resubmission(self) -> None:
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": None, "new": None, "changed": False, "rev": 0},
+            ],
+            changed_count=0,
+        )
+        result = resolve_re_submission("b1", [record("d1", "", "")], entry)
+        self.assertEqual(
+            result,
+            {"batch": "b1", "status": "already-applied",
+             "changed": 0, "unchanged": 1, "total": 1},
+        )
+
+    def test_adding_or_removing_a_sample_conflicts_despite_spelling_swap(self) -> None:
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": "", "new": "cat", "changed": True, "rev": 1},
+            ],
+            changed_count=1,
+        )
+        # Same content plus one extra sample: conflict.
+        with self.assertRaises(BatchError):
+            resolve_re_submission(
+                "b1",
+                [record("d1", None, "cat"), record("d2", "cat", "cat")],
+                entry,
+            )
+        # Only a subset of the stored samples: conflict too.
+        with self.assertRaises(BatchError):
+            resolve_re_submission("b1", [], entry)
+
+    def test_literal_unlabeled_spelling_is_not_folded_into_unlabeled(self) -> None:
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": None, "new": "cat", "changed": True, "rev": 1},
+            ],
+            changed_count=1,
+        )
+        with self.assertRaises(BatchError):
+            resolve_re_submission("b1", [record("d1", "unlabeled", "cat")], entry)
+
+    def test_case_whitespace_and_separator_differences_are_real_changes(self) -> None:
+        # d1 is identical in both; only d2's old/new spelling varies, and
+        # that variation must still be a content conflict.
+        for stored, resubmitted in (
+            (("cat", "Cat"), ("Cat", "cat")),  # case
+            (("cat", "cat"), ("cat ", "cat")),  # surrounding whitespace
+            (("a/b", "a/b"), ("a\\b", "a/b")),  # path separator
+        ):
+            with self.subTest(stored=stored, resubmitted=resubmitted):
+                entry = self.entry(
+                    records=[
+                        {"sha256": "d1", "old": "cat", "new": "dog",
+                         "changed": True, "rev": 1},
+                        {"sha256": "d2", "old": stored[0], "new": stored[1],
+                         "changed": True, "rev": 1},
+                    ],
+                    changed_count=2,
+                )
+                with self.assertRaises(BatchError):
+                    resolve_re_submission(
+                        "b1",
+                        [record("d1", "cat", "dog"),
+                         record("d2", resubmitted[0], resubmitted[1])],
+                        entry,
+                    )
 
     def test_different_content_conflicts(self) -> None:
         with self.assertRaises(BatchError) as ctx:

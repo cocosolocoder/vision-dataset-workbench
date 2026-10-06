@@ -168,6 +168,152 @@ class BatchSubmitTest(StoreHarness):
         self.assertEqual([e["batch"] for e in self.store.history()], ["b1"])
         self.assertEqual(self.store.lookup_label(d)["label"], "dog")
 
+    def _save_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_resubmit_matches_empty_string_history_spelling(self) -> None:
+        d1 = self.add_sample(None)     # set: unlabeled -> cat
+        d2 = self.add_sample("cat")    # clear: cat -> unlabeled
+        d3 = self.add_sample("dog")    # no-op
+        first = self.submit(
+            "b1", (d1, None, "cat"), (d2, "cat", None), (d3, "dog", "dog")
+        )
+        self.assertEqual(first["status"], "applied")
+        self.assertEqual((first["changed"], first["unchanged"], first["total"]),
+                         (2, 1, 3))
+
+        # Simulate legacy history that saved unlabeled as "" instead of null.
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        entry = next(e for e in history["batches"] if e["batch"] == "b1")
+        for record in entry["records"]:
+            if record["sha256"] == d1:
+                record["old"] = ""
+            if record["sha256"] == d2:
+                record["new"] = ""
+        self._save_history(history)
+
+        # Reshuffled order, null spelling: still the same batch.
+        replay = self.store.submit_batch(
+            {
+                "batch": "b1",
+                "changes": [
+                    {"sha256": d3, "old": "dog", "new": "dog"},
+                    {"sha256": d2, "old": "cat", "new": None},
+                    {"sha256": d1, "old": None, "new": "cat"},
+                ],
+            }
+        )
+        self.assertEqual(replay["status"], "already-applied")
+        self.assertEqual(replay["changed"], 2)      # original counts, ...
+        self.assertEqual(replay["unchanged"], 1)    # ...not recomputed...
+        self.assertEqual(replay["total"], 3)        # ...from current labels
+
+    def test_resubmit_after_later_changes_returns_original_without_writes(self) -> None:
+        d = self.add_sample(None)
+        self.submit("b1", (d, None, "cat"))
+        # Another batch moves the sample after b1, so b1's expected old no
+        # longer matches the current label.
+        self.submit("b2", (d, "cat", "horse"))
+
+        # Legacy "" spelling in history for the original unlabeled old value.
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        entry = next(e for e in history["batches"] if e["batch"] == "b1")
+        entry["records"][0]["old"] = ""
+        self._save_history(history)
+
+        manifest_before = self.store.manifest_path.read_text(encoding="utf-8")
+        history_before = self.store.batches_path.read_text(encoding="utf-8")
+
+        replay = self.submit("b1", (d, None, "cat"))
+        self.assertEqual(replay["status"], "already-applied")
+        self.assertEqual(replay["changed"], 1)
+        # Label change from b2 is not re-applied away and rev is untouched.
+        self.assertEqual(self.store.lookup_label(d)["label"], "horse")
+        self.assertEqual(
+            self.store.manifest_path.read_text(encoding="utf-8"), manifest_before
+        )
+        # No new entry, no spelling/state rewrite of existing history.
+        self.assertEqual(
+            self.store.batches_path.read_text(encoding="utf-8"), history_before
+        )
+        self.assertEqual([e["batch"] for e in self.store.history()], ["b1", "b2"])
+
+    def test_resubmit_undone_batch_does_not_revive_it(self) -> None:
+        d1 = self.add_sample(None)
+        d2 = self.add_sample("cat")
+        self.submit("b1", (d1, None, "cat"), (d2, "cat", None))
+        self.store.undo_batch("b1")
+
+        # Rewrite history to the "" unlabeled spelling (keeping undone
+        # marker and timestamp) to mimic legacy storage.
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        entry = next(e for e in history["batches"] if e["batch"] == "b1")
+        undone_at = entry["undone_at"]
+        for record in entry["records"]:
+            if record["sha256"] == d1:
+                record["old"] = ""
+            if record["sha256"] == d2:
+                record["new"] = ""
+        self._save_history(history)
+
+        labels_before = self.manifest_labels()
+        history_before = self.store.batches_path.read_text(encoding="utf-8")
+
+        replay = self.submit(
+            "b1", (d1, None, "cat"), (d2, "cat", None)
+        )
+        self.assertEqual(replay["status"], "already-applied")
+        self.assertEqual(replay["changed"], 2)
+        # The undone batch is not re-applied: labels and revs stay put.
+        self.assertEqual(self.manifest_labels(), labels_before)
+        saved = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        b1 = next(e for e in saved["batches"] if e["batch"] == "b1")
+        self.assertTrue(b1["undone"])
+        self.assertEqual(b1["undone_at"], undone_at)
+        self.assertEqual(
+            self.store.batches_path.read_text(encoding="utf-8"), history_before
+        )
+
+    def test_resubmit_with_unlabeled_spelling_swap_still_reports_conflicts(self) -> None:
+        d1 = self.add_sample(None)
+        d2 = self.add_sample("cat")
+        d3 = self.add_sample("dog")
+        self.submit("b1", (d1, None, "cat"), (d2, "cat", None))
+
+        # Save b1's history with the "" spelling to make sure the null/""
+        # equivalence cannot mask a genuine content difference.
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        entry = next(e for e in history["batches"] if e["batch"] == "b1")
+        for record in entry["records"]:
+            if record["sha256"] == d1:
+                record["old"] = ""
+            if record["sha256"] == d2:
+                record["new"] = ""
+        self._save_history(history)
+
+        def assert_conflict(*changes: tuple) -> None:
+            with self.assertRaises(BatchError) as ctx:
+                self.submit("b1", *changes)
+            self.assertIn("already used with different content", str(ctx.exception))
+
+        # Added sample.
+        assert_conflict((d1, None, "cat"), (d2, "cat", None), (d3, "dog", "dog"))
+        # Removed sample.
+        assert_conflict((d1, None, "cat"))
+        # Real target-label change.
+        assert_conflict((d1, None, "fish"), (d2, "cat", None))
+        # Real old-label change.
+        assert_conflict((d1, "unlabeled", "cat"), (d2, "cat", None))
+        # Case / whitespace / path separator keep their meaning.
+        assert_conflict((d1, None, "Cat"), (d2, "cat", None))
+        # State untouched after every rejected attempt.
+        self.assertEqual([e["batch"] for e in self.store.history()], ["b1"])
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertIsNone(self.store.lookup_label(d2)["label"])
+
     def test_history_lists_successes_in_submission_order(self) -> None:
         d1 = self.add_sample("cat")
         d2 = self.add_sample("dog")
@@ -1482,6 +1628,92 @@ class BatchCliTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "dog")
         manifest = json.loads(self.store.manifest_path.read_text("utf-8"))
         self.assertEqual(manifest["items"][0]["rev"], 1)
+
+    def _write_batch_file(self, name: str, payload: dict) -> Path:
+        path = self.root.parent / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_cli_resubmit_with_empty_string_history_replays(self) -> None:
+        d1 = self.add_sample(None)
+        d2 = self.add_sample("cat")
+        d3 = self.add_sample("dog")
+        self._write_batch_file(
+            "b1.json",
+            {"batch": "b1", "changes": [
+                {"sha256": d1, "old": None, "new": "cat"},
+                {"sha256": d2, "old": "cat", "new": None},
+                {"sha256": d3, "old": "dog", "new": "dog"},
+            ]},
+        )
+        first = self.run_cli("batch", str(self.root), str(self.root.parent / "b1.json"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(
+            json.loads(first.stdout),
+            {"batch": "b1", "status": "applied",
+             "changed": 2, "unchanged": 1, "total": 3},
+        )
+
+        # Legacy history saved unlabeled as "".
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        for record in history["batches"][0]["records"]:
+            if record["sha256"] == d1:
+                record["old"] = ""
+            if record["sha256"] == d2:
+                record["new"] = ""
+        self.store.batches_path.write_text(json.dumps(history), encoding="utf-8")
+
+        # Resubmit with null spellings in a reshuffled order.
+        self._write_batch_file(
+            "b1-again.json",
+            {"batch": "b1", "changes": [
+                {"sha256": d3, "old": "dog", "new": "dog"},
+                {"sha256": d2, "old": "cat", "new": None},
+                {"sha256": d1, "old": None, "new": "cat"},
+            ]},
+        )
+        replay = self.run_cli(
+            "batch", str(self.root), str(self.root.parent / "b1-again.json")
+        )
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(
+            json.loads(replay.stdout),
+            {"batch": "b1", "status": "already-applied",
+             "changed": 2, "unchanged": 1, "total": 3},
+        )
+        # Labels were not re-applied.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertIsNone(self.store.lookup_label(d2)["label"])
+        self.assertEqual(len(self.store.history()), 1)
+
+    def test_cli_resubmit_real_content_conflict_fails_nonzero(self) -> None:
+        d = self.add_sample(None)
+        self._write_batch_file(
+            "b1.json",
+            {"batch": "b1", "changes": [{"sha256": d, "old": None, "new": "cat"}]},
+        )
+        first = self.run_cli("batch", str(self.root), str(self.root.parent / "b1.json"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        # "" spelling in history cannot mask a genuine target-label change.
+        history = json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+        history["batches"][0]["records"][0]["old"] = ""
+        self.store.batches_path.write_text(json.dumps(history), encoding="utf-8")
+
+        self._write_batch_file(
+            "b1-conflict.json",
+            {"batch": "b1", "changes": [{"sha256": d, "old": None, "new": "fish"}]},
+        )
+        rejected = self.run_cli(
+            "batch", str(self.root), str(self.root.parent / "b1-conflict.json")
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("already used with different content", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        # Sample and history stay as the original batch left them.
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+        self.assertEqual(len(self.store.history()), 1)
 
 
 if __name__ == "__main__":

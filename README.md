@@ -443,9 +443,16 @@ samples.
 
 Submitting the same number with the same content again returns the
 original result without re-modifying anything (list order and the
-`null`/`""` spelling do not change the content), even if labels were
-changed in the meantime. The same number with different content is a
-conflict.
+`null`/`""` spelling do not change the content — this holds whichever
+spelling the stored history itself used, so history saved with `""`
+still matches a later submission using `null`), even if labels were
+changed in the meantime. The returned `changed`/`unchanged`/`total` are
+those of the first successful submission, not recomputed from the
+current labels. Re-submitting never re-applies a batch, so it cannot
+revive a batch that was since undone. The same number with different
+content is a conflict — adding or removing a sample, or changing any
+sample's real before/after label (case, surrounding whitespace, path
+separators and the literal class `unlabeled` all keep their meaning).
 
 `history` lists successful batches in submission order: the samples
 involved, their before/after labels, and the number of samples actually
