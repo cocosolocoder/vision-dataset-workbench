@@ -132,11 +132,13 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 # with the conditions that reject a submission, in their original order:
 #
 #   1. reject_unknown_samples  — records naming no registered sample
-#   2. resolve_re_submission   — same-number history: the existing entry
-#                                must list each sample once (corruption
-#                                refusal) and save both labels on every
-#                                record (corruption refusal), then replay
-#                                or conflict
+#   2. find_unique_history_entry + resolve_re_submission — same-number
+#                                history: the number must identify exactly
+#                                one saved entry (corruption refusal),
+#                                that entry must list each sample once
+#                                (corruption refusal) and save both labels
+#                                on every record (corruption refusal),
+#                                then replay or conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -176,6 +178,12 @@ def resolve_re_submission(
     result without touching the manifest — even when samples have since
     changed — while different content conflicts.  Returns the replay
     result, or ``None`` when the number is free.
+
+    The caller resolves ``existing`` with
+    :func:`find_unique_history_entry` first, so a number carried by two
+    or more history entries has already been refused as corruption before
+    this replay/conflict decision runs — the entry passed here is always
+    the number's only one.
 
     Integrity is refused before either verdict.  The same-number entry
     must list every sample at most once (see
@@ -588,12 +596,13 @@ def find_unique_history_entry(
 ) -> Mapping[str, Any] | None:
     """Find the single history entry whose number is ``number``.
 
-    An undo target must name exactly one batch.  Matching is on the batch
+    A batch number — whether named by an undo or by a new submission —
+    must identify exactly one batch.  Matching is on the batch
     number's saved raw string — no trimming of surrounding whitespace and
     no case folding — so the whole list is scanned with exact equality
     rather than stopping at the first hit: a second entry carrying the
     same number, whether adjacent to the first or separated by other
-    batches, makes the target ambiguous.  Such a history is corrupted no
+    batches, makes the number ambiguous.  Such a history is corrupted no
     matter what the two entries contain — identical record content,
     different samples, different label changes or differing undo states
     are all refusal, never a reason to pick the first, the last or the
@@ -602,10 +611,12 @@ def find_unique_history_entry(
     Returns the unique entry, or ``None`` when the number does not occur.
     On a repeat the error names the user-given batch number and the two
     1-based positions of the conflicting entries in the full history
-    list, so neither record is undone, preferred or repaired.  Callers
-    must run this before every per-entry integrity check and before the
-    already-undone short-circuit: even an entry already marked undone
-    leaves the number ambiguous and must surface this instead.
+    list, so neither record is undone, replayed, preferred or repaired.
+    Callers must run this before every per-entry integrity check and
+    before any success-shaped short-circuit (an already-undone batch, a
+    same-content replay or a different-content conflict): even an entry
+    already marked undone leaves the number ambiguous and must surface
+    this instead.
     """
     positions = [
         position

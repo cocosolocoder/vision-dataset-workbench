@@ -447,6 +447,24 @@ original result without re-modifying anything (list order and the
 changed in the meantime. The same number with different content is a
 conflict.
 
+Before either verdict, the submitted number must identify **exactly one
+entry** in the saved history list — the same uniqueness an undo relies
+on. When the number occurs on two or more entries — byte-for-byte
+identical copies or entries with different content, adjacent or
+separated by other batches, already undone or not — the whole submission
+is refused as corrupted batch history: the command exits non-zero with
+nothing on standard output and no traceback, and the error names the
+submitted batch number and the 1-based positions of its first and second
+occurrence in the full history list (with three or more occurrences, the
+first two are named). Neither entry is picked — not the first, the last
+or the still-active one — and the two are never merged, renumbered,
+de-duplicated or repaired. Numbers are matched by their saved raw string
+exactly, so `"b1"`, `"B1"` and `" b1"` are three different numbers, and a
+duplicate of some *other* number never blocks a new number or a unique
+existing one. On refusal nothing changes: sample labels and their
+revisions, the history records and their undo markers, and saved split
+plans stay as they were, and no new history entry is appended.
+
 Before either verdict, the saved batch with that number is checked for
 the same one-row-per-sample integrity an undo relies on: the same full
 SHA-256 digest may appear on at most one of its records. Because
