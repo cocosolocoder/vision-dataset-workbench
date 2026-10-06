@@ -105,10 +105,22 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 
     Two submissions with the same number are considered the same batch
     when their record sets compare equal here: list order does not matter
-    and ``null`` vs ``""`` does not matter.
+    and ``null`` vs ``""`` does not matter.  Labels are normalized on both
+    sides before comparing, so the equality also holds across the two
+    places records come from — freshly parsed records (already normalized
+    to ``None``) and history rows loaded from disk, which may have legally
+    saved either unlabeled spelling.  Every other string is kept exactly,
+    so a real class named ``unlabeled`` never matches an unlabeled record
+    and case, surrounding whitespace, Chinese text and path separators
+    stay significant.
     """
     return frozenset(
-        (record["sha256"], record["old"], record["new"]) for record in records
+        (
+            record["sha256"],
+            normalize_label(record["old"]),
+            normalize_label(record["new"]),
+        )
+        for record in records
     )
 
 

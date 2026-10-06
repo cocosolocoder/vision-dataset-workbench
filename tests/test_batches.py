@@ -159,6 +159,91 @@ class BatchSubmitTest(StoreHarness):
         )
         self.assertEqual(replay["status"], "already-applied")
 
+    def test_replay_when_history_saved_empty_string_but_submit_uses_null(self) -> None:
+        # A legitimate batch history may have saved unlabeled as "" while a
+        # repeat submission uses null (or the other way around): the two
+        # spellings are the same state, so this must replay, not conflict.
+        d_set = self.add_sample(None)      # unlabeled -> cat (changes)
+        d_clear = self.add_sample("cat")   # cat -> unlabeled (changes)
+        d_same = self.add_sample("dog")    # dog -> dog (unchanged)
+        first = self.submit(
+            "b1",
+            (d_set, None, "cat"),
+            (d_clear, "cat", None),
+            (d_same, "dog", "dog"),
+        )
+        self.assertEqual(
+            first,
+            {"batch": "b1", "status": "applied",
+             "changed": 2, "unchanged": 1, "total": 3},
+        )
+
+        # Rewrite the committed history so every unlabeled label is saved
+        # as the empty string — a shape validate_history explicitly allows.
+        history = json.loads(
+            self.store.batches_path.read_text(encoding="utf-8")
+        )
+        for record in history["batches"][0]["records"]:
+            for key in ("old", "new"):
+                if record[key] is None:
+                    record[key] = ""
+        self.store.batches_path.write_text(
+            json.dumps(history), encoding="utf-8"
+        )
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+
+        # Resubmit with null spellings and reordered records.
+        replay = self.store.submit_batch(
+            {
+                "batch": "b1",
+                "changes": [
+                    {"sha256": d_same, "old": "dog", "new": "dog"},
+                    {"sha256": d_clear, "old": "cat", "new": None},
+                    {"sha256": d_set, "old": None, "new": "cat"},
+                ],
+            }
+        )
+        # Counts are the ORIGINAL submission's, not recomputed from current
+        # labels: the spelling change for d_same must not count as a change.
+        self.assertEqual(
+            replay,
+            {"batch": "b1", "status": "already-applied",
+             "changed": first["changed"], "unchanged": first["unchanged"],
+             "total": first["total"]},
+        )
+        # Nothing is re-applied and no history is added or rewritten.
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+
+    def test_replay_empty_string_history_undone_batch_stays_undone(self) -> None:
+        # An undone batch whose history saved "" must not come back to life
+        # when the same content is resubmitted with null.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", None))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+
+        history = json.loads(
+            self.store.batches_path.read_text(encoding="utf-8")
+        )
+        for record in history["batches"][0]["records"]:
+            for key in ("old", "new"):
+                if record[key] is None:
+                    record[key] = ""
+        self.store.batches_path.write_text(
+            json.dumps(history), encoding="utf-8"
+        )
+
+        replay = self.submit("b1", (d, "cat", ""))
+        self.assertEqual(replay["status"], "already-applied")
+        # Still restored to cat and the entry stays marked undone.
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+        entry = self.store.history()[0]
+        self.assertTrue(entry["undone"])
+        self.assertIsNotNone(entry["undone_at"])
+
     def test_same_number_different_content_conflicts(self) -> None:
         d = self.add_sample("cat")
         self.submit("b1", (d, "cat", "dog"))

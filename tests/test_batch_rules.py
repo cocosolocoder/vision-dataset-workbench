@@ -92,6 +92,46 @@ class ReSubmissionTest(unittest.TestCase):
         result = resolve_re_submission("b1", [record("d1", "", "cat")], entry)
         self.assertEqual(result["status"], "already-applied")
 
+    def test_empty_string_saved_in_history_matches_null_resubmission(self) -> None:
+        # History loaded from disk may have legally saved unlabeled as the
+        # empty string (validate_history accepts both spellings); those rows
+        # are NOT passed through normalize_label before comparison. The
+        # repeat submission parses "" back to None, in another order, and
+        # mixes a setting change with an unlabeled-to-unlabeled no-op.
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": "", "new": "cat", "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "", "new": "", "changed": False, "rev": 0},
+            ],
+            changed_count=1,
+        )
+        result = resolve_re_submission(
+            "b1",
+            [record("d2", None, None), record("d1", None, "cat")],
+            entry,
+        )
+        self.assertEqual(
+            result,
+            {"batch": "b1", "status": "already-applied",
+             "changed": 1, "unchanged": 1, "total": 2},
+        )
+
+    def test_literal_unlabeled_saved_in_history_is_distinct_state(self) -> None:
+        # Only null and "" collapse to unlabeled; a real class named
+        # "unlabeled" must never compare equal to an unlabeled record.
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": "cat", "new": "",
+                 "changed": True, "rev": 1}
+            ],
+            changed_count=1,
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1", [record("d1", "cat", "unlabeled")], entry
+            )
+        self.assertIn("already used with different content", str(ctx.exception))
+
     def test_different_content_conflicts(self) -> None:
         with self.assertRaises(BatchError) as ctx:
             resolve_re_submission(
