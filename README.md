@@ -447,6 +447,32 @@ original result without re-modifying anything (list order and the
 changed in the meantime. The same number with different content is a
 conflict.
 
+Before either verdict, the saved batch with that number is checked for
+the same label-field integrity an undo relies on: every one of its
+records must explicitly carry both the before label `old` and the after
+label `new`. A record missing either key — distinguished as missing
+`old`, missing `new`, or missing both — makes the batch history
+corrupted, and the whole repeat submission is refused before it can
+return the original statistics or report a number conflict. The command
+exits non-zero with nothing on standard output and no traceback, and the
+error names the submitted batch number, the offending sample's full
+SHA-256 digest and the record's 1-based position inside that batch. Key
+presence alone decides: an explicitly saved `null` or empty string is a
+recorded unlabeled label and still takes part in same-content
+comparison, and a real class literally named `unlabeled` stays its own
+category; full labels keep their case, whitespace and Chinese text
+exactly. Every record is examined, including unchanged rows and records
+behind otherwise valid ones, so a complete record at the front never
+masks a gap later, and the damage is reported even when the repeat
+content would otherwise conflict or the batch has already been undone.
+The missing value is never reconstructed from this submission or from
+the sample's current label. On refusal nothing changes — sample labels,
+their revisions, the history records, undo markers and saved split plans
+stay as they were, no field is filled in and no new result is appended.
+Only the batch named by the submission is inspected: missing label
+fields in a *different* batch neither block a new batch number nor
+reuse of another batch's intact history.
+
 `history` lists successful batches in submission order: the samples
 involved, their before/after labels, and the number of samples actually
 changed. Failed batches never enter history.

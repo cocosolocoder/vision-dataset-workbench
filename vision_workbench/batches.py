@@ -132,7 +132,10 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 # with the conditions that reject a submission, in their original order:
 #
 #   1. reject_unknown_samples  — records naming no registered sample
-#   2. resolve_re_submission   — same-number history: replay or conflict
+#   2. resolve_re_submission   — same-number history: the existing entry
+#                                must save both labels on every record
+#                                (corruption refusal), then replay or
+#                                conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -172,9 +175,20 @@ def resolve_re_submission(
     result without touching the manifest — even when samples have since
     changed — while different content conflicts.  Returns the replay
     result, or ``None`` when the number is free.
+
+    Content equality is judged from the labels saved in the existing
+    entry, so that entry must explicitly carry both ``old`` and ``new``
+    on every record first: a row missing either key is batch-history
+    corruption (see :func:`require_intact_history_labels`), never an
+    unlabeled label to guess, and it is reported before either the
+    replay or the conflict verdict — an entry that would otherwise
+    conflict is refused for the damage instead.  Explicitly saved
+    ``null`` and ``""`` stay ordinary unlabeled labels and take part in
+    the comparison as usual.
     """
     if existing is None:
         return None
+    require_intact_history_labels(existing)
     if content_key(existing["records"]) == content_key(records):
         return replay_result(existing)
     raise BatchError(
@@ -322,7 +336,7 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 
 
 # ---------------------------------------------------------------------------
-# Undo-time integrity checks
+# History integrity checks
 #
 # Every ``require_intact_history_*`` check scans the same record list of
 # the same target batch entry, so the shared mechanics live in two
@@ -330,9 +344,12 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # missing list or a non-object row and yields ``(position, record)``
 # pairs; ``_corruption_prefix`` and ``_record_ref`` assemble the common
 # "Batch history is corrupted: batch ..." message parts.  The checks
-# themselves stay separate passes and keep their original order —
-# duplicate digests, then revisions, then labels, then changed flags —
-# each reporting its first problem in record order.
+# themselves stay separate passes and keep their original order on the
+# undo path — duplicate digests, then revisions, then labels, then
+# changed flags — each reporting its first problem in record order.
+# The label-presence check additionally guards batch re-submission
+# (``resolve_re_submission``), where it runs before the same-content
+# replay / different-content conflict decision.
 # ---------------------------------------------------------------------------
 
 
@@ -470,8 +487,8 @@ def require_intact_history_labels(entry: Mapping[str, Any]) -> None:
     before the damage is found.
 
     Callers must run this before any success-shaped short-circuit (such
-    as an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    as an already-undone batch or a same-number replay), so corruption
+    can never be masked by a success verdict or swallowed by a conflict.
     """
     for position, record in _iter_history_records(entry):
         problem = describe_missing_history_labels(record)

@@ -149,6 +149,155 @@ class ReSubmissionTest(unittest.TestCase):
         self.assertEqual(result["status"], "already-applied")
 
 
+class ReSubmissionHistoryDamageTest(unittest.TestCase):
+    """Re-submitting a number whose saved history lacks old/new labels."""
+
+    def entry(self, records: list[dict], *, undone: bool = False) -> dict:
+        return {
+            "batch": "b1",
+            "records": records,
+            "changed_count": sum(1 for r in records if r.get("changed")),
+            "undone": undone,
+            "undone_at": None,
+        }
+
+    def _assert_corruption(self, error: Exception, digest: str, position: int,
+                           problem: str) -> None:
+        message = str(error)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(digest, message)
+        self.assertIn(f"record #{position}", message)
+        self.assertIn(problem, message)
+        self.assertNotIn("different content", message)
+
+    def test_missing_old_refused_before_replay(self) -> None:
+        # The submission content matches what the batch did; the missing
+        # field still refuses instead of replaying the original result.
+        entry = self.entry(
+            [{"sha256": "d1", "new": "dog", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "missing 'old' label")
+
+    def test_missing_new_refused_before_replay(self) -> None:
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "missing 'new' label")
+
+    def test_both_missing_is_named_as_both(self) -> None:
+        entry = self.entry(
+            [{"sha256": "d1", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(
+            ctx.exception, "d1", 1, "missing 'old' and 'new' labels"
+        )
+
+    def test_damage_on_an_unchanged_record_is_refused_too(self) -> None:
+        # Even a row the batch never changed must carry both labels.
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "dog",
+                 "changed": False, "rev": 0},
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [record("d1", "cat", "dog"), record("d2", "dog", "dog")],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d2", 2, "missing 'new' label")
+
+    def test_a_normal_record_at_the_front_never_masks_a_later_gap(self) -> None:
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "dog", "new": "puppy",
+                 "changed": True, "rev": 1},
+                {"sha256": "d3", "new": "guppy",
+                 "changed": True, "rev": 1},
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [
+                    record("d1", "cat", "dog"),
+                    record("d2", "dog", "puppy"),
+                    record("d3", "fish", "guppy"),
+                ],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d3", 3, "missing 'old' label")
+
+    def test_damage_is_reported_even_when_content_would_conflict(self) -> None:
+        # Different content would ordinarily be a number conflict; the
+        # integrity refusal must come first.
+        entry = self.entry(
+            [{"sha256": "d1", "new": "dog", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "fish")], entry)
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("d1", message)
+        self.assertNotIn("different content", message)
+
+    def test_damage_is_reported_even_when_the_batch_was_undone(self) -> None:
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "changed": True, "rev": 1}],
+            undone=True,
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "missing 'new' label")
+
+    def test_explicit_null_and_empty_string_still_replay(self) -> None:
+        # Explicitly saved null/"" are recorded unlabeled labels, not
+        # missing fields, so same-content submission keeps replaying.
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": None, "new": "cat",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "", "new": "",
+                 "changed": False, "rev": 0},
+            ]
+        )
+        result = resolve_re_submission(
+            "b1",
+            [record("d2", None, None), record("d1", "", "cat")],
+            entry,
+        )
+        self.assertEqual(result["status"], "already-applied")
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(result["unchanged"], 1)
+
+    def test_literal_unlabeled_class_keeps_replay_rules(self) -> None:
+        entry = self.entry(
+            [{"sha256": "d1", "old": "unlabeled", "new": "cat",
+              "changed": True, "rev": 1}]
+        )
+        self.assertEqual(
+            resolve_re_submission(
+                "b1", [record("d1", "unlabeled", "cat")], entry
+            )["status"],
+            "already-applied",
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", None, "cat")], entry)
+        self.assertIn("different content", str(ctx.exception))
+
+
 class VerifyRecordsTest(unittest.TestCase):
     def test_mismatch_rejects_and_names_record_and_both_labels(self) -> None:
         records = [
