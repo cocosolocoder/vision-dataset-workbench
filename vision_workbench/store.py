@@ -751,10 +751,12 @@ class DatasetStore:
         1. **Unknown samples** — every named digest must be registered; the
            first unknown one rejects the batch with nothing written.
         2. **Number identity** — a batch number already in history is
-           refused outright when that history batch is damaged: every one
-           of its records must explicitly save both the before (``old``)
+           refused outright when that history batch is damaged: it may
+           list each sample at most once (a repeated full SHA-256 digest,
+           however the copies differ, is corruption), and every one of
+           its records must explicitly save both the before (``old``)
            and after (``new``) label (an explicit ``null``/``""`` counts
-           as saved), and the refusal comes before either verdict below.
+           as saved).  The refusals come before either verdict below.
            An intact known number then replays the first submission's
            result (same content) or conflicts (different content);
            neither touches the manifest.
@@ -784,8 +786,9 @@ class DatasetStore:
             # Stage 2: a known number is replayed or conflicts; a fresh
             # number proceeds without examining the current labels.
             # resolve_re_submission first refuses a damaged same-number
-            # entry (a record missing its saved old/new label) before it
-            # can compare or replay anything.
+            # entry (a repeated sample digest or a record missing its
+            # saved old/new label) before it can compare or replay
+            # anything.
             existing = next(
                 (entry for entry in history["batches"] if entry["batch"] == number),
                 None,

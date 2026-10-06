@@ -133,9 +133,10 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 #
 #   1. reject_unknown_samples  — records naming no registered sample
 #   2. resolve_re_submission   — same-number history: the existing entry
-#                                must save both labels on every record
-#                                (corruption refusal), then replay or
-#                                conflict
+#                                must list each sample once (corruption
+#                                refusal) and save both labels on every
+#                                record (corruption refusal), then replay
+#                                or conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -176,18 +177,24 @@ def resolve_re_submission(
     changed — while different content conflicts.  Returns the replay
     result, or ``None`` when the number is free.
 
-    Content equality is judged from the labels saved in the existing
-    entry, so that entry must explicitly carry both ``old`` and ``new``
-    on every record first: a row missing either key is batch-history
-    corruption (see :func:`require_intact_history_labels`), never an
-    unlabeled label to guess, and it is reported before either the
-    replay or the conflict verdict — an entry that would otherwise
-    conflict is refused for the damage instead.  Explicitly saved
-    ``null`` and ``""`` stay ordinary unlabeled labels and take part in
-    the comparison as usual.
+    Integrity is refused before either verdict.  The same-number entry
+    must list every sample at most once (see
+    :func:`require_intact_history_records`): a content digest appearing on
+    a second record is batch-history corruption, and it has to be caught
+    here because :func:`content_key` compares record *sets*, so a
+    duplicated row would otherwise collapse away and the replay would
+    count the sample's label change twice.  The entry must also
+    explicitly carry both ``old`` and ``new`` on every record first (see
+    :func:`require_intact_history_labels`): a row missing either key is
+    corruption too, never an unlabeled label to guess, and it is reported
+    before the replay or the conflict verdict — an entry that would
+    otherwise conflict is refused for the damage instead.  Explicitly
+    saved ``null`` and ``""`` stay ordinary unlabeled labels and take
+    part in the comparison as usual.
     """
     if existing is None:
         return None
+    require_intact_history_records(existing)
     require_intact_history_labels(existing)
     if content_key(existing["records"]) == content_key(records):
         return replay_result(existing)
@@ -347,9 +354,10 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # themselves stay separate passes and keep their original order on the
 # undo path — duplicate digests, then revisions, then labels, then
 # changed flags — each reporting its first problem in record order.
-# The label-presence check additionally guards batch re-submission
-# (``resolve_re_submission``), where it runs before the same-content
-# replay / different-content conflict decision.
+# Re-submission (``resolve_re_submission``) reuses the two checks that
+# verdict needs, in the same order: duplicate digests, then labels, both
+# running before the same-content replay / different-content conflict
+# decision.
 # ---------------------------------------------------------------------------
 
 
@@ -405,8 +413,9 @@ def require_intact_history_records(entry: Mapping[str, Any]) -> None:
     full digest and both 1-based record positions; nothing is repaired.
 
     Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    an already-undone batch or a same-number replay), so corruption can
+    never be masked by a repeated-undo success or by a replay whose
+    set-based content comparison would collapse the duplicate into one.
     """
     seen: dict[str, int] = {}
     for position, record in _iter_history_records(entry):
