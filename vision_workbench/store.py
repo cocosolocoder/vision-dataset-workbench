@@ -96,6 +96,31 @@ def _import_confirmation_error(
     return ValueError(f"cannot read {display}: not a regular file")
 
 
+def _validate_import_label(label: Any) -> None:
+    """Reject a non-string import label before anything is registered.
+
+    Only a string or ``None`` is accepted: numbers, booleans, lists,
+    dictionaries and every other object are refused with a plain
+    :class:`ValueError` naming the ``label`` parameter, the actual type
+    received and the allowed types — distinct from the corruption errors
+    (:class:`ManifestError` and friends) raised for unusable stored data.
+    No conversion is attempted: a number is never turned into a category
+    name, and ``False``, ``0`` or an empty list never stands for
+    "unlabeled" (only ``None`` and the empty string do).
+
+    The check runs before any file is read, any duplicate is detected or
+    any candidate is counted, so an illegal label fails the call itself —
+    even one that would otherwise have reported only duplicates or zero
+    new samples — and can never be written into the manifest, where it
+    would be judged corruption on the next read.
+    """
+    if label is not None and not isinstance(label, str):
+        raise ValueError(
+            f"invalid label argument: expected a string or None, "
+            f"got {type(label).__name__} ({label!r})"
+        )
+
+
 @dataclass(frozen=True)
 class ImportResult:
     digest: str
@@ -233,6 +258,12 @@ class DatasetStore:
                 self._read()
 
     def add(self, source: Path, label: str | None = None) -> ImportResult:
+        # The label is validated before anything else — before the source
+        # is even looked at — so an illegal label fails this call outright
+        # and can never reach the manifest, not even on a re-import of
+        # already registered content (which would otherwise report a
+        # harmless "already present" success).
+        _validate_import_label(label)
         self.initialize()
         file_path = source.resolve(strict=True)
         if not file_path.is_file():
@@ -287,15 +318,19 @@ class DatasetStore:
         empty string both mean unlabeled.
 
         The whole batch commits as one journal transaction.  The import
-        fails entirely (no new samples) when the source is missing or not
-        a directory, a directory that should be visited cannot be scanned,
+        fails entirely (no new samples) when the label is not a string or
+        ``None``, when the source is missing or not a directory, a
+        directory that should be visited cannot be scanned,
         a candidate cannot be read in full, a candidate's identity,
         size or modification time changes while it is being read, or a
         subdirectory confirmed as a real directory is replaced by a
         symbolic link before its scan or before its candidates finish
         reading — the link target's images are never imported or even
-        reported as duplicates.
+        reported as duplicates.  The label check comes first of all, so
+        an illegal label fails the call even when the directory is empty
+        or every candidate is already registered.
         """
+        _validate_import_label(label)
         self.initialize()
         source_path = Path(source)
         if not source_path.exists():
