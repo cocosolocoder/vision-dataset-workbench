@@ -573,6 +573,27 @@ normal and stays legal; only a repeat inside the one target batch is an
 error. Damage in a different batch does not matter: only the target batch's
 records are examined, so a valid batch still undoes normally.
 
+Re-submitting a number that is already in history is judged by the same
+integrity rule. Before the command decides whether the repeat can return
+the original result or is a number conflict, every record of the target
+batch — unchanged rows included, and rows behind complete ones — must
+explicitly save both `old` and `new`. A row missing either field (or both)
+is corrupted batch history: the command exits non-zero with nothing on
+standard output and no traceback, and standard error names the submitted
+batch number, the sample's full SHA-256 digest, the record's 1-based
+position inside the target batch and which of `old`/`new` (or both) is
+absent. This verdict comes before the replay/conflict decision, so it is
+reported even when the submitted content would conflict and even when the
+batch is already undone; the missing labels are never guessed from the
+submission or the sample's current label. An explicitly saved `null` or
+empty string is a recorded unlabeled label, not damage, and keeps
+participating in the same-number content comparison. Nothing is rewritten
+on refusal: sample labels and revisions, the history entries and undo
+markers, and saved split plans all stay as they were, and no new
+submission result is appended. Only the submitted number's own batch is
+examined — a different batch missing these fields never blocks a new
+number or the replay of a complete batch.
+
 Imports, batch writes and undos are crash-safe: a write-ahead journal
 installs the manifest and the history together, so after an interruption
 the workspace shows either the old state or the complete new state with

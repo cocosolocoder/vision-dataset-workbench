@@ -365,6 +365,181 @@ class BatchValidationTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "cat")
 
 
+class BatchResubmitCorruptHistoryTest(StoreHarness):
+    """Re-submitting a used number whose saved batch lacks old/new labels."""
+
+    def _history_on_disk(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def _write_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _drop_record_fields(self, number: str, index: int, *keys: str) -> None:
+        """Remove ``old``/``new`` from one saved record (history damage)."""
+        history = self._history_on_disk()
+        entry = next(e for e in history["batches"] if e["batch"] == number)
+        for key in keys:
+            del entry["records"][index][key]
+        self._write_history(history)
+
+    def test_missing_old_rejects_resubmission_and_writes_nothing(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._drop_record_fields("b1", 0, "old")
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d, "cat", "dog"))
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(d, message)
+        self.assertIn("record #1", message)
+        self.assertIn("missing 'old' label", message)
+
+        # Nothing is replayed, re-applied, repaired or appended.
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+
+    def test_missing_new_is_named(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._drop_record_fields("b1", 0, "new")
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d, "cat", "dog"))
+        self.assertIn("missing 'new' label", str(ctx.exception))
+
+    def test_missing_both_labels_is_named(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._drop_record_fields("b1", 0, "old", "new")
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d, "cat", "dog"))
+        self.assertIn("missing 'old' and 'new' labels", str(ctx.exception))
+
+    def test_missing_field_on_unchanged_record_is_damage_too(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        # d2 is a genuine no-op row; its labels must still be saved.
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self._drop_record_fields("b1", 1, "new")
+
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        message = str(ctx.exception)
+        self.assertIn(d2, message)
+        self.assertIn("record #2", message)
+        self.assertIn("missing 'new' label", message)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+
+    def test_front_records_never_mask_a_later_gap(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        d3 = self.add_sample("fish")
+        self.submit(
+            "b1",
+            (d1, "cat", "kitten"),
+            (d2, "dog", "puppy"),
+            (d3, "fish", "guppy"),
+        )
+        self._drop_record_fields("b1", 2, "old")
+
+        with self.assertRaises(BatchError) as ctx:
+            self.submit(
+                "b1",
+                (d1, "cat", "kitten"),
+                (d2, "dog", "puppy"),
+                (d3, "fish", "guppy"),
+            )
+        message = str(ctx.exception)
+        self.assertIn(d3, message)
+        self.assertIn("record #3", message)
+
+    def test_corruption_reported_before_a_content_conflict(self) -> None:
+        # The resubmitted content would conflict, but the damaged target
+        # batch is reported first.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._drop_record_fields("b1", 0, "old")
+
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d, "cat", "fish"))
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertNotIn("different content", message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_corruption_reported_on_an_undone_batch(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self._drop_record_fields("b1", 0, "new")
+
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b1", (d, "cat", "dog"))
+        self.assertIn("Batch history is corrupted", str(ctx.exception))
+        # The undo marker and the sample's restored label stay as they were.
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        self.assertTrue(self._history_on_disk()["batches"][0]["undone"])
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+
+    def test_damage_in_another_batch_does_not_block(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._drop_record_fields("b2", 0, "old")
+
+        # The intact batch still replays normally.
+        replay = self.submit("b1", (d1, "cat", "kitten"))
+        self.assertEqual(replay["status"], "already-applied")
+        # A fresh number still applies normally.
+        d3 = self.add_sample("fish")
+        applied = self.submit("b3", (d3, "fish", "guppy"))
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(self.store.lookup_label(d3)["label"], "guppy")
+        # The damaged number itself keeps being refused.
+        with self.assertRaises(BatchError) as ctx:
+            self.submit("b2", (d2, "dog", "puppy"))
+        self.assertIn("Batch history is corrupted", str(ctx.exception))
+
+    def test_cli_missing_label_fails_cleanly_with_nonzero_exit(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._drop_record_fields("b1", 0, "old")
+
+        batch_path = self.root.parent / "resubmit.json"
+        batch_path.write_text(
+            json.dumps(
+                {"batch": "b1", "changes": [{"sha256": d, "old": "cat", "new": "dog"}]}
+            ),
+            encoding="utf-8",
+        )
+        rejected = subprocess.run(
+            [sys.executable, "-m", "vision_workbench", "batch",
+             str(self.root), str(batch_path)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("Batch history is corrupted", rejected.stderr)
+        self.assertIn("b1", rejected.stderr)
+        self.assertIn(d, rejected.stderr)
+        self.assertIn("record #1", rejected.stderr)
+        self.assertIn("missing 'old' label", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+
 class BatchUndoTest(StoreHarness):
     def _rewrite_history_record(self, number: str, index: int, **fields: object) -> None:
         """Patch one saved history record in place (history allows both

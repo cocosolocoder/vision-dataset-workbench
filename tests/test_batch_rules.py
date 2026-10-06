@@ -148,6 +148,71 @@ class ReSubmissionTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "already-applied")
 
+    def test_missing_labels_in_history_are_corruption_not_replay(self) -> None:
+        # The stored row lacks 'old': the replay decision reads that field,
+        # so the damage must surface as corruption — never as a KeyError,
+        # a replay or a conflict.
+        entry = self.entry(
+            records=[{"sha256": "d1", "new": "dog", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("d1", message)
+        self.assertIn("record #1", message)
+        self.assertIn("missing 'old' label", message)
+
+    def test_missing_new_in_history_is_corruption(self) -> None:
+        entry = self.entry(
+            records=[{"sha256": "d1", "old": "cat", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self.assertIn("missing 'new' label", str(ctx.exception))
+
+    def test_missing_both_labels_in_history_is_corruption(self) -> None:
+        entry = self.entry(
+            records=[{"sha256": "d1", "changed": False, "rev": 0}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "cat")], entry)
+        self.assertIn("missing 'old' and 'new' labels", str(ctx.exception))
+
+    def test_corruption_beats_a_content_conflict(self) -> None:
+        # The resubmitted content differs, but the damaged target batch is
+        # reported before any conflict verdict.
+        entry = self.entry(
+            records=[{"sha256": "d1", "new": "dog", "changed": True, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "fish")], entry)
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertNotIn("different content", message)
+
+    def test_corruption_beats_replay_on_an_undone_batch(self) -> None:
+        entry = self.entry(
+            records=[{"sha256": "d1", "new": "dog", "changed": True, "rev": 1}],
+            undone=True,
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self.assertIn("Batch history is corrupted", str(ctx.exception))
+
+    def test_null_and_empty_saved_labels_are_not_damage(self) -> None:
+        # Explicitly saved null/"" spellings stay legal history content and
+        # keep participating in the comparison.
+        entry = self.entry(
+            records=[
+                {"sha256": "d1", "old": None, "new": "", "changed": False, "rev": 0}
+            ],
+            changed_count=0,
+        )
+        result = resolve_re_submission("b1", [record("d1", "", None)], entry)
+        self.assertEqual(result["status"], "already-applied")
+
 
 class VerifyRecordsTest(unittest.TestCase):
     def test_mismatch_rejects_and_names_record_and_both_labels(self) -> None:

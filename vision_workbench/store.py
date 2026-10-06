@@ -750,9 +750,13 @@ class DatasetStore:
 
         1. **Unknown samples** — every named digest must be registered; the
            first unknown one rejects the batch with nothing written.
-        2. **Number identity** — a batch number already in history either
-           replays the first submission's result (same content) or is a
-           conflict (different content); neither touches the manifest.
+        2. **Number identity** — a batch number already in history first
+           has its stored records checked for intact before/after labels
+           (a missing ``old`` or ``new`` field is corrupted batch history
+           and refuses the whole submission); an intact target batch then
+           either replays the first submission's result (same content) or
+           is a conflict (different content).  None of these touches the
+           manifest.
         3. **Verification/classification** — each current label is read
            once: an expected-old mismatch rejects the batch, and the same
            reading decides whether that record actually changes.

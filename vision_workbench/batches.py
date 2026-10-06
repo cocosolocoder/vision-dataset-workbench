@@ -132,7 +132,9 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 # with the conditions that reject a submission, in their original order:
 #
 #   1. reject_unknown_samples  — records naming no registered sample
-#   2. resolve_re_submission   — same-number history: replay or conflict
+#   2. resolve_re_submission   — same-number history: the target batch's
+#                                stored labels must be intact first, then
+#                                replay or conflict
 #   3. verify_records          — one current-label pass: old-label
 #                                mismatches reject the whole batch; the
 #                                surviving resolutions also decide which
@@ -172,9 +174,18 @@ def resolve_re_submission(
     result without touching the manifest — even when samples have since
     changed — while different content conflicts.  Returns the replay
     result, or ``None`` when the number is free.
+
+    Both verdicts read the stored records' before/after labels, so the
+    target batch must explicitly save ``old`` and ``new`` on every row
+    first: a row missing either field is corrupted batch history, reported
+    before any replay or conflict verdict — even when the submitted
+    content would conflict or the batch is already undone.  An explicitly
+    saved ``null`` or empty string is a recorded unlabeled label, never
+    damage, and keeps participating in the content comparison.
     """
     if existing is None:
         return None
+    require_intact_history_labels(existing)
     if content_key(existing["records"]) == content_key(records):
         return replay_result(existing)
     raise BatchError(
