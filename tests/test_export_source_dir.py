@@ -25,6 +25,60 @@ import vision_workbench.exporter as exporter_mod
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _remove_deep_tree(root: Path) -> None:
+    """Delete a directory tree without recursive Python calls.
+
+    ``shutil.rmtree`` walks recursively and therefore fails on chains
+    deeper than Python's recursion limit; this variant keeps a stack of
+    directory descriptors and removes files at once and empty
+    directories deepest-first.  Symlinks are unlinked, never traversed.
+    A root that is already gone is treated as success.
+    """
+    if not root.exists():
+        return
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    # (parent fd or None for root, this fd, basename or None, entries)
+    stack: list = [(None, root_fd, None, os.scandir(root_fd))]
+    try:
+        while stack:
+            parent_fd, fd, name, entries = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(fd)
+                stack.pop()
+                if parent_fd is not None:
+                    os.rmdir(name, dir_fd=parent_fd)
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                try:
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=fd,
+                    )
+                except PermissionError:
+                    # A directory a test made unreadable on purpose:
+                    # restore access so the tree can be unwound.
+                    os.chmod(entry.name, 0o700, dir_fd=fd)
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=fd,
+                    )
+                stack.append(
+                    (fd, child_fd, entry.name, os.scandir(child_fd))
+                )
+            else:
+                os.unlink(entry.name, dir_fd=fd)
+    finally:
+        for parent_fd, fd, name, entries in stack:
+            entries.close()
+            os.close(fd)
+    os.rmdir(root)
+
+
 class SourceDirHarness(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -848,6 +902,251 @@ class DirectoryReplacedBySymlinkTest(SourceDirHarness):
         with zipfile.ZipFile(target) as archive:
             names = [n for n in archive.namelist() if n.endswith(".jpg")]
             self.assertEqual(archive.read(names[0]), self.CAT)
+
+
+class DeepTreeSourceDirExportTest(SourceDirHarness):
+    """Exports from directory chains deeper than Python's recursion limit."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Roots of chains deeper than Python's recursion limit; removed
+        # iteratively in tearDown because shutil.rmtree is itself
+        # recursive and cannot unwind such a tree.
+        self._deep_roots: list[Path] = []
+
+    def tearDown(self) -> None:
+        for root in self._deep_roots:
+            _remove_deep_tree(root)
+        super().tearDown()
+
+    def _make_chain(self, root: Path, depth: int, name: str = "a") -> Path:
+        """Create a ``depth``-level chain of directories without recursion.
+
+        Single-character names keep the absolute path under the platform
+        ``PATH_MAX`` even when the depth exceeds Python's recursion limit
+        (``Path.mkdir(parents=True)`` is itself recursive and cannot build
+        such a chain, so each level is made with one ``os.mkdir``).
+        """
+        directory = root
+        root.mkdir(parents=True, exist_ok=True)
+        for _ in range(depth):
+            directory = directory / name
+            os.mkdir(directory)
+        self._deep_roots.append(root)
+        return directory
+
+    def _build_moved_tree(self, depth: int) -> tuple[Path, Path, Path]:
+        """A deep chain under ``moved`` with a side branch halfway down.
+
+        Returns the tree root, the mid-chain directory carrying the
+        ``side`` subdirectory and the leaf directory at the chain's end.
+        """
+        moved = self.root.parent / "moved-deep"
+        moved.mkdir()
+        self._deep_roots.append(moved)
+        directory = moved
+        mid = moved
+        for level in range(depth):
+            directory = directory / "a"
+            os.mkdir(directory)
+            if level == depth // 2:
+                mid = directory
+        side = mid / "side"
+        os.mkdir(side)
+        return moved, side, directory
+
+    def test_deep_tree_exports_every_sample_byte_identical(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        contents = {
+            "root": b"root-sample-content",
+            "mid": b"mid-side-branch-content",
+            "leaf": b"leaf-of-the-long-chain",
+        }
+        digests = {
+            where: self.add_sample(label, content)
+            for (where, content), label in zip(
+                contents.items(), ["cat", "dog", "bird"]
+            )
+        }
+        self.create_plan()
+        normal = self.root.parent / "normal.zip"
+        self.export(target=normal)
+        manifest_before = self.store.manifest_path.read_bytes()
+        plan_before = (
+            self.store.splits_directory / "baseline.json"
+        ).read_bytes()
+
+        moved, side, leaf = self._build_moved_tree(depth)
+        # Root of the new tree, no extension; mid-chain side branch,
+        # renamed with a new extension; end of the long chain, no
+        # extension.  The recorded sources are deleted, so only the
+        # moved tree can supply the bytes.
+        (moved / "root-sample").write_bytes(contents["root"])
+        (side / "renamed.data").write_bytes(contents["mid"])
+        (leaf / "leaf-sample").write_bytes(contents["leaf"])
+        for child in self.root.parent.iterdir():
+            if child.name.startswith("sample-") and child.suffix == ".jpg":
+                child.unlink()
+
+        via_dir = self.root.parent / "via-dir.zip"
+        result, target = self.export(target=via_dir, source_dir=moved)
+
+        self.assertEqual(result["exported"], 3)
+        # Depth only decides where bytes are found: the package is
+        # byte-identical to the one exported from the recorded paths.
+        self.assertEqual(normal.read_bytes(), via_dir.read_bytes())
+        with zipfile.ZipFile(target) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            by_digest = {s["sha256"]: s for s in manifest["samples"]}
+            for where, digest in digests.items():
+                entry = by_digest[digest]
+                # The package extension still comes from the recorded
+                # source, never from the moved file's name.
+                self.assertTrue(entry["path"].endswith(".jpg"))
+                self.assertEqual(
+                    archive.read(entry["path"]), contents[where]
+                )
+        # The moved locations are not written back into the records.
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            (self.store.splits_directory / "baseline.json").read_bytes(),
+            plan_before,
+        )
+
+    def test_deep_tree_sorted_first_selection_ignores_depth(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        leaf = self._make_chain(self.root.parent / "moved-order", depth)
+        moved = leaf.parents[depth - 1]
+        digest = hashlib.sha256(b"shared").hexdigest()
+        # The deep copy's relative path sorts before the shallow one.
+        deep_copy = leaf / "z-deep"
+        deep_copy.write_bytes(b"shared")
+        shallow_copy = moved / "z-shallow"
+        shallow_copy.write_bytes(b"shared")
+        resolver = _scan_source_directory(moved)
+        self.assertEqual(resolver[digest][0], deep_copy.resolve())
+        # A shallow copy whose name sorts first wins instead: the choice
+        # follows the slash-separated relative path, not the depth or
+        # the order directories were visited in.
+        shallow_copy.rename(moved / "0-shallow")
+        resolver = _scan_source_directory(moved)
+        self.assertEqual(resolver[digest][0], (moved / "0-shallow").resolve())
+
+    def test_deep_unreadable_directory_fails_whole_export(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        leaf = self._make_chain(self.root.parent / "moved-unreadable", depth)
+        moved = leaf.parents[depth - 1]
+        # Every sample is findable at the root of the tree...
+        (moved / "cat.jpg").write_bytes(b"abc")
+        # ...but a directory at the deep end cannot be scanned.
+        blocked = leaf / "blocked"
+        os.mkdir(blocked)
+        blocked.chmod(0)
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError) as caught:
+            self.export(target=target, source_dir=moved)
+        self.assertIn(str(blocked), str(caught.exception))
+        self.assertFalse(target.exists())
+        leftovers = [
+            entry.name
+            for entry in self.root.parent.iterdir()
+            if entry.name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_deep_unreadable_file_fails_whole_export(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        leaf = self._make_chain(self.root.parent / "moved-badfile", depth)
+        moved = leaf.parents[depth - 1]
+        (moved / "cat.jpg").write_bytes(b"abc")
+        bad = leaf / "unreadable"
+        bad.write_bytes(b"xyz")
+        bad.chmod(0)
+        target = self.root.parent / "out.zip"
+        with self.assertRaises(ExportError) as caught:
+            self.export(target=target, source_dir=moved)
+        self.assertIn(str(bad), str(caught.exception))
+        self.assertFalse(target.exists())
+
+    def test_deep_directory_swapped_after_scan_fails_export(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        moved, side, leaf = self._build_moved_tree(depth)
+        (leaf / "cat.jpg").write_bytes(b"abc")
+        # A confirmed directory halfway down the chain, replaced by a
+        # symlink (pointing at the moved original, so even the content
+        # behind the link is unchanged) after the lookup finished.
+        victim = side.parent
+        moved_away = victim.with_name("victim-moved")
+
+        real_scan = exporter_mod._scan_source_directory
+
+        def scan_wrap(root):
+            resolver = real_scan(root)
+            os.rename(victim, moved_away)
+            victim.symlink_to(moved_away)
+            return resolver
+
+        target = self.root.parent / "out.zip"
+        with patch.object(
+            exporter_mod, "_scan_source_directory", side_effect=scan_wrap
+        ):
+            with self.assertRaises(ExportError) as caught:
+                self.export(target=target, source_dir=moved)
+        message = str(caught.exception)
+        self.assertIn(str(victim), message)
+        self.assertIn("symlink", message)
+        self.assertFalse(target.exists())
+
+    def test_empty_and_fully_skipped_plans_never_scan_deep_content(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        self.create_plan("empty")  # no samples registered yet
+        self.add_sample(None, b"unlabeled")
+        self.create_plan()
+        leaf = self._make_chain(self.root.parent / "moved-skipped", depth)
+        moved = leaf.parents[depth - 1]
+        # Deep and unreadable content must not matter when nothing has
+        # to be exported.
+        blocked = leaf / "blocked"
+        os.mkdir(blocked)
+        blocked.chmod(0)
+        result, target = self.export("empty", source_dir=moved)
+        self.assertEqual(result["exported"], 0)
+        self.assertTrue(target.exists())
+        skipped_target = self.root.parent / "skipped.zip"
+        result, _ = self.export(
+            skip_unlabeled=True, source_dir=moved, target=skipped_target
+        )
+        self.assertEqual(result["exported"], 0)
+        self.assertEqual(
+            result["skipped"], {"train": 1, "validation": 0, "test": 0}
+        )
+        self.assertTrue(skipped_target.exists())
+
+    def test_cli_deep_unreadable_directory_fails_nonzero_quietly(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        self.add_sample("cat", b"abc")
+        self.create_plan()
+        leaf = self._make_chain(self.root.parent / "moved-cli", depth)
+        moved = leaf.parents[depth - 1]
+        (moved / "cat.jpg").write_bytes(b"abc")
+        blocked = leaf / "blocked"
+        os.mkdir(blocked)
+        blocked.chmod(0)
+        target = self.root.parent / "cli.zip"
+        result = self.run_cli(
+            "export", str(self.root), "baseline", str(target),
+            "--source-dir", str(moved),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(blocked), result.stderr)
+        self.assertFalse(target.exists())
 
 
 class SourceDirCliTest(SourceDirHarness):

@@ -58,7 +58,10 @@ confirmed real during the walk that is a symlink by the time it is
 entered — whether the link points outside the tree, inside it, or at
 the moved original — fails the whole export naming that path and the
 symlink; the same applies to a swap landing while its children are
-being processed.
+being processed.  The descent runs on an explicit stack rather than
+Python calls, so a tree deeper than the interpreter's recursion limit
+is scanned and re-verified in full instead of aborting partway with a
+``RecursionError``.
 
 The protection extends to the package copy that follows the lookup.
 Before each matched file is opened its ancestor directories are
@@ -417,7 +420,7 @@ def _scan_source_directory(root: Path) -> Resolver:
 
     The directory and all its subdirectories are searched for regular
     files only: there is no extension filter, symlinks and other
-    non-regular entries are skipped, and recursion never descends through
+    non-regular entries are skipped, and the walk never descends through
     symlinked directories.  Every regular file found is read in full and
     identified by its content digest; when several files share content,
     the one whose slash-separated path relative to ``root`` sorts first
@@ -465,7 +468,7 @@ def _scan_tree(root_fd: int, root: Path) -> _ScanResult:
     except OSError as error:
         raise ExportError(f"cannot scan directory {root}: {error}") from error
     directories[""] = (root, root_status.st_dev, root_status.st_ino)
-    _walk_directory(root_fd, None, root, root, found, directories)
+    _walk_tree(root_fd, root, found, directories)
     files = {
         digest: (path, device, inode)
         for digest, (_, path, device, inode) in found.items()
@@ -473,43 +476,58 @@ def _scan_tree(root_fd: int, root: Path) -> _ScanResult:
     return _ScanResult(files, directories)
 
 
-def _walk_directory(
-    parent_fd: int,
-    name: str | None,
-    display: Path,
+def _list_directory(directory_fd: int, display: Path) -> list[str]:
+    """List one pinned directory's entry names, or fail naming the path."""
+    try:
+        return [entry.name for entry in os.scandir(directory_fd)]
+    except OSError as error:
+        raise ExportError(f"cannot scan directory {display}: {error}") from error
+
+
+def _walk_tree(
+    root_fd: int,
     root: Path,
     found: dict[str, tuple[str, Path, int, int]],
     directories: dict[str, tuple[Path, int, int]],
 ) -> None:
-    """Process one directory, anchored to a pinned descriptor.
+    """Walk the whole tree below the pinned root without Python recursion.
 
-    ``name`` is the parent-relative basename; ``None`` marks the already
-    open ``root`` whose descriptor is ``parent_fd``.  Any other
-    directory is entered through :func:`_enter_subdirectory`, which
-    pins the exact directory listed by the parent.
+    The descent runs on an explicit stack rather than Python calls: a
+    tree deeper than the interpreter's recursion limit is scanned in
+    full instead of aborting partway with a ``RecursionError``.  A frame
+    is one entered directory — the descriptor of the parent it was
+    listed from, its own pinned descriptor, its parent-relative basename
+    (``None`` for the root, whose descriptor is owned by the caller),
+    its display path and the entry names still to visit (reversed, so
+    ``pop()`` yields scan order).  A parent frame, descriptor still
+    open, stays on the stack for the whole time its subtree is
+    processed, so every directory remains pinned exactly as long as with
+    a recursive walk, at any depth.
     """
-    if name is None:
-        directory_fd = parent_fd
-        entered = False
-    else:
-        directory_fd = _enter_subdirectory(parent_fd, name, display)
-        entered = True
+    frames: list[list[Any]] = [
+        [root_fd, root_fd, None, root, _list_directory(root_fd, root)[::-1]]
+    ]
     try:
-        if entered:
-            try:
-                pinned = os.fstat(directory_fd)
-            except OSError as error:
-                raise ExportError(
-                    f"cannot scan directory {display}: {error}"
-                ) from error
-            rel = os.path.relpath(display, root).replace(os.sep, "/")
-            directories[rel] = (display, pinned.st_dev, pinned.st_ino)
-        try:
-            entries = list(os.scandir(directory_fd))
-        except OSError as error:
-            raise ExportError(f"cannot scan directory {display}: {error}") from error
-        for entry in entries:
-            child_name = entry.name
+        while frames:
+            parent_fd, directory_fd, name, display, entries = frames[-1]
+            if not entries:
+                frames.pop()
+                if name is not None:
+                    # The children are done and were all reached through
+                    # this pinned descriptor.  Re-prove the
+                    # parent-relative name still binds to this same
+                    # directory: a symlink (or anything else) swapped
+                    # onto it while the children were being processed
+                    # must fail the export even though nothing was read
+                    # through that link.
+                    try:
+                        _assert_still_same_directory(
+                            parent_fd, name, display, directory_fd
+                        )
+                    finally:
+                        os.close(directory_fd)
+                continue
+            child_name = entries.pop()
             child_display = display / child_name
             try:
                 status = os.stat(
@@ -532,28 +550,49 @@ def _walk_directory(
                 if current is None or rel < current[0]:
                     found[digest] = (rel, child_display, device, inode)
             elif stat.S_ISDIR(mode):
-                _walk_directory(
-                    directory_fd,
-                    child_name,
-                    child_display,
-                    root,
-                    found,
-                    directories,
+                child_fd = _enter_subdirectory(
+                    directory_fd, child_name, child_display
                 )
+                transferred = False
+                try:
+                    try:
+                        pinned = os.fstat(child_fd)
+                    except OSError as error:
+                        raise ExportError(
+                            f"cannot scan directory {child_display}: {error}"
+                        ) from error
+                    rel = os.path.relpath(child_display, root).replace(
+                        os.sep, "/"
+                    )
+                    directories[rel] = (
+                        child_display,
+                        pinned.st_dev,
+                        pinned.st_ino,
+                    )
+                    frames.append(
+                        [
+                            directory_fd,
+                            child_fd,
+                            child_name,
+                            child_display,
+                            _list_directory(child_fd, child_display)[::-1],
+                        ]
+                    )
+                    # The descriptor now belongs to the frame and is
+                    # closed when that frame finishes; the finally must
+                    # not close it on the successful path.
+                    transferred = True
+                finally:
+                    if not transferred:
+                        os.close(child_fd)
             # Any other entry type is skipped as before.
-        if entered:
-            # The children are done and were all reached through this
-            # pinned descriptor.  Re-prove the parent-relative name still
-            # binds to this same directory: a symlink (or anything else)
-            # swapped onto it while the children were being processed
-            # must fail the export even though nothing was read through
-            # that link.
-            _assert_still_same_directory(
-                parent_fd, name, display, directory_fd
-            )
     finally:
-        if entered:
-            os.close(directory_fd)
+        # On a failure mid-walk, close every confirmed descendant
+        # descriptor still held by an unfinished frame; the root
+        # descriptor itself is owned by the caller.
+        for frame in frames:
+            if frame[2] is not None:
+                os.close(frame[1])
 
 
 def _enter_subdirectory(parent_fd: int, name: str, display: Path) -> int:
@@ -732,7 +771,10 @@ class _SourceAnchor:
         parent/child structure opens each directory exactly once, so a
         tree of any depth costs one descent rather than one per
         directory.  Every open is an ``openat`` relative to the pinned
-        parent, so a symlink swapped in at any level is refused.
+        parent, so a symlink swapped in at any level is refused.  The
+        descent runs on an explicit stack rather than Python calls, so a
+        tree deeper than the interpreter's recursion limit is verified
+        in full instead of aborting partway with a ``RecursionError``.
         """
         self._check_root()
         children: dict[str, list[tuple[str, str]]] = {}
@@ -741,7 +783,43 @@ class _SourceAnchor:
                 continue
             parent_key, _, name = key.rpartition("/")
             children.setdefault(parent_key, []).append((name, key))
-        self._verify_children(self.root_fd, "", self.root, children)
+        # A frame is one opened directory: its descriptor, whether this
+        # traversal owns that descriptor (the root's is held by the
+        # export), the children still to verify (reversed, so pop()
+        # yields sorted order) and its display path.  Parent frames stay
+        # on the stack while their subtree is verified, so each
+        # directory is pinned for exactly as long as a recursive
+        # traversal would hold it, at any depth.
+        frames: list[tuple[int, bool, list[tuple[str, str]], Path]] = [
+            (self.root_fd, False, sorted(children.get("", ()))[::-1], self.root)
+        ]
+        try:
+            while frames:
+                descriptor, owned, pending, display = frames[-1]
+                if not pending:
+                    frames.pop()
+                    if owned:
+                        os.close(descriptor)
+                    continue
+                name, key = pending.pop()
+                child_display = display / name
+                child_fd = self._open_checked(
+                    descriptor, name, child_display, *self.directories[key][1:]
+                )
+                frames.append(
+                    (
+                        child_fd,
+                        True,
+                        sorted(children.get(key, ()))[::-1],
+                        child_display,
+                    )
+                )
+        finally:
+            # On a failure mid-check, close every descriptor this
+            # traversal still holds; the root descriptor is not ours.
+            for descriptor, owned, _, _ in frames:
+                if owned:
+                    os.close(descriptor)
 
     def _check_root(self) -> None:
         _, root_dev, root_inode = self.directories[""]
@@ -758,26 +836,6 @@ class _SourceAnchor:
             raise _directory_changed_message(
                 self.root, pinned_root.st_mode, during_scan=False
             )
-
-    def _verify_children(
-        self,
-        parent_fd: int,
-        parent_key: str,
-        display: Path,
-        children: dict[str, list[tuple[str, str]]],
-    ) -> None:
-        for name, key in sorted(children.get(parent_key, ())):
-            child_display = display / name
-            descriptor = self._open_checked(
-                parent_fd, child_display.name, child_display,
-                *self.directories[key][1:],
-            )
-            try:
-                self._verify_children(
-                    descriptor, key, child_display, children
-                )
-            finally:
-                os.close(descriptor)
 
     def _descend(self, parts: tuple[str, ...]) -> None:
         # Start from the root descriptor held open since before the
