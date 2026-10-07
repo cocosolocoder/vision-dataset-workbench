@@ -426,6 +426,13 @@ class DatasetStore:
         or during its scan fails the whole import instead of the link
         target being scanned.  The confirmed list lets the caller
         re-verify the directories once more after the candidate reads.
+
+        The walk runs on an explicit stack rather than Python call
+        frames, so a tree deeper than the interpreter recursion limit is
+        still scanned in full; each frame holds its pinned directory
+        descriptor for exactly the lifetime a recursive descent would
+        hold it, and every opened descriptor is released on exit, a
+        failure included.
         """
         rel_paths: list[str] = []
         confirmed_dirs: list[Path] = []
@@ -455,51 +462,98 @@ class DatasetStore:
                 found.append((entry.name, is_file, is_dir))
             return found
 
-        def walk(
-            directory: Path,
-            rel_prefix: str,
-            parent_fd: int,
-            entries: list[tuple[str, bool, bool]],
-        ) -> None:
-            for name, is_file, is_dir in entries:
-                if is_file:
-                    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
-                        rel_paths.append(rel_prefix + name)
-                elif is_dir:
-                    subdirectory = directory / name
-                    # Open the confirmed subdirectory through the pinned
-                    # parent with O_NOFOLLOW and scan the descriptor
-                    # itself: a symlink swapped onto the path by now fails
-                    # the whole import here, and the link target is never
-                    # scanned.
-                    try:
-                        child_fd = self._open_real_directory(
-                            name, parent_fd, subdirectory
-                        )
-                    except OSError as error:
-                        raise ValueError(
-                            f"cannot scan directory {subdirectory}: {error}"
-                        ) from error
-                    try:
-                        child_entries = classify(subdirectory, child_fd)
-                        confirmed_dirs.append(subdirectory)
-                        walk(
-                            subdirectory,
-                            rel_prefix + name + "/",
-                            child_fd,
-                            child_entries,
-                        )
-                    finally:
-                        os.close(child_fd)
-
         try:
             root_fd = self._open_real_directory(str(root), None, root)
         except OSError as error:
             raise ValueError(f"cannot scan directory {root}: {error}") from error
+
+        # One frame per directory still being scanned: its display path,
+        # slash-relative prefix, pinned descriptor, the entries classified
+        # in it, and the index of the next entry to visit.  Suspending a
+        # frame (pushing its child) keeps the parent's descriptor open
+        # until the whole subtree is done, and finishing a frame closes
+        # its descriptor at once, so the descriptors open at any moment
+        # are exactly those on the current root-to-leaf path — the same
+        # lifetime nested recursive calls give them, independent of how
+        # wide the tree is.  The explicit stack replaces a Python call
+        # frame per directory level, so trees deeper than the interpreter
+        # recursion limit are still scanned in full.
+        stack: list[
+            tuple[Path, str, int, list[tuple[str, bool, bool]], int]
+        ] = [(root, "", root_fd, classify(root, root), 0)]
         try:
-            walk(root, "", root_fd, classify(root, root))
+            while stack:
+                directory, rel_prefix, parent_fd, entries, index = stack[-1]
+                if index >= len(entries):
+                    # This subtree is fully scanned: release the pinned
+                    # descriptor exactly as a recursive walk's finally
+                    # would before returning to the parent.
+                    finished = stack.pop()
+                    try:
+                        os.close(finished[2])
+                    except OSError:
+                        pass
+                    continue
+                name, is_file, is_dir = entries[index]
+                stack[-1] = (
+                    directory,
+                    rel_prefix,
+                    parent_fd,
+                    entries,
+                    index + 1,
+                )
+                if is_file:
+                    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+                        rel_paths.append(rel_prefix + name)
+                    continue
+                if not is_dir:
+                    # Symlinks and every other non-directory entry: never
+                    # descended into, exactly as in the non-recursive
+                    # classification.
+                    continue
+                subdirectory = directory / name
+                # Open the confirmed subdirectory through the pinned
+                # parent with O_NOFOLLOW and scan the descriptor
+                # itself: a symlink swapped onto the path by now fails
+                # the whole import here, and the link target is never
+                # scanned.
+                try:
+                    child_fd = self._open_real_directory(
+                        name, parent_fd, subdirectory
+                    )
+                except OSError as error:
+                    raise ValueError(
+                        f"cannot scan directory {subdirectory}: {error}"
+                    ) from error
+                try:
+                    child_entries = classify(subdirectory, child_fd)
+                except ValueError:
+                    # The frame that owns child_fd is never pushed, so the
+                    # outer cleanup would not know to release it.
+                    try:
+                        os.close(child_fd)
+                    except OSError:
+                        pass
+                    raise
+                confirmed_dirs.append(subdirectory)
+                stack.append(
+                    (
+                        subdirectory,
+                        rel_prefix + name + "/",
+                        child_fd,
+                        child_entries,
+                        0,
+                    )
+                )
         finally:
-            os.close(root_fd)
+            # Frames still suspended when an error was raised own exactly
+            # the descriptors still open: close each once, no double
+            # close against the normal pop path above.
+            for suspended in reversed(stack):
+                try:
+                    os.close(suspended[2])
+                except OSError:
+                    pass
         # Unicode code point order on the slash-separated relative path.
         rel_paths.sort()
         return rel_paths, confirmed_dirs
