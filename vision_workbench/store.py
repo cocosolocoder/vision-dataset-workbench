@@ -43,7 +43,7 @@ from .splits import (
     assign,
     category_key,
     category_name,
-    invalid_digest_reason,
+    check_member,
     validate_name,
     validate_ratios,
 )
@@ -1295,33 +1295,34 @@ class DatasetStore:
             )
             distribution: Counter[str] = Counter()
             for position, member in enumerate(members, start=1):
-                if not isinstance(member, dict):
-                    raise SplitError(
-                        f"Split plan {data.get('name')!r} is corrupted: "
-                        f"{set_name} member {position} is not a JSON object"
-                    )
-                digest = member.get("sha256")
-                digest_problem = invalid_digest_reason(digest)
-                if digest_problem is not None:
-                    # The identity format is judged from the saved plan
-                    # alone, exactly as the manifest enforces it for
-                    # registered samples: a truncated, padded, uppercase
-                    # or non-hex spelling, an empty or missing field,
-                    # surrounding whitespace or a non-string value is
-                    # corruption, never auto-repaired.  Earlier valid
-                    # members cannot mask a later one.
-                    raise SplitError(
-                        f"Split plan {data.get('name')!r} is corrupted: "
-                        f"{set_name} member {position} has an invalid "
-                        f"'sha256' identity {digest!r}: {digest_problem}"
-                    )
-                if not isinstance(member.get("label"), str) or not isinstance(
-                    member.get("source"), str
-                ):
+                problem = check_member(member)
+                if problem is not None:
+                    if problem.kind == "not-object":
+                        raise SplitError(
+                            f"Split plan {data.get('name')!r} is corrupted: "
+                            f"{set_name} member {position} is not a JSON object"
+                        )
+                    if problem.kind == "identity":
+                        # The identity format is judged from the saved plan
+                        # alone, exactly as the manifest enforces it for
+                        # registered samples: a truncated, padded, uppercase
+                        # or non-hex spelling, an empty or missing field,
+                        # surrounding whitespace or a non-string value is
+                        # corruption, never auto-repaired.  Earlier valid
+                        # members cannot mask a later one.
+                        raise SplitError(
+                            f"Split plan {data.get('name')!r} is corrupted: "
+                            f"{set_name} member {position} has an invalid "
+                            f"'sha256' identity "
+                            f"{member.get('sha256')!r}: {problem.detail}"
+                        )
+                    # A non-string label or source: both are the same "bad
+                    # member" refusal for this entry point.
                     raise SplitError(
                         f"Split plan record has a bad member in {set_name} "
                         f"at position {position}"
                     )
+                digest = member["sha256"]
                 if digest in seen:
                     raise SplitError(
                         f"Split plan record lists {digest} in more than one set"

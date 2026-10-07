@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import math
 from fractions import Fraction
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from .identity import invalid_identity_reason
 
@@ -44,6 +44,55 @@ def invalid_digest_reason(value: Any) -> str | None:
     never normalized into acceptance.
     """
     return invalid_identity_reason(value, missing_is_null=True)
+
+
+class MemberProblem(NamedTuple):
+    """The first membership-rule violation found in one saved plan member.
+
+    ``kind`` is one of ``"not-object"`` (the member is not a JSON
+    object), ``"identity"`` (the ``sha256`` field is not a full lowercase
+    SHA-256 digest), ``"label"`` (the label is not a string) or
+    ``"source"`` (the source is not a string, or is empty where a
+    recorded path is required).  ``detail`` carries the concrete
+    :func:`invalid_digest_reason` text for an ``"identity"`` problem and
+    is ``None`` for the other kinds.
+    """
+
+    kind: str
+    detail: str | None
+
+
+def check_member(member: Any, *, require_source: bool = False) -> MemberProblem | None:
+    """Return the first membership-rule violation of ``member``, else None.
+
+    This is the single member rule every reader of a saved split plan —
+    ``split show`` and same-name ``split create`` (through
+    ``DatasetStore``) as well as ``export`` — applies to every member,
+    so the identity, label and source requirements are maintained in one
+    place and cannot drift apart between the entry points.  A member
+    must be a JSON object whose ``sha256`` is exactly 64 lowercase
+    hexadecimal characters (judged by :func:`invalid_digest_reason` from
+    the saved value alone, never normalized into acceptance), whose
+    ``label`` is a string (the empty string meaning unlabeled) and whose
+    ``source`` is a string.  ``require_source`` additionally rejects an
+    empty source string — the one difference between the readers:
+    viewing a plan accepts a member with no recorded source path, while
+    exporting one does not.
+
+    Only the saved record is inspected: the sample is never looked up in
+    the current manifest and its source file is never opened.
+    """
+    if not isinstance(member, dict):
+        return MemberProblem("not-object", None)
+    digest_problem = invalid_digest_reason(member.get("sha256"))
+    if digest_problem is not None:
+        return MemberProblem("identity", digest_problem)
+    if not isinstance(member.get("label"), str):
+        return MemberProblem("label", None)
+    source = member.get("source")
+    if not isinstance(source, str) or (require_source and not source):
+        return MemberProblem("source", None)
+    return None
 
 
 def category_key(label: Any) -> Any:

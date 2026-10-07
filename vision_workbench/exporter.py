@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any
 
 from . import confirmed
-from .splits import SET_NAMES, SplitError, invalid_digest_reason
+from .splits import SET_NAMES, MemberProblem, SplitError, check_member
 
 EXPORT_SCHEMA_VERSION = 1
 
@@ -272,37 +272,50 @@ def _collect_members(plan: dict[str, Any]) -> list[dict[str, Any]]:
     for set_name in SET_NAMES:
         payload = plan["sets"][set_name]
         for position, member in enumerate(payload["members"], start=1):
-            digest = member.get("sha256")
-            label = member.get("label")
-            source = member.get("source")
-            digest_problem = invalid_digest_reason(digest)
-            if digest_problem is not None:
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} has an invalid 'sha256' "
-                    f"identity {digest!r}: {digest_problem}"
-                )
-            if not isinstance(label, str):
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} (sha256 {digest}) has a "
-                    "non-string label"
-                )
-            if not isinstance(source, str) or not source:
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} (sha256 {digest}) has no "
-                    "recorded source path"
-                )
+            problem = check_member(member, require_source=True)
+            if problem is not None:
+                raise _member_corruption(plan, set_name, position, member, problem)
             members.append(
                 {
-                    "sha256": digest,
-                    "label": label,
-                    "source": source,
+                    "sha256": member["sha256"],
+                    "label": member["label"],
+                    "source": member["source"],
                     "set": set_name,
                 }
             )
     return members
+
+
+def _member_corruption(
+    plan: dict[str, Any],
+    set_name: str,
+    position: int,
+    member: Any,
+    problem: MemberProblem,
+) -> ExportError:
+    """Report a plan member that breaks the shared membership rule.
+
+    The identity, label and source requirements are the same ones
+    "split show" enforces (export additionally requires a recorded
+    source path on every member, even one it would skip as unlabeled);
+    only the wording is the export's own, keeping the plan name, the
+    set, the member's 1-based position and the concrete reason.
+    """
+    prefix = (
+        f"split plan {plan.get('name')!r} is corrupted: "
+        f"{set_name} member {position}"
+    )
+    if problem.kind == "not-object":
+        return ExportError(f"{prefix} is not a JSON object")
+    if problem.kind == "identity":
+        return ExportError(
+            f"{prefix} has an invalid 'sha256' identity "
+            f"{member.get('sha256')!r}: {problem.detail}"
+        )
+    digest = member["sha256"]
+    if problem.kind == "label":
+        return ExportError(f"{prefix} (sha256 {digest}) has a non-string label")
+    return ExportError(f"{prefix} (sha256 {digest}) has no recorded source path")
 
 
 class _ExportStatistics:
