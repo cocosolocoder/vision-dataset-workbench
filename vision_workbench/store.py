@@ -761,9 +761,12 @@ class DatasetStore:
            winner.  The unique matching history batch is then itself
            refused when damaged: it may list each sample at most once (a
            repeated full SHA-256 digest, however the copies differ, is
-           corruption), and every one of its records must explicitly
+           corruption), every one of its records must explicitly
            save both the before (``old``) and after (``new``) label (an
-           explicit ``null``/``""`` counts as saved).  These refusals
+           explicit ``null``/``""`` counts as saved), and every record's
+           ``changed`` flag must agree with those saved labels (differing
+           labels marked unchanged, or identical labels marked changed,
+           are corruption judged from the record itself).  These refusals
            come before either verdict below.  An intact known number
            then replays the first submission's result (same content) or
            conflicts (different content); neither touches the manifest.
@@ -799,8 +802,9 @@ class DatasetStore:
             # could be matched against a first or active entry.  Only a
             # unique same-number entry is then handed to
             # resolve_re_submission, which refuses a damaged one (a
-            # repeated sample digest or a record missing its saved
-            # old/new label) before it can compare or replay anything.
+            # repeated sample digest, a record missing its saved
+            # old/new label or a changed flag contradicting those
+            # labels) before it can compare or replay anything.
             require_unique_history_number(number, history["batches"])
             existing = next(
                 (entry for entry in history["batches"] if entry["batch"] == number),

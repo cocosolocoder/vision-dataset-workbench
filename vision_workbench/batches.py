@@ -146,8 +146,10 @@ def content_key(records: list[dict[str, Any]]) -> frozenset[tuple[str, str | Non
 #                                identify one entry in the full history
 #                                list (require_unique_history_number
 #                                refusal), the existing entry must list
-#                                each sample once (corruption refusal)
-#                                and save both labels on every record
+#                                each sample once (corruption refusal),
+#                                save both labels on every record
+#                                (corruption refusal) and carry a changed
+#                                flag that matches those labels
 #                                (corruption refusal), then replay or
 #                                conflict
 #   3. verify_records          — one current-label pass: old-label
@@ -203,12 +205,22 @@ def resolve_re_submission(
     before the replay or the conflict verdict — an entry that would
     otherwise conflict is refused for the damage instead.  Explicitly
     saved ``null`` and ``""`` stay ordinary unlabeled labels and take
-    part in the comparison as usual.
+    part in the comparison as usual.  Finally every record's ``changed``
+    flag must agree with its saved before/after labels (see
+    :func:`require_intact_history_changes`): differing labels marked
+    ``changed: false`` would replay an ``already-applied`` result that
+    counts the sample as untouched, and identical labels marked
+    ``changed: true`` would inflate the replayed change count, so both
+    are corruption — judged from the record's own stored labels, never
+    the sample's current label or this submission's labels — and refused
+    before either verdict, whether the entry is still active or already
+    undone.
     """
     if existing is None:
         return None
     require_intact_history_records(existing)
     require_intact_history_labels(existing)
+    require_intact_history_changes(existing)
     if content_key(existing["records"]) == content_key(records):
         return replay_result(existing)
     raise BatchError(
@@ -368,9 +380,10 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # undo path — digest formats, then duplicate digests, then revisions,
 # then labels, then changed flags — each reporting its first problem in
 # record order.  Re-submission (``resolve_re_submission``) reuses only
-# the two checks that verdict needs, in the same order: duplicate
-# digests, then labels, both running before the same-content replay /
-# different-content conflict decision.  Those are per-entry checks; the
+# the checks that verdict needs, in the same relative order: duplicate
+# digests, then labels, then changed flags, all running before the
+# same-content replay / different-content conflict decision.  Those are
+# per-entry checks; the
 # coarser ``require_unique_history_number`` check — that the submitted
 # number identifies one entry at all in the full history list — is
 # shared with undo and runs on the submit path even earlier, before the
@@ -668,8 +681,9 @@ def require_intact_history_changes(entry: Mapping[str, Any]) -> None:
     front can never mask a contradiction further back.
 
     Callers must run this before any success-shaped short-circuit (such as
-    an already-undone batch), so corruption can never be masked by a
-    repeated-undo success.
+    an already-undone batch or a same-number replay), so corruption can
+    never be masked by a repeated-undo success or replayed as an
+    ``already-applied`` result with a miscounted change tally.
     """
     for position, record in _iter_history_records(entry):
         problem = describe_history_change_problem(record)
