@@ -43,7 +43,7 @@ from .splits import (
     assign,
     category_key,
     category_name,
-    invalid_digest_reason,
+    check_set_member,
     validate_name,
     validate_ratios,
 )
@@ -1295,40 +1295,24 @@ class DatasetStore:
             )
             distribution: Counter[str] = Counter()
             for position, member in enumerate(members, start=1):
-                if not isinstance(member, dict):
-                    raise SplitError(
-                        f"Split plan {data.get('name')!r} is corrupted: "
-                        f"{set_name} member {position} is not a JSON object"
-                    )
-                digest = member.get("sha256")
-                digest_problem = invalid_digest_reason(digest)
-                if digest_problem is not None:
-                    # The identity format is judged from the saved plan
-                    # alone, exactly as the manifest enforces it for
-                    # registered samples: a truncated, padded, uppercase
-                    # or non-hex spelling, an empty or missing field,
-                    # surrounding whitespace or a non-string value is
-                    # corruption, never auto-repaired.  Earlier valid
-                    # members cannot mask a later one.
-                    raise SplitError(
-                        f"Split plan {data.get('name')!r} is corrupted: "
-                        f"{set_name} member {position} has an invalid "
-                        f"'sha256' identity {digest!r}: {digest_problem}"
-                    )
-                if not isinstance(member.get("label"), str) or not isinstance(
-                    member.get("source"), str
-                ):
-                    raise SplitError(
-                        f"Split plan record has a bad member in {set_name} "
-                        f"at position {position}"
-                    )
+                # The per-member rules — record shape, lowercase 64-char
+                # identity, string label and string source — are shared
+                # with export so a rule is maintained in one place; show
+                # accepts an empty source string, which export rejects.
+                digest, label, _source = check_set_member(
+                    data.get("name"),
+                    set_name,
+                    position,
+                    member,
+                    require_source=False,
+                )
                 if digest in seen:
                     raise SplitError(
                         f"Split plan record lists {digest} in more than one set"
                     )
                 seen.add(digest)
-                distribution[member["label"]] += 1
-                overall[member["label"]] += 1
+                distribution[label] += 1
+                overall[label] += 1
             set_totals[set_name] = len(members)
             set_distributions[set_name] = distribution
             if set_payload["samples"] != len(members):

@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any
 
 from . import confirmed
-from .splits import SET_NAMES, SplitError, invalid_digest_reason
+from .splits import SET_NAMES, SplitError, check_set_member
 
 EXPORT_SCHEMA_VERSION = 1
 
@@ -267,33 +267,29 @@ def export_split(
 
 
 def _collect_members(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten plan members and validate the fields export depends on."""
+    """Flatten plan members and validate the fields export depends on.
+
+    The shared member rule (record shape, lowercase 64-char identity and
+    string label) is the same one ``split show`` runs while reading the
+    plan; it is applied again here in :class:`ExportError` wording so the
+    check stays complete when members are collected from a plan directly.
+    The one export-only addition is ``require_source``: every exported
+    member, unlabeled or not, must carry a non-empty recorded source
+    path -- ``--skip-unlabeled`` can never bypass that, since the check
+    runs before any member is skipped.
+    """
     members: list[dict[str, Any]] = []
     for set_name in SET_NAMES:
         payload = plan["sets"][set_name]
         for position, member in enumerate(payload["members"], start=1):
-            digest = member.get("sha256")
-            label = member.get("label")
-            source = member.get("source")
-            digest_problem = invalid_digest_reason(digest)
-            if digest_problem is not None:
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} has an invalid 'sha256' "
-                    f"identity {digest!r}: {digest_problem}"
-                )
-            if not isinstance(label, str):
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} (sha256 {digest}) has a "
-                    "non-string label"
-                )
-            if not isinstance(source, str) or not source:
-                raise ExportError(
-                    f"split plan {plan.get('name')!r} is corrupted: "
-                    f"{set_name} member {position} (sha256 {digest}) has no "
-                    "recorded source path"
-                )
+            digest, label, source = check_set_member(
+                plan.get("name"),
+                set_name,
+                position,
+                member,
+                require_source=True,
+                error_type=ExportError,
+            )
             members.append(
                 {
                     "sha256": digest,

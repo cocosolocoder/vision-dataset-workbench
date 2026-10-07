@@ -46,6 +46,79 @@ def invalid_digest_reason(value: Any) -> str | None:
     return invalid_identity_reason(value, missing_is_null=True)
 
 
+def check_set_member(
+    plan_name: Any,
+    set_name: str,
+    position: int,
+    member: Any,
+    *,
+    require_source: bool,
+    error_type: type[ValueError] = SplitError,
+) -> tuple[str, str, str]:
+    """Validate one saved split-plan member record the shared way.
+
+    Both readers of a saved plan — ``split show`` (via the store's payload
+    validation) and ``export`` — judge every member with exactly the same
+    rules, so the rule lives here once: the record must be a JSON object;
+    its ``sha256`` must be a full lowercase identity (see
+    :func:`invalid_digest_reason` — a missing, null, empty, wrong-length,
+    uppercase, non-hexadecimal or whitespace-bearing spelling is rejected,
+    never repaired); its ``label`` must be a string (the empty string is
+    the unlabeled category); and its ``source`` must be a string.
+
+    ``require_source`` is the one entry-point difference: export copies
+    each sample from its recorded source path, so an empty source string
+    is rejected there even when the member would be skipped as unlabeled;
+    reading a plan for ``split show`` (or same-name reuse) still accepts
+    the empty string, as it always has.
+
+    On failure the error is raised in the caller's ``error_type`` with the
+    historical wording — the identity error names the plan, set, 1-based
+    position, bad value and concrete reason — so a reader that wraps the
+    store's :class:`SplitError` (export) keeps the identical text.  Returns
+    the validated ``(sha256, label, source)`` triple on success.
+    """
+    if not isinstance(member, dict):
+        raise error_type(
+            f"Split plan {plan_name!r} is corrupted: "
+            f"{set_name} member {position} is not a JSON object"
+        )
+    digest = member.get("sha256")
+    digest_problem = invalid_digest_reason(digest)
+    if digest_problem is not None:
+        # The identity format is judged from the saved plan alone,
+        # exactly as the manifest enforces it for registered samples: a
+        # truncated, padded, uppercase or non-hex spelling, an empty or
+        # missing field, surrounding whitespace or a non-string value is
+        # corruption, never auto-repaired.  Earlier valid members cannot
+        # mask a later one.
+        raise error_type(
+            f"Split plan {plan_name!r} is corrupted: "
+            f"{set_name} member {position} has an invalid 'sha256' identity "
+            f"{digest!r}: {digest_problem}"
+        )
+    label = member.get("label")
+    source = member.get("source")
+    if not isinstance(label, str) or not isinstance(source, str) or (
+        require_source and not source
+    ):
+        # A non-string label or source is structural corruption of a
+        # saved record and keeps the store's generic wording; export adds
+        # the recorded-source requirement (a string that is non-empty),
+        # reported with its own message naming the member.
+        if require_source and (not isinstance(source, str) or not source):
+            raise error_type(
+                f"split plan {plan_name!r} is corrupted: "
+                f"{set_name} member {position} (sha256 {digest}) has no "
+                "recorded source path"
+            )
+        raise error_type(
+            f"Split plan record has a bad member in {set_name} "
+            f"at position {position}"
+        )
+    return digest, label, source
+
+
 def category_key(label: Any) -> Any:
     """Stratum key for a manifest label value.
 
