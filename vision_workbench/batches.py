@@ -16,20 +16,12 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-BATCH_SCHEMA_VERSION = 1
+from .identity import IdentityProblem, identity_problem
 
-# A registered sample identity is a full SHA-256 digest: exactly 64
-# lowercase hexadecimal characters — the same spelling the registration
-# manifest enforces.  Undo requires every target-batch record to pin a
-# sample in that exact spelling, so a truncated or padded digest, an
-# uppercase spelling, surrounding or embedded whitespace or any other
-# non-hex character can never be accepted by stripping, lowercasing,
-# truncating or padding.
-_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+BATCH_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -433,34 +425,37 @@ def describe_history_digest_problem(value: Any) -> str | None:
     acceptance by stripping whitespace, folding case, truncating or
     padding, and no identity is inferred from the current sample list.
     Returns ``None`` when the value is well formed.
+
+    The format rule itself — the checks and their order — is the shared
+    one in :mod:`vision_workbench.identity`; only the wording is
+    specific to batch history.
     """
-    if not isinstance(value, str):
+    problem = identity_problem(value)
+    if problem is None:
+        return None
+    if problem is IdentityProblem.NOT_STRING:
         # validate_history() already rules a missing or non-string
         # digest out; defend direct callers just the same.
         return (
             "it is not a string; expected a string of 64 lowercase "
             "hexadecimal characters"
         )
-    if not value:
+    if problem is IdentityProblem.EMPTY:
         return "it is empty; expected 64 lowercase hexadecimal characters"
-    if value != value.strip() or any(char in " \t\r\n" for char in value):
+    if problem is IdentityProblem.WHITESPACE:
         return (
             "it contains surrounding or embedded whitespace; expected 64 "
             "lowercase hexadecimal characters without spaces"
         )
-    if len(value) != 64:
+    if problem is IdentityProblem.WRONG_LENGTH:
         return (
             f"it has {len(value)} characters instead of 64; expected 64 "
             "lowercase hexadecimal characters"
         )
-    if _DIGEST_RE.fullmatch(value) is None:
-        # Length is exactly 64 here, so what remains is an uppercase
-        # letter or a non-hexadecimal character.
-        return (
-            "it must contain only lowercase hexadecimal characters "
-            "(digits 0-9 and letters a-f)"
-        )
-    return None
+    return (
+        "it must contain only lowercase hexadecimal characters "
+        "(digits 0-9 and letters a-f)"
+    )
 
 
 def require_intact_history_digests(entry: Mapping[str, Any]) -> None:

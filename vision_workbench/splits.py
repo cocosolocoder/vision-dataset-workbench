@@ -14,23 +14,16 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 from fractions import Fraction
 from typing import Any, Sequence
+
+from .identity import IdentityProblem, identity_problem
 
 # Sentinel for samples without a label.  An object (not the string
 # "unlabeled") keeps a real class literally named "unlabeled" separate.
 UNLABELED = object()
 
 SET_NAMES = ("train", "validation", "test")
-
-# A sample identity is a full SHA-256 digest: exactly 64 lowercase
-# hexadecimal characters.  The same spelling the registration manifest
-# enforces is required inside saved split plans, so a truncated digest,
-# an uppercase spelling, surrounding whitespace or a stray non-hex digit
-# can never be repaired by truncating, padding, stripping or changing
-# case.
-_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class SplitError(ValueError):
@@ -45,37 +38,40 @@ def invalid_digest_reason(value: Any) -> str | None:
     (including a missing ``None``), an empty string, a digest of any other
     length, an uppercase spelling or surrounding whitespace is rejected
     with a concrete reason; the value is never normalized into acceptance.
+
+    The format rule itself — the checks and their order — is the shared
+    one in :mod:`vision_workbench.identity`; only the wording is specific
+    to split plans.
     """
-    if value is None:
-        return (
-            "the field is missing or null; expected a string of 64 "
-            "lowercase hexadecimal characters"
-        )
-    if not isinstance(value, str):
+    problem = identity_problem(value)
+    if problem is None:
+        return None
+    if problem is IdentityProblem.NOT_STRING:
+        if value is None:
+            return (
+                "the field is missing or null; expected a string of 64 "
+                "lowercase hexadecimal characters"
+            )
         return (
             f"it is a {type(value).__name__}, not a string; expected a "
             "string of 64 lowercase hexadecimal characters"
         )
-    if not value:
+    if problem is IdentityProblem.EMPTY:
         return "it is empty; expected 64 lowercase hexadecimal characters"
-    if value != value.strip() or any(char in " \t\r\n" for char in value):
+    if problem is IdentityProblem.WHITESPACE:
         return (
             "it contains surrounding or embedded whitespace; expected 64 "
             "lowercase hexadecimal characters without spaces"
         )
-    if len(value) != 64:
+    if problem is IdentityProblem.WRONG_LENGTH:
         return (
             f"it has {len(value)} characters instead of 64; expected 64 "
             "lowercase hexadecimal characters"
         )
-    if _DIGEST_RE.fullmatch(value) is None:
-        # Length is exactly 64 here, so every remaining problem is a
-        # non-hex or uppercase character.
-        return (
-            "it must contain only lowercase hexadecimal characters "
-            "(digits 0-9 and letters a-f)"
-        )
-    return None
+    return (
+        "it must contain only lowercase hexadecimal characters "
+        "(digits 0-9 and letters a-f)"
+    )
 
 
 def category_key(label: Any) -> Any:
