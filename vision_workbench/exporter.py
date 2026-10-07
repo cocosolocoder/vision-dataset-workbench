@@ -189,23 +189,18 @@ def export_split(
         # bypass a corrupted identity.
         raise ExportError(str(error)) from error
     members = _collect_members(plan)
+    stats = _ExportStatistics(members)
 
-    unlabeled = [member for member in members if member["label"] == ""]
-    if unlabeled and not skip_unlabeled:
-        first = min(unlabeled, key=lambda member: member["sha256"])
+    if stats.unlabeled and not skip_unlabeled:
+        first = min(stats.unlabeled, key=lambda member: member["sha256"])
         raise ExportError(
             f"sample {first['sha256']} in set {first['set']} has no label; "
             "pass --skip-unlabeled to export without unlabeled samples"
         )
 
-    exported = [member for member in members if member["label"] != ""]
-    skipped_counts = {set_name: 0 for set_name in SET_NAMES}
-    for member in unlabeled:
-        skipped_counts[member["set"]] += 1
-
+    exported = stats.exported
     classes = _build_classes(exported)
-    manifest = _build_manifest(plan, classes, exported, skipped_counts)
-    distributions = _distributions(exported)
+    manifest = _build_manifest(plan, classes, stats)
 
     resolver = None
     if source_dir is not None:
@@ -263,15 +258,9 @@ def export_split(
     return {
         "plan": plan["name"],
         "exported": len(exported),
-        "skipped": skipped_counts,
+        "skipped": dict(stats.skipped),
         "sets": {
-            set_name: {
-                "samples": distributions[set_name]["samples"],
-                "distribution": dict(
-                    sorted(distributions[set_name]["distribution"].items())
-                ),
-            }
-            for set_name in SET_NAMES
+            set_name: stats.set_result(set_name) for set_name in SET_NAMES
         },
         "target": str(target.resolve()),
     }
@@ -316,6 +305,53 @@ def _collect_members(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return members
 
 
+class _ExportStatistics:
+    """The sample counts of one export, derived once from the plan members.
+
+    Every number an export reports — the result payload's total, per-set
+    sample counts and class distributions, and the manifest's per-set
+    sample and skip counts — comes from this single pass, so the success
+    result and the packaged manifest always describe the same samples.
+    Only the saved plan is consulted: samples imported, relabeled or
+    reverted after the plan was saved never enter these counts.
+
+    A member whose label is the empty string is unlabeled: with
+    ``skip_unlabeled`` it counts towards its own set's skipped total only
+    — never towards the exported samples or any class distribution, and
+    never causing another member to change sets.  The literal label
+    ``unlabeled`` is an ordinary class like any other.
+    """
+
+    def __init__(self, members: list[dict[str, Any]]) -> None:
+        self.exported: list[dict[str, Any]] = []
+        self.unlabeled: list[dict[str, Any]] = []
+        self.skipped: dict[str, int] = {set_name: 0 for set_name in SET_NAMES}
+        self._samples: dict[str, int] = {set_name: 0 for set_name in SET_NAMES}
+        self._labels: dict[str, Counter[str]] = {
+            set_name: Counter() for set_name in SET_NAMES
+        }
+        for member in members:
+            set_name = member["set"]
+            if member["label"] == "":
+                self.unlabeled.append(member)
+                self.skipped[set_name] += 1
+            else:
+                self.exported.append(member)
+                self._samples[set_name] += 1
+                self._labels[set_name][member["label"]] += 1
+
+    def set_samples(self, set_name: str) -> int:
+        """Number of samples actually exported into ``set_name``."""
+        return self._samples[set_name]
+
+    def set_result(self, set_name: str) -> dict[str, Any]:
+        """Result-payload summary for one set: count and class distribution."""
+        return {
+            "samples": self._samples[set_name],
+            "distribution": dict(sorted(self._labels[set_name].items())),
+        }
+
+
 def _build_classes(members: list[dict[str, Any]]) -> dict[str, str]:
     """Map every exported label to one shared numbered class directory.
 
@@ -331,19 +367,17 @@ def _build_classes(members: list[dict[str, Any]]) -> dict[str, str]:
 def _build_manifest(
     plan: dict[str, Any],
     classes: dict[str, str],
-    members: list[dict[str, Any]],
-    skipped_counts: dict[str, int],
+    stats: _ExportStatistics,
 ) -> dict[str, Any]:
     set_summaries = {}
     for set_name in SET_NAMES:
-        set_members = [member for member in members if member["set"] == set_name]
         set_summaries[set_name] = {
-            "samples": len(set_members),
-            "skipped": skipped_counts[set_name],
+            "samples": stats.set_samples(set_name),
+            "skipped": stats.skipped[set_name],
         }
 
     sample_entries = []
-    for member in sorted(members, key=lambda item: item["sha256"]):
+    for member in sorted(stats.exported, key=lambda item: item["sha256"]):
         arc_path = _sample_path(member, classes[member["label"]])
         sample_entries.append(
             {
@@ -372,17 +406,6 @@ def _sample_path(member: dict[str, Any], class_directory: str) -> str:
     """Package-relative path for a sample: ``<set>/<class>/<digest><ext>``."""
     extension = Path(member["source"]).suffix
     return f"{member['set']}/{class_directory}/{member['sha256']}{extension}"
-
-
-def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for set_name in SET_NAMES:
-        set_members = [member for member in members if member["set"] == set_name]
-        result[set_name] = {
-            "samples": len(set_members),
-            "distribution": Counter(member["label"] for member in set_members),
-        }
-    return result
 
 
 # A resolver maps a full SHA-256 digest to the absolute path of the
