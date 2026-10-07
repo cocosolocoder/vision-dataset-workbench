@@ -560,6 +560,32 @@ requested number is judged: a duplicate of some *other* number never blocks
 a unique, otherwise valid target from undoing normally, and a number absent
 from the list still returns the ordinary unknown-batch error.
 
+Every record stored for a successful batch names its sample by a `sha256`
+in exactly the format the registration list uses: **exactly 64 lowercase
+hexadecimal characters**. When an undo targets a batch whose record carries
+anything else — an empty string, a digest of any other length, uppercase
+letters, a non-hexadecimal character or surrounding whitespace — that
+record is corrupted batch history. The stored value is never repaired into
+acceptance: whitespace is not stripped, letters are not lowercased, and the
+string is not truncated or padded, and the original identifier is never
+guessed from the registered samples — even when such a rewrite would land
+on a registered sample, the record as saved is refused. The whole undo
+fails: the command exits non-zero with nothing on standard output and no
+traceback, and standard error reports that the **batch history** is
+corrupted, naming the requested batch number, the record's 1-based position
+inside the target batch, the stored `sha256` value verbatim and the
+concrete format problem. Every record of the target batch is examined —
+records that never changed a label and records behind restorable ones
+included — and the check runs before any sample is restored and before the
+repeated-undo short-circuit, so a batch already marked undone still
+surfaces its bad record instead of returning `already-undone`. No sample
+label or label revision changes, neither the registration list nor the
+batch history is rewritten, no undo marker or undo time is added, and saved
+split plans are untouched. Only the target batch's records are examined: a
+malformed digest in some other batch never blocks a valid batch from
+undoing normally, and a well-formed digest that simply names no registered
+sample is not corruption — it keeps the ordinary missing-sample refusal.
+
 Every sample record stored for a successful batch carries a `rev`: the
 sample's label revision at the moment the batch finished, which an undo
 pins against. That `rev` is mandatory on **every** history record —

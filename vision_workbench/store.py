@@ -27,6 +27,7 @@ from .batches import (
     parse_batch_file,
     reject_unknown_samples,
     require_intact_history_changes,
+    require_intact_history_digests,
     require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
@@ -842,16 +843,17 @@ class DatasetStore:
         entry carrying that same number — identical content or different,
         adjacent or separated by other batches, already undone or not — is
         batch history corruption, never a first-match/last-match/active
-        choice and never a merge.  The target batch must then list every
-        sample exactly once, carry a sound pinned revision on each
+        choice and never a merge.  The target batch must then name every
+        sample by a full 64-character lowercase hexadecimal digest, list
+        every sample exactly once, carry a sound pinned revision on each
         record, explicitly save both before/after labels on each record,
         and have every record's ``changed`` flag agree with the
-        before/after labels saved on that same record.  A duplicated
-        number, a duplicated digest, a bad row, a missing label field or a
-        flag that contradicts its labels rejects the undo even when the
-        batch is already marked undone, so corruption is never hidden
-        behind an ``already-undone`` success or confused with a sample
-        modified after the batch.
+        before/after labels saved on that same record.  A malformed
+        digest, a duplicated number, a duplicated digest, a bad row, a
+        missing label field or a flag that contradicts its labels rejects
+        the undo even when the batch is already marked undone, so
+        corruption is never hidden behind an ``already-undone`` success
+        or confused with a sample modified after the batch.
         """
         with self._locked(create=True):
             manifest = self._read()
@@ -866,13 +868,15 @@ class DatasetStore:
             # raises before this point; repeats of other numbers do not
             # match and stay irrelevant.
             #
-            # Validate the unique target batch's integrity — one row per
-            # sample, sound pinned revisions, both before/after labels
+            # Validate the unique target batch's integrity — every record
+            # naming its sample by a full lowercase hex digest, one row
+            # per sample, sound pinned revisions, both before/after labels
             # saved, and a changed flag that matches those labels — before
             # the already-undone short-circuit and the later-modification
             # checks: a duplicated, inconsistent or corrupt history record
             # is refusal, not an undo, a no-op or an unknown batch, and
             # nothing is rewritten.
+            require_intact_history_digests(entry)
             require_intact_history_records(entry)
             require_intact_history_revisions(entry)
             require_intact_history_labels(entry)

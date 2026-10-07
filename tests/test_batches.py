@@ -835,6 +835,188 @@ class BatchUndoCorruptHistoryTest(StoreHarness):
         )
 
 
+class BatchUndoCorruptDigestTest(StoreHarness):
+    """Undo must refuse a target batch whose records carry a malformed
+    sample digest: anything but exactly 64 lowercase hexadecimal
+    characters is batch-history corruption, never a value to repair."""
+
+    def _history_on_disk(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def _write_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _rewrite_record_digest(self, number: str, index: int, value: object) -> None:
+        """Overwrite one target-batch record's sha256 (history damage)."""
+        history = self._history_on_disk()
+        entry = next(e for e in history["batches"] if e["batch"] == number)
+        entry["records"][index]["sha256"] = value
+        self._write_history(history)
+
+    def _manifest_item(self, digest: str) -> dict:
+        manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        return next(item for item in manifest["items"] if item["sha256"] == digest)
+
+    def test_malformed_digest_on_changed_record_rejects_whole_undo(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        bad = "A" * 64  # uppercase spelling of a digest-shaped string
+        self._rewrite_record_digest("b1", 0, bad)
+
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn("record #1", message)
+        self.assertIn(repr(bad), message)
+        self.assertIn("hexadecimal", message)
+
+        # Nothing restored, nothing rewritten.
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+        self.assertEqual(self._manifest_item(d).get("rev"), 1)
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        entry = self._history_on_disk()["batches"][0]
+        self.assertFalse(entry["undone"])
+        self.assertIsNone(entry["undone_at"])
+
+    def test_malformed_digest_on_unchanged_record_is_still_corruption(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        # d2 is a no-op in b1; damaging its digest must still fail the undo.
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self._rewrite_record_digest("b1", 1, "")
+
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("record #2", message)
+        self.assertIn("''", message)
+        # The changed record ahead of the damaged one is not restored.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertFalse(self._history_on_disk()["batches"][0]["undone"])
+
+    def test_malformed_digest_behind_valid_records_is_found(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        d3 = self.add_sample("fish")
+        self.submit(
+            "b1",
+            (d1, "cat", "kitten"),
+            (d2, "dog", "puppy"),
+            (d3, "fish", "fish"),
+        )
+        bad = d3[:-1] + " "  # trailing whitespace instead of the last digit
+        self._rewrite_record_digest("b1", 2, bad)
+
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("record #3", message)
+        self.assertIn(repr(bad), message)
+        # No restorable record ahead of the damaged one was restored.
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_every_invalid_spelling_is_rejected_without_repair(self) -> None:
+        d = self.add_sample("cat")
+        bad_spellings = [
+            "",                      # empty
+            "a" * 63,                # too short
+            "a" * 65,                # too long
+            d.upper(),               # uppercase, would match if lowered
+            "g" * 64,                # non-hexadecimal letters
+            " " + d[1:],             # leading whitespace
+            d[:63] + "\t",           # embedded whitespace
+            d[:32] + " " + d[33:],   # whitespace inside
+        ]
+        for bad in bad_spellings:
+            with self.subTest(bad=bad):
+                self.submit("b1", (d, "cat", "dog"))
+                self._rewrite_record_digest("b1", 0, bad)
+                with self.assertRaises(BatchError) as ctx:
+                    self.store.undo_batch("b1")
+                message = str(ctx.exception)
+                self.assertIn("Batch history is corrupted", message)
+                self.assertIn(repr(bad), message)
+                # The stored value was not normalized into acceptance.
+                self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+                self.assertFalse(self._history_on_disk()["batches"][0]["undone"])
+                # Repair for the next sub-case.
+                self._rewrite_record_digest("b1", 0, d)
+
+    def test_malformed_digest_on_already_undone_batch_is_still_rejected(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        first = self.store.undo_batch("b1")
+        self.assertEqual(first["status"], "undone")
+        self._rewrite_record_digest("b1", 0, "a" * 63)
+
+        # A repeated undo must not hide the damage behind already-undone.
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        self.assertIn("Batch history is corrupted", str(ctx.exception))
+        entry = self._history_on_disk()["batches"][0]
+        self.assertTrue(entry["undone"])  # marker unchanged, no new write
+
+    def test_malformed_digest_in_another_batch_does_not_block_valid_undo(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._rewrite_record_digest("b2", 0, "not-a-digest")
+
+        # Only the target batch's records are examined.
+        result = self.store.undo_batch("b1")
+        self.assertEqual(result["status"], "undone")
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_unknown_batch_still_unknown_with_malformed_digest_elsewhere(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._rewrite_record_digest("b1", 0, "")
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("ghost")
+        self.assertIn("unknown batch number", str(ctx.exception))
+
+    def test_wellformed_unknown_digest_keeps_missing_sample_rule(self) -> None:
+        # A changed record naming a well-formed digest that no registered
+        # sample has is the ordinary missing-sample refusal, not a
+        # corruption verdict.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        ghost = "f" * 64
+        self._rewrite_record_digest("b1", 0, ghost)
+
+        with self.assertRaises(BatchError) as ctx:
+            self.store.undo_batch("b1")
+        message = str(ctx.exception)
+        self.assertNotIn("corrupted", message)
+        self.assertIn("no longer in the manifest", message)
+        self.assertIn(ghost, message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_failed_undo_leaves_existing_splits_untouched(self) -> None:
+        d = self.add_sample("cat")
+        plan = self.store.create_split("p", 0, [1, 0, 0]).plan
+        self.submit("b1", (d, "cat", "dog"))
+        self._rewrite_record_digest("b1", 0, "Z" * 64)
+
+        with self.assertRaises(BatchError):
+            self.store.undo_batch("b1")
+        self.assertEqual(self.store.get_split("p"), plan)
+
+
 class BatchUndoDuplicateNumberTest(StoreHarness):
     def _history_on_disk(self) -> dict:
         return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
@@ -2544,6 +2726,30 @@ class BatchCliTest(StoreHarness):
         # A clear message, never a program traceback.
         self.assertNotIn("Traceback", rejected.stderr)
         # First sample was not restored either.
+        self.assertEqual(self.store.lookup_label(d)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_cli_malformed_digest_undo_fails_cleanly(self) -> None:
+        d = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d, "cat", "kitten"), (d2, "dog", "puppy"))
+        history_path = self.store.batches_path
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        bad = "A" * 64  # uppercase spelling is not a registered digest
+        history["batches"][0]["records"][1]["sha256"] = bad
+        history_path.write_text(json.dumps(history), encoding="utf-8")
+
+        rejected = self.run_cli("undo", str(self.root), "b1")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("Batch history is corrupted", rejected.stderr)
+        self.assertIn("b1", rejected.stderr)
+        self.assertIn("record #2", rejected.stderr)
+        self.assertIn(bad, rejected.stderr)
+        self.assertIn("hexadecimal", rejected.stderr)
+        # A clear message, never a program traceback.
+        self.assertNotIn("Traceback", rejected.stderr)
+        # Neither sample was restored.
         self.assertEqual(self.store.lookup_label(d)["label"], "kitten")
         self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
 

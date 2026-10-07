@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from .splits import invalid_digest_reason
+
 BATCH_SCHEMA_VERSION = 1
 
 
@@ -355,8 +357,9 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # pairs; ``_corruption_prefix`` and ``_record_ref`` assemble the common
 # "Batch history is corrupted: batch ..." message parts.  The checks
 # themselves stay separate passes and keep their original order on the
-# undo path — duplicate digests, then revisions, then labels, then
-# changed flags — each reporting its first problem in record order.
+# undo path — digest format, duplicate digests, then revisions, then
+# labels, then changed flags — each reporting its first problem in record
+# order.
 # Re-submission (``resolve_re_submission``) reuses the two checks that
 # verdict needs, in the same order: duplicate digests, then labels, both
 # running before the same-content replay / different-content conflict
@@ -399,6 +402,46 @@ def _iter_history_records(
         if not isinstance(record, dict):
             raise BatchError(f"{prefix}: malformed record")
         yield position, record
+
+
+def require_intact_history_digests(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records carry a malformed sample digest.
+
+    Every record — changed or not — must name its sample by a full
+    SHA-256 digest: exactly 64 lowercase hexadecimal characters, the same
+    spelling the registration manifest enforces.  An empty string, a
+    digest of any other length, uppercase letters, non-hexadecimal
+    characters or surrounding whitespace are all batch-history
+    corruption: the stored value is never repaired by stripping,
+    lowering, truncating or padding, and the original identifier is never
+    guessed from the registered samples — even when a rewritten value
+    would match one, the record as saved is refused.
+
+    The whole record list is scanned in order — unchanged rows and rows
+    behind restorable ones included — so a sound row at the front can
+    never mask a damaged one further back, and no sample is restored
+    before the damage is found.  The error names the batch number, the
+    record's 1-based position inside the target batch, the stored
+    ``sha256`` value verbatim and the concrete format problem; nothing is
+    repaired.
+
+    Only the undo target batch is examined: a malformed digest saved in
+    some other batch's records never blocks this batch's undo.  A
+    well-formed digest that simply names no registered sample is not
+    corruption — it keeps the ordinary missing-sample behaviour.
+
+    Callers must run this before any success-shaped short-circuit (such
+    as an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    for position, record in _iter_history_records(entry):
+        digest = record.get("sha256")
+        problem = invalid_digest_reason(digest)
+        if problem is not None:
+            raise BatchError(
+                f"{_corruption_prefix(entry)}, record #{position}: "
+                f"'sha256' is {digest!r}: {problem}"
+            )
 
 
 def require_intact_history_records(entry: Mapping[str, Any]) -> None:
