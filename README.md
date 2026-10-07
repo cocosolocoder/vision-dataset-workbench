@@ -46,7 +46,12 @@ python3 -m vision_workbench import-dir ./workspace ./examples --recursive
   and other entry types never qualify; recursion stays on the top level
   unless `--recursive` is given and never descends through symlinked
   directories. Files that appear after the scan are left for the next
-  import.
+  import. The recursive scan walks an explicit stack rather than Python
+  call frames, so a chain of directories deeper than the interpreter's
+  recursion limit is scanned in full — images at the top, on side branches
+  and at the end of a long chain are all imported — as long as the paths,
+  directory permissions and system resources allow; the scan never stops
+  at some depth and reports success for only the shallower part.
 - Candidates are ordered by their path relative to the source directory,
   with `/` separators, compared by Unicode code point.
 - Samples are identified by their full SHA-256 digest. When several

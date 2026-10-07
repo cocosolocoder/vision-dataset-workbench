@@ -426,13 +426,18 @@ class DatasetStore:
         or during its scan fails the whole import instead of the link
         target being scanned.  The confirmed list lets the caller
         re-verify the directories once more after the candidate reads.
+
+        The descent runs on an explicit stack rather than Python calls:
+        a tree deeper than the interpreter's recursion limit is scanned in
+        full instead of aborting partway with a ``RecursionError``, and a
+        confirmed directory's descriptor stays open for exactly as long as
+        its subtree is being visited, just as with the former recursive
+        walk.
         """
         rel_paths: list[str] = []
         confirmed_dirs: list[Path] = []
 
-        def classify(
-            directory: Path, fd_or_path: Any
-        ) -> list[tuple[str, bool, bool]]:
+        def classify(directory: Path, fd_or_path: Any) -> list[tuple[str, bool, bool]]:
             try:
                 entries = list(os.scandir(fd_or_path))
             except OSError as error:
@@ -455,13 +460,33 @@ class DatasetStore:
                 found.append((entry.name, is_file, is_dir))
             return found
 
-        def walk(
-            directory: Path,
-            rel_prefix: str,
-            parent_fd: int,
-            entries: list[tuple[str, bool, bool]],
-        ) -> None:
-            for name, is_file, is_dir in entries:
+        try:
+            root_fd = self._open_real_directory(str(root), None, root)
+        except OSError as error:
+            raise ValueError(f"cannot scan directory {root}: {error}") from error
+
+        # A frame is one entered directory: its pinned descriptor, its
+        # path, its slash-relative prefix and the entries still to visit
+        # (reversed, so pop() yields scan order).  The frame list is the
+        # iterative counterpart of the recursive call chain: a parent
+        # frame — with its descriptor still open — stays on the stack for
+        # the whole time its subtree is processed, at every depth.
+        frames: list[tuple[int, Path, str, list[tuple[str, bool, bool]]]] = []
+        try:
+            # The root is listed by its path; every descendant is listed
+            # through its pinned descriptor.  root_fd still anchors the
+            # no-follow open of the root's own children.
+            frames.append(
+                (root_fd, root, "", list(reversed(classify(root, root))))
+            )
+            while frames:
+                parent_fd, directory, rel_prefix, entries = frames[-1]
+                if not entries:
+                    frames.pop()
+                    if parent_fd != root_fd:
+                        os.close(parent_fd)
+                    continue
+                name, is_file, is_dir = entries.pop()
                 if is_file:
                     if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
                         rel_paths.append(rel_prefix + name)
@@ -480,25 +505,32 @@ class DatasetStore:
                         raise ValueError(
                             f"cannot scan directory {subdirectory}: {error}"
                         ) from error
+                    transferred = False
                     try:
                         child_entries = classify(subdirectory, child_fd)
                         confirmed_dirs.append(subdirectory)
-                        walk(
-                            subdirectory,
-                            rel_prefix + name + "/",
-                            child_fd,
-                            child_entries,
+                        frames.append(
+                            (
+                                child_fd,
+                                subdirectory,
+                                rel_prefix + name + "/",
+                                list(reversed(child_entries)),
+                            )
                         )
+                        # The descriptor now belongs to the frame and is
+                        # closed when that frame finishes; the finally must
+                        # not close it on the successful path.
+                        transferred = True
                     finally:
-                        os.close(child_fd)
-
-        try:
-            root_fd = self._open_real_directory(str(root), None, root)
-        except OSError as error:
-            raise ValueError(f"cannot scan directory {root}: {error}") from error
-        try:
-            walk(root, "", root_fd, classify(root, root))
+                        if not transferred:
+                            os.close(child_fd)
         finally:
+            # On an error mid-walk, close every confirmed descendant
+            # descriptor still held by an unfinished frame; the root
+            # descriptor itself is always closed here.
+            for descriptor, *_ in frames:
+                if descriptor != root_fd:
+                    os.close(descriptor)
             os.close(root_fd)
         # Unicode code point order on the slash-separated relative path.
         rel_paths.sort()

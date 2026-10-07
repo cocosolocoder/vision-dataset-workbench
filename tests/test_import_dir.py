@@ -35,6 +35,50 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def remove_deep_tree(root: Path) -> None:
+    """Delete a directory tree without recursive Python calls.
+
+    ``shutil.rmtree`` walks recursively and therefore fails on chains
+    deeper than Python's recursion limit; this variant keeps a stack of
+    directory descriptors and removes files at once and empty
+    directories deepest-first.  Symlinks are unlinked, never traversed.
+    A root that is already gone is treated as success.
+    """
+    if not root.exists():
+        return
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    # (parent fd or None for root, this fd, basename or None, entries)
+    stack: list = [(None, root_fd, None, os.scandir(root_fd))]
+    try:
+        while stack:
+            parent_fd, fd, name, entries = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(fd)
+                stack.pop()
+                if parent_fd is not None:
+                    os.rmdir(name, dir_fd=parent_fd)
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=fd,
+                )
+                stack.append(
+                    (fd, child_fd, entry.name, os.scandir(child_fd))
+                )
+            else:
+                os.unlink(entry.name, dir_fd=fd)
+    finally:
+        for parent_fd, fd, name, entries in stack:
+            entries.close()
+            os.close(fd)
+    os.rmdir(root)
+
+
 def _import_worker(root: str, source: str, label, recursive: bool, queue) -> None:
     try:
         result = DatasetStore(Path(root)).import_directory(
@@ -82,8 +126,14 @@ class DirectoryImportTest(unittest.TestCase):
         self.source = self.base / "images"
         self.source.mkdir()
         self.store = DatasetStore(self.workspace)
+        # Roots of chains deeper than Python's recursion limit; removed
+        # iteratively in tearDown because shutil.rmtree is itself
+        # recursive and cannot unwind such a tree.
+        self._deep_roots: list[Path] = []
 
     def tearDown(self) -> None:
+        for root in self._deep_roots:
+            remove_deep_tree(root)
         self.temp.cleanup()
 
     def _write(self, relative: str, content: bytes) -> Path:
@@ -91,6 +141,22 @@ class DirectoryImportTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return path
+
+    def _make_chain(self, root: Path, depth: int, name: str = "a") -> Path:
+        """Create a ``depth``-level chain of directories without recursion.
+
+        Single-character names keep the absolute path under the platform
+        ``PATH_MAX`` even when the depth exceeds Python's recursion limit
+        (``Path.mkdir(parents=True)`` is itself recursive and cannot build
+        such a chain, so each level is made with one ``os.mkdir``).
+        """
+        directory = root
+        root.mkdir(parents=True, exist_ok=True)
+        for _ in range(depth):
+            directory = directory / name
+            os.mkdir(directory)
+        self._deep_roots.append(root)
+        return directory
 
     def test_filters_extensions_case_insensitive_and_ignores_other_files(self) -> None:
         accepted = ["a.JPG", "b.Jpeg", "c.png", "d.BMP", "e.gif", "f.webp"]
@@ -544,6 +610,144 @@ class DirectoryImportTest(unittest.TestCase):
         after = self.store.create_split("after", 2, [1, 0, 0])
         self.assertEqual(after.plan["samples"]["total"], 1)
 
+    # ------------------------------------------------------------------
+    # Trees deeper than Python's recursion limit
+    # ------------------------------------------------------------------
+
+    def test_deep_tree_imports_images_at_every_depth(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        leaf = self._make_chain(self.source, depth)
+        top = self.source / "top.jpg"
+        top.write_bytes(b"top")
+        leaf_image = leaf / "leaf.png"
+        leaf_image.write_bytes(b"leaf")
+        # A side branch off the long chain: several depths are visited in
+        # one batch, so depth may not decide candidate order or membership.
+        branch = leaf.parent / "sibling"
+        os.mkdir(branch)
+        (branch / "shot.gif").write_bytes(b"branch-shot")
+        # Duplicate content at the top level and at the chain end.  The
+        # shallow name sorts first, so only it is added; the deep copy
+        # reports duplicate even though it lies 1000+ levels down.
+        shallow_dup = self.source / "AAA-dup.jpg"
+        shallow_dup.write_bytes(b"shared-bytes")
+        deep_dup = leaf / "zz-dup.jpg"
+        deep_dup.write_bytes(b"shared-bytes")
+        # A symlinked directory met deep in the tree is still ignored.
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "evil.jpg").write_bytes(b"evil")
+        os.symlink(elsewhere, leaf.parent / "link")
+        # A non-image file at the deepest level stays a non-candidate.
+        (leaf / "notes.txt").write_bytes(b"not an image")
+
+        result = self.store.import_directory(
+            self.source, "cat", recursive=True
+        )
+
+        expected_paths = sorted(
+            [
+                "top.jpg",
+                f"{'a/' * depth}leaf.png",
+                f"{'a/' * (depth - 1)}sibling/shot.gif",
+                "AAA-dup.jpg",
+                f"{'a/' * depth}zz-dup.jpg",
+            ]
+        )
+        self.assertEqual(
+            [candidate["path"] for candidate in result["candidates"]],
+            expected_paths,
+        )
+        self.assertEqual(result["candidate_count"], 5)
+        self.assertEqual(result["added"], 4)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(
+            result["added"] + result["duplicates"], result["candidate_count"]
+        )
+        statuses = {
+            candidate["path"]: candidate["status"]
+            for candidate in result["candidates"]
+        }
+        self.assertEqual(statuses["AAA-dup.jpg"], "added")
+        self.assertEqual(statuses[f"{'a/' * depth}zz-dup.jpg"], "duplicate")
+        # The sorted-first (here shallow) copy owns source and label.
+        manifest = json.loads(
+            (self.workspace / ".vision-workbench" / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        shared = _sha256(b"shared-bytes")
+        owners = [item for item in manifest["items"] if item["sha256"] == shared]
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(Path(owners[0]["source"]).name, "AAA-dup.jpg")
+        self.assertEqual(owners[0]["label"], "cat")
+        self.assertEqual(self.store.summary()["items"], 4)
+
+    def test_deep_tree_reimport_reports_only_duplicates(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        leaf = self._make_chain(self.source, depth)
+        (self.source / "top.jpg").write_bytes(b"top")
+        (leaf / "leaf.png").write_bytes(b"leaf")
+        (leaf / "again.bmp").write_bytes(b"again")
+
+        first = self.store.import_directory(self.source, "cat", recursive=True)
+        self.assertEqual(first["added"], 3)
+        # A different label on the re-import never overwrites the first
+        # registration, no matter how deep the existing sources are.
+        second = self.store.import_directory(
+            self.source, "dog", recursive=True
+        )
+        self.assertEqual(second["candidate_count"], 3)
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(second["duplicates"], 3)
+        self.assertTrue(
+            all(candidate["status"] == "duplicate"
+                for candidate in second["candidates"])
+        )
+        self.assertEqual(self.store.summary()["items"], 3)
+        self.assertEqual(self.store.summary()["labels"], {"cat": 3})
+
+    def test_deep_tree_without_images_succeeds_with_zero_candidates(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        empty = self.base / "empty-deep"
+        self._make_chain(empty, depth, name="e")
+        result = DatasetStore(self.base / "ws-empty-deep").import_directory(
+            empty, "cat", recursive=True
+        )
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["duplicates"], 0)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(
+            DatasetStore(self.base / "ws-empty-deep").summary()["items"], 0
+        )
+
+    def test_deep_tree_non_recursive_stays_top_level(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        leaf = self._make_chain(self.source, depth)
+        (self.source / "top.jpg").write_bytes(b"top")
+        (leaf / "leaf.png").write_bytes(b"leaf")
+
+        result = self.store.import_directory(self.source, "cat")
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(
+            [candidate["path"] for candidate in result["candidates"]],
+            ["top.jpg"],
+        )
+        self.assertEqual(result["added"], 1)
+
+    def test_deep_tree_does_not_leak_file_descriptors(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        leaf = self._make_chain(self.source, depth)
+        (self.source / "top.jpg").write_bytes(b"top")
+        (leaf / "leaf.png").write_bytes(b"leaf")
+
+        descriptor_dir = f"/proc/{os.getpid()}/fd"
+        before = len(os.listdir(descriptor_dir))
+        self.store.import_directory(self.source, "cat", recursive=True)
+        after = len(os.listdir(descriptor_dir))
+        self.assertEqual(after, before)
+
 
 class DirectoryImportConcurrencyTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -682,8 +886,11 @@ class DirectoryImportCLITest(unittest.TestCase):
         self.workspace = self.base / "dataset"
         self.source = self.base / "images"
         self.source.mkdir()
+        self._deep_roots: list[Path] = []
 
     def tearDown(self) -> None:
+        for root in self._deep_roots:
+            remove_deep_tree(root)
         self.temp.cleanup()
 
     def _write(self, relative: str, content: bytes) -> None:
@@ -740,6 +947,36 @@ class DirectoryImportCLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("error:", result.stderr)
         self.assertIn("does not exist", result.stderr)
+
+    def test_cli_deep_tree_beyond_recursion_limit_succeeds(self) -> None:
+        depth = sys.getrecursionlimit() + 250
+        directory = self.source
+        for _ in range(depth):
+            directory = directory / "a"
+            directory.mkdir()
+        # Only the long chain needs iterative teardown.
+        self._deep_roots.append(self.source / "a")
+        (directory / "leaf.png").write_bytes(b"leaf")
+        (self.source / "top.jpg").write_bytes(b"top")
+
+        result = self.run_cli(
+            "import", str(self.workspace), str(self.source), "--recursive"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["candidate_count"], 2)
+        self.assertEqual(payload["added"], 2)
+        self.assertEqual(payload["duplicates"], 0)
+        self.assertEqual(
+            [candidate["path"] for candidate in payload["candidates"]],
+            sorted(
+                [
+                    "top.jpg",
+                    f"{'a/' * depth}leaf.png",
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":
