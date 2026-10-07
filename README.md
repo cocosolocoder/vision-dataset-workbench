@@ -522,6 +522,42 @@ submission is inspected: a repeated sample or missing label fields in a
 *different* batch neither block a new batch number nor reuse of another
 batch's intact history.
 
+The saved batch is likewise checked for the same `changed`-flag
+integrity an undo relies on: every record's flag must agree with the
+before/after labels saved on that same record. A replay reconstructs
+the original statistics from those flags, so a record that saved `cat`
+→ `dog` but is flagged unchanged would be replayed as `already-applied`
+with the sample miscounted as untouched, and a record flagged changed
+on identical before/after labels would inflate the changed count. Both
+are corrupted batch history, and the whole repeat submission is refused
+before it can return the original statistics or report a number
+conflict — never reported as a successful submission, and never
+auto-corrected and then accepted. Whether the two labels differ is
+judged exactly as the undo judges it: `null` and the empty string spell
+the same unlabeled state, so swapping them is not a change, while a
+real class literally named `unlabeled` is an ordinary label; every
+other label compares as the exact original string, with case, leading
+or trailing whitespace, Chinese text and path separators all
+significant. The decision uses only the labels stored in the history
+record — never the sample's current label and never the labels in this
+submission — so a record that recorded `cat` → `dog` but is flagged
+unchanged is corruption even if the sample has since been changed back
+to `cat`. The command exits non-zero with nothing on standard output
+and no traceback, and the error names the submitted batch number, the
+sample's full SHA-256 digest, the record's 1-based position inside that
+batch and the exact contradiction (a false flag with differing labels,
+or a true flag with identical labels). Every record is examined,
+including records that recorded no real change and records behind
+otherwise valid ones, so a consistent record at the front never masks a
+contradiction later, and the damage is reported even when the repeat
+content would otherwise conflict or the batch has already been undone.
+On refusal nothing changes — sample labels, their revisions, the
+history records and undo markers stay as they were, no flag is
+rewritten and no new result is appended. Only the batch named by the
+submission is inspected: the same contradiction in a *different* batch
+neither blocks a new batch number nor reuse of another batch's intact
+history.
+
 `history` lists successful batches in submission order: the samples
 involved, their before/after labels, and the number of samples actually
 changed. Failed batches never enter history.

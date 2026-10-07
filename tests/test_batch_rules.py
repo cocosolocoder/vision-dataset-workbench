@@ -417,6 +417,188 @@ class ReSubmissionDuplicateRecordTest(unittest.TestCase):
         self.assertEqual(result["changed"], 2)
 
 
+class ReSubmissionChangeFlagTest(unittest.TestCase):
+    """Re-submitting a number whose saved flags contradict old/new labels."""
+
+    def entry(self, records: list[dict], *, undone: bool = False) -> dict:
+        return {
+            "batch": "b1",
+            "records": records,
+            "changed_count": sum(1 for r in records if r.get("changed")),
+            "undone": undone,
+            "undone_at": None,
+        }
+
+    def _assert_corruption(self, error: Exception, digest: str, position: int,
+                           problem: str) -> None:
+        message = str(error)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(digest, message)
+        self.assertIn(f"record #{position}", message)
+        self.assertIn(problem, message)
+        self.assertNotIn("different content", message)
+
+    def test_hidden_change_refused_instead_of_replaying(self) -> None:
+        # cat -> dog saved with changed=false would replay as
+        # already-applied while miscounting the sample as untouched.
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "new": "dog",
+              "changed": False, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "'changed' is false")
+
+    def test_false_change_on_identical_labels_is_refused(self) -> None:
+        # changed=true on identical labels would inflate the replayed
+        # changed count.
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "new": "cat",
+              "changed": True, "rev": 0}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "cat")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "'changed' is true")
+
+    def test_judged_from_history_labels_not_the_current_label(self) -> None:
+        # The sample may since have been changed back to "cat"; the saved
+        # cat -> dog row flagged unchanged is still corruption.
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "new": "dog",
+              "changed": False, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self.assertIn("'cat'", str(ctx.exception))
+        self.assertIn("'dog'", str(ctx.exception))
+
+    def test_null_and_empty_swap_flagged_changed_is_refused(self) -> None:
+        # null/"" spell the same unlabeled state, so changed=true is a
+        # false change even though the saved spellings differ.
+        entry = self.entry(
+            [{"sha256": "d1", "old": None, "new": "",
+              "changed": True, "rev": 0}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "", None)], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "identical")
+
+    def test_literal_unlabeled_change_flagged_unchanged_is_refused(self) -> None:
+        # A real class named "unlabeled" is an ordinary label: moving to
+        # it from null is a real change and must be flagged as one.
+        entry = self.entry(
+            [{"sha256": "d1", "old": None, "new": "unlabeled",
+              "changed": False, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1", [record("d1", None, "unlabeled")], entry
+            )
+        self._assert_corruption(ctx.exception, "d1", 1, "'changed' is false")
+
+    def test_exact_string_differences_flagged_unchanged_are_refused(self) -> None:
+        # Case, surrounding whitespace and separators stay significant.
+        for old, new in (("cat", "Cat"), ("cat", "cat "), ("a/b", "a\\b"),
+                         ("猫", "狗")):
+            with self.subTest(old=old, new=new):
+                entry = self.entry(
+                    [{"sha256": "d1", "old": old, "new": new,
+                      "changed": False, "rev": 1}]
+                )
+                with self.assertRaises(BatchError) as ctx:
+                    resolve_re_submission(
+                        "b1", [record("d1", old, new)], entry
+                    )
+                self.assertIn("'changed' is false", str(ctx.exception))
+
+    def test_damage_on_an_unchanged_record_is_refused_too(self) -> None:
+        # A row that recorded no real change still must not carry a flag
+        # contradicting its own labels.
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "dog", "new": "dog",
+                 "changed": True, "rev": 0},
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [record("d1", "cat", "dog"), record("d2", "dog", "dog")],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d2", 2, "'changed' is true")
+
+    def test_a_consistent_record_at_the_front_never_masks_a_later_one(
+        self,
+    ) -> None:
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": "cat", "new": "dog",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "dog", "new": "puppy",
+                 "changed": True, "rev": 1},
+                {"sha256": "d3", "old": "fish", "new": "guppy",
+                 "changed": False, "rev": 1},
+            ]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission(
+                "b1",
+                [
+                    record("d1", "cat", "dog"),
+                    record("d2", "dog", "puppy"),
+                    record("d3", "fish", "guppy"),
+                ],
+                entry,
+            )
+        self._assert_corruption(ctx.exception, "d3", 3, "'changed' is false")
+
+    def test_damage_is_reported_even_when_content_would_conflict(self) -> None:
+        # Different content would ordinarily be a number conflict; the
+        # flag contradiction must be reported first.
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "new": "dog",
+              "changed": False, "rev": 1}]
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "fish")], entry)
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("d1", message)
+        self.assertNotIn("different content", message)
+
+    def test_damage_is_reported_even_when_the_batch_was_undone(self) -> None:
+        entry = self.entry(
+            [{"sha256": "d1", "old": "cat", "new": "dog",
+              "changed": False, "rev": 1}],
+            undone=True,
+        )
+        with self.assertRaises(BatchError) as ctx:
+            resolve_re_submission("b1", [record("d1", "cat", "dog")], entry)
+        self._assert_corruption(ctx.exception, "d1", 1, "'changed' is false")
+
+    def test_consistent_flags_still_replay(self) -> None:
+        entry = self.entry(
+            [
+                {"sha256": "d1", "old": None, "new": "cat",
+                 "changed": True, "rev": 1},
+                {"sha256": "d2", "old": "", "new": None,
+                 "changed": False, "rev": 0},
+            ]
+        )
+        result = resolve_re_submission(
+            "b1",
+            [record("d2", None, ""), record("d1", "", "cat")],
+            entry,
+        )
+        self.assertEqual(result["status"], "already-applied")
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(result["unchanged"], 1)
+
+
 class RequireUniqueHistoryNumberTest(unittest.TestCase):
     """The full-history number-uniqueness refusal shared by submit/undo."""
 

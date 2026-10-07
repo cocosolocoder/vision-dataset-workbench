@@ -1881,6 +1881,236 @@ class BatchResubmitMissingLabelsTest(StoreHarness):
         self.assertEqual(self.store.lookup_label(d)["label"], "dog")
 
 
+class BatchResubmitChangeFlagTest(StoreHarness):
+    """Re-submitting a used number whose saved flags belie old/new labels."""
+
+    def _history_on_disk(self) -> dict:
+        return json.loads(self.store.batches_path.read_text(encoding="utf-8"))
+
+    def _write_history(self, history: dict) -> None:
+        self.store.batches_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _set_record_flag(self, number: str, index: int, changed: bool) -> None:
+        """Rewrite one target-batch record's changed flag (history damage)."""
+        history = self._history_on_disk()
+        entry = next(e for e in history["batches"] if e["batch"] == number)
+        entry["records"][index]["changed"] = changed
+        self._write_history(history)
+
+    def _assert_refused(self, *changes: tuple, number: str = "b1") -> str:
+        manifest_before = self.store.manifest_path.read_bytes()
+        history_before = self.store.batches_path.read_bytes()
+        batch_count = len(self._history_on_disk()["batches"])
+        with self.assertRaises(BatchError) as ctx:
+            self.submit(number, *changes)
+        # Nothing is rewritten and no new result is appended.
+        self.assertEqual(self.store.manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(self.store.batches_path.read_bytes(), history_before)
+        self.assertEqual(
+            len(self._history_on_disk()["batches"]), batch_count
+        )
+        return str(ctx.exception)
+
+    def test_hidden_change_refuses_same_content_resubmission(self) -> None:
+        # cat -> dog saved with changed=false would replay already-applied
+        # and count the sample as untouched.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_record_flag("b1", 0, False)
+
+        message = self._assert_refused((d, "cat", "dog"))
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'b1'", message)
+        self.assertIn(d, message)
+        self.assertIn("record #1", message)
+        self.assertIn("'changed' is false", message)
+        # No replay, no re-application: the label keeps its post-batch value.
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_false_change_on_identical_labels_is_refused(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+        self._set_record_flag("b1", 1, True)
+
+        message = self._assert_refused(
+            (d1, "cat", "kitten"), (d2, "dog", "dog")
+        )
+        self.assertIn(d2, message)
+        self.assertIn("record #2", message)
+        self.assertIn("'changed' is true", message)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "dog")
+
+    def test_judged_from_history_labels_not_the_current_label(self) -> None:
+        # The sample is back at "cat"; the saved cat -> dog row flagged
+        # unchanged is still corruption.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.submit("b2", (d, "dog", "cat"))
+        self._set_record_flag("b1", 0, False)
+
+        message = self._assert_refused((d, "cat", "dog"))
+        self.assertIn("'changed' is false", message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+
+    def test_null_and_empty_swap_flagged_changed_is_refused(self) -> None:
+        # null/"" spell the same unlabeled state; flagging the swap as a
+        # change is a false change.
+        d1 = self.add_sample(None)
+        d2 = self.add_sample("cat")
+        self.submit("b1", (d1, None, "cat"), (d2, "cat", None))
+        history = self._history_on_disk()
+        records = history["batches"][0]["records"]
+        records[1]["old"] = ""       # same state, other spelling
+        records[1]["changed"] = True
+        self._write_history(history)
+
+        message = self._assert_refused((d1, None, "cat"), (d2, "", None))
+        self.assertIn(d2, message)
+        self.assertIn("record #2", message)
+        self.assertIn("identical", message)
+
+    def test_literal_unlabeled_change_flagged_unchanged_is_refused(self) -> None:
+        # Moving to a real class named "unlabeled" is a real change.
+        d = self.add_sample(None)
+        self.submit("b1", (d, None, "unlabeled"))
+        self._set_record_flag("b1", 0, False)
+
+        message = self._assert_refused((d, None, "unlabeled"))
+        self.assertIn("'changed' is false", message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "unlabeled")
+
+    def test_consistent_records_in_front_never_mask_a_later_one(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        d3 = self.add_sample("fish")
+        self.submit(
+            "b1",
+            (d1, "cat", "kitten"),
+            (d2, "dog", "puppy"),
+            (d3, "fish", "guppy"),
+        )
+        self._set_record_flag("b1", 2, False)
+
+        message = self._assert_refused(
+            (d1, "cat", "kitten"),
+            (d2, "dog", "puppy"),
+            (d3, "fish", "guppy"),
+        )
+        self.assertIn(d3, message)
+        self.assertIn("record #3", message)
+        for digest, label in ((d1, "kitten"), (d2, "puppy"), (d3, "guppy")):
+            self.assertEqual(self.store.lookup_label(digest)["label"], label)
+
+    def test_corruption_precedes_a_number_conflict(self) -> None:
+        # The repeat carries genuinely different content, which would
+        # normally be a number conflict; history damage wins.
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_record_flag("b1", 0, False)
+
+        message = self._assert_refused((d, "cat", "fish"))
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn(d, message)
+        self.assertNotIn("different content", message)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+    def test_corruption_reported_even_when_batch_was_undone(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self.assertEqual(self.store.undo_batch("b1")["status"], "undone")
+        self._set_record_flag("b1", 0, False)
+
+        message = self._assert_refused((d, "cat", "dog"))
+        self.assertIn("Batch history is corrupted", message)
+        self.assertNotIn("already-applied", message)
+        self.assertTrue(self._history_on_disk()["batches"][0]["undone"])
+        self.assertEqual(self.store.lookup_label(d)["label"], "cat")
+
+    def test_unknown_sample_rejection_precedes_flag_damage(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_record_flag("b1", 0, False)
+
+        # Stage 1 (unknown samples) runs before stage 2 (history damage).
+        with self.assertRaises(BatchError) as ctx:
+            self.store.submit_batch(
+                {
+                    "batch": "b1",
+                    "changes": [
+                        {"sha256": "a" * 64, "old": "cat", "new": "dog"}
+                    ],
+                }
+            )
+        self.assertIn("sample not found", str(ctx.exception))
+        self.assertNotIn("corrupted", str(ctx.exception))
+
+    def test_damage_in_another_batch_leaves_reuse_and_new_numbers_free(
+        self,
+    ) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"))
+        self.submit("b2", (d2, "dog", "puppy"))
+        self._set_record_flag("b2", 0, False)
+
+        # The intact batch can be replayed by number ...
+        replay = self.submit("b1", (d1, "cat", "kitten"))
+        self.assertEqual(replay["status"], "already-applied")
+        # ... and a fresh number applies normally; b2 is never inspected.
+        self.submit("b3", (d1, "kitten", "cat"))
+        self.assertEqual(self.store.lookup_label(d1)["label"], "cat")
+        self.assertEqual(self.store.lookup_label(d2)["label"], "puppy")
+
+    def test_intact_history_still_replays_original_stats(self) -> None:
+        d1 = self.add_sample("cat")
+        d2 = self.add_sample("dog")
+        self.submit("b1", (d1, "cat", "kitten"), (d2, "dog", "dog"))
+
+        replay = self.submit("b1", (d2, "dog", "dog"), (d1, "cat", "kitten"))
+        self.assertEqual(replay["status"], "already-applied")
+        self.assertEqual(replay["changed"], 1)
+        self.assertEqual(replay["unchanged"], 1)
+        self.assertEqual(self.store.lookup_label(d1)["label"], "kitten")
+
+    def test_cli_flag_corruption_resubmission_fails_cleanly(self) -> None:
+        d = self.add_sample("cat")
+        self.submit("b1", (d, "cat", "dog"))
+        self._set_record_flag("b1", 0, False)
+
+        batch_path = self.root.parent / "repeat.json"
+        batch_path.write_text(
+            json.dumps(
+                {
+                    "batch": "b1",
+                    "changes": [{"sha256": d, "old": "cat", "new": "dog"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        rejected = subprocess.run(
+            [sys.executable, "-m", "vision_workbench", "batch",
+             str(self.root), str(batch_path)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("Batch history is corrupted", rejected.stderr)
+        self.assertIn("b1", rejected.stderr)
+        self.assertIn(d, rejected.stderr)
+        self.assertIn("record #1", rejected.stderr)
+        self.assertIn("'changed' is false", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(self.store.lookup_label(d)["label"], "dog")
+
+
 class BatchResubmitDuplicateRecordsTest(StoreHarness):
     """Re-submitting a used number whose saved history repeats a sample."""
 
