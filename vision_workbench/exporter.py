@@ -199,13 +199,14 @@ def export_split(
         )
 
     exported = [member for member in members if member["label"] != ""]
-    skipped_counts = {set_name: 0 for set_name in SET_NAMES}
-    for member in unlabeled:
-        skipped_counts[member["set"]] += 1
+    # One pass over the plan members produces every per-set count the
+    # export reports; the manifest's set summaries and the result
+    # payload below both derive from it, so the three surfaces always
+    # describe the same samples.
+    statistics = _set_statistics(members)
 
     classes = _build_classes(exported)
-    manifest = _build_manifest(plan, classes, exported, skipped_counts)
-    distributions = _distributions(exported)
+    manifest = _build_manifest(plan, classes, exported, statistics)
 
     resolver = None
     if source_dir is not None:
@@ -263,12 +264,14 @@ def export_split(
     return {
         "plan": plan["name"],
         "exported": len(exported),
-        "skipped": skipped_counts,
+        "skipped": {
+            set_name: statistics[set_name]["skipped"] for set_name in SET_NAMES
+        },
         "sets": {
             set_name: {
-                "samples": distributions[set_name]["samples"],
+                "samples": statistics[set_name]["samples"],
                 "distribution": dict(
-                    sorted(distributions[set_name]["distribution"].items())
+                    sorted(statistics[set_name]["distribution"].items())
                 ),
             }
             for set_name in SET_NAMES
@@ -332,15 +335,17 @@ def _build_manifest(
     plan: dict[str, Any],
     classes: dict[str, str],
     members: list[dict[str, Any]],
-    skipped_counts: dict[str, int],
+    statistics: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    set_summaries = {}
-    for set_name in SET_NAMES:
-        set_members = [member for member in members if member["set"] == set_name]
-        set_summaries[set_name] = {
-            "samples": len(set_members),
-            "skipped": skipped_counts[set_name],
+    # The per-set summaries reuse the export's single statistics pass,
+    # so the manifest agrees with the result payload by construction.
+    set_summaries = {
+        set_name: {
+            "samples": statistics[set_name]["samples"],
+            "skipped": statistics[set_name]["skipped"],
         }
+        for set_name in SET_NAMES
+    }
 
     sample_entries = []
     for member in sorted(members, key=lambda item: item["sha256"]):
@@ -374,15 +379,30 @@ def _sample_path(member: dict[str, Any], class_directory: str) -> str:
     return f"{member['set']}/{class_directory}/{member['sha256']}{extension}"
 
 
-def _distributions(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for set_name in SET_NAMES:
-        set_members = [member for member in members if member["set"] == set_name]
-        result[set_name] = {
-            "samples": len(set_members),
-            "distribution": Counter(member["label"] for member in set_members),
-        }
-    return result
+def _set_statistics(members: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Count one export's plan members per set, in a single pass.
+
+    For each set this records how many members are actually exported
+    (``samples``), how many unlabeled members are omitted from the
+    package (``skipped``) and the label histogram of the exported
+    members only (``distribution``).  An unlabeled member is charged to
+    the set the plan assigned it to and contributes to nothing else.
+    Every per-set number the export reports — the result payload and
+    the manifest's set summaries alike — derives from this one
+    computation, so the surfaces cannot drift apart.
+    """
+    statistics: dict[str, dict[str, Any]] = {
+        set_name: {"samples": 0, "skipped": 0, "distribution": Counter()}
+        for set_name in SET_NAMES
+    }
+    for member in members:
+        set_stats = statistics[member["set"]]
+        if member["label"] == "":
+            set_stats["skipped"] += 1
+        else:
+            set_stats["samples"] += 1
+            set_stats["distribution"][member["label"]] += 1
+    return statistics
 
 
 # A resolver maps a full SHA-256 digest to the absolute path of the
