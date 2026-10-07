@@ -13,13 +13,11 @@ resolved to one copy.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
-MANIFEST_SCHEMA_VERSION = 1
+from .identity import is_hex_identity
 
-# A full SHA-256 digest: exactly 64 lowercase hexadecimal characters.
-_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+MANIFEST_SCHEMA_VERSION = 1
 
 
 class ManifestError(ValueError):
@@ -79,7 +77,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
                 f"Dataset manifest is corrupted: {location} is missing its "
                 "string 'sha256' field"
             )
-        if not _DIGEST_RE.fullmatch(digest):
+        if not is_hex_identity(digest):
             raise ManifestError(
                 f"Dataset manifest is corrupted: {location} has an invalid "
                 f"'sha256' field {digest!r}: expected 64 lowercase hexadecimal "
