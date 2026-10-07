@@ -15,6 +15,7 @@ from vision_workbench.batches import (
     apply_resolutions,
     build_history_entry,
     describe_history_change_problem,
+    describe_history_digest_problem,
     describe_history_revision_problem,
     describe_missing_history_labels,
     history_labels_equal,
@@ -23,6 +24,7 @@ from vision_workbench.batches import (
     reject_unknown_samples,
     replay_result,
     require_intact_history_changes,
+    require_intact_history_digests,
     require_intact_history_labels,
     require_intact_history_records,
     require_intact_history_revisions,
@@ -636,6 +638,139 @@ class ResultAssemblyTest(unittest.TestCase):
             {"batch": "b1", "status": "already-applied",
              "changed": 1, "unchanged": 1, "total": 2},
         )
+
+
+class HistoryDigestFormatValidationTest(unittest.TestCase):
+    GOOD = "a" * 64
+
+    def entry(self, records: list[dict], *, number: str = "b1") -> dict:
+        return {"batch": number, "records": records}
+
+    def row(self, digest: object = GOOD, *, changed: bool = True) -> dict:
+        return {
+            "sha256": digest,
+            "old": "cat",
+            "new": "dog" if changed else "cat",
+            "changed": changed,
+            "rev": 1 if changed else 0,
+        }
+
+    def test_well_formed_digest_has_no_problem(self) -> None:
+        import hashlib
+
+        digest = hashlib.sha256(b"x").hexdigest()
+        self.assertEqual(len(digest), 64)
+        self.assertIsNone(describe_history_digest_problem(digest))
+        self.assertIsNone(describe_history_digest_problem(self.GOOD))
+
+    def test_each_bad_shape_has_a_concrete_reason(self) -> None:
+        cases = [
+            ("", "empty"),
+            (self.GOOD[:-1], "63"),                       # truncated
+            (self.GOOD + "a", "65"),                      # padded
+            (self.GOOD.upper(), "lowercase"),             # uppercase
+            (self.GOOD[:-1] + "g", "lowercase"),          # non-hex letter
+            (self.GOOD[:-1] + "G", "lowercase"),          # uppercase non-hex
+            (" " + self.GOOD, "whitespace"),              # leading space
+            (self.GOOD + " ", "whitespace"),              # trailing space
+            (self.GOOD[:8] + "\t" + self.GOOD[9:],
+             "whitespace"),                                # embedded tab
+            (self.GOOD[:8] + " " + self.GOOD[9:],
+             "whitespace"),                                # embedded space
+        ]
+        for value, fragment in cases:
+            with self.subTest(value=repr(value)):
+                problem = describe_history_digest_problem(value)
+                self.assertIsNotNone(problem)
+                self.assertIn("lowercase hexadecimal", problem)
+                if fragment != "lowercase":
+                    self.assertIn(fragment, problem)
+
+    def test_non_string_values_are_rejected_too(self) -> None:
+        for value in (None, 123, True, [], {}):
+            with self.subTest(value=value):
+                problem = describe_history_digest_problem(value)
+                self.assertIsNotNone(problem)
+                self.assertIn("not a string", problem)
+
+    def test_require_passes_for_well_formed_records(self) -> None:
+        require_intact_history_digests(
+            self.entry([self.row(), self.row("b" * 64, changed=False)])
+        )
+
+    def test_require_empty_record_list_passes(self) -> None:
+        require_intact_history_digests(self.entry([]))
+
+    def test_require_names_batch_position_raw_value_and_reason(self) -> None:
+        bad = self.GOOD[:-1]  # 63 characters
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(
+                self.entry(
+                    [self.row("b" * 64), self.row(bad)],
+                    number="renumber-5",
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("Batch history is corrupted", message)
+        self.assertIn("'renumber-5'", message)
+        self.assertIn("record #2", message)
+        self.assertIn(repr(bad), message)
+        self.assertIn("63 characters instead of 64", message)
+
+    def test_unchanged_record_is_checked_too(self) -> None:
+        # A no-op row ("the batch did not change this label") must carry a
+        # well-formed identity just like a restorable row.
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(
+                self.entry([self.row(self.GOOD.upper(), changed=False)])
+            )
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("lowercase hexadecimal", message)
+
+    def test_front_rows_never_mask_a_later_bad_digest(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(
+                self.entry(
+                    [
+                        self.row("a" * 64),
+                        self.row("b" * 64),
+                        self.row("c" * 64 + " "),
+                    ]
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("record #3", message)
+        self.assertIn("whitespace", message)
+
+    def test_empty_value_is_named_as_empty(self) -> None:
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(self.entry([self.row("")]))
+        message = str(ctx.exception)
+        self.assertIn("record #1", message)
+        self.assertIn("''", message)
+        self.assertIn("empty", message)
+
+    def test_uppercase_spelling_is_refused_even_when_lowercase_would_match(
+        self,
+    ) -> None:
+        # The check judges the saved spelling alone: it must not lowercase
+        # the value or look anything up before deciding.
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(
+                self.entry([self.row(self.GOOD.upper())])
+            )
+        message = str(ctx.exception)
+        self.assertIn(self.GOOD.upper(), message)
+        self.assertIn("lowercase hexadecimal", message)
+
+    def test_missing_digest_field_is_rejected_without_attribute_error(self) -> None:
+        row = self.row()
+        del row["sha256"]
+        with self.assertRaises(BatchError) as ctx:
+            require_intact_history_digests(self.entry([row]))
+        self.assertIn("record #1", str(ctx.exception))
+        self.assertIn("not a string", str(ctx.exception))
 
 
 class HistoryRevisionValidationTest(unittest.TestCase):

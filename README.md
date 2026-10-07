@@ -560,6 +560,33 @@ requested number is judged: a duplicate of some *other* number never blocks
 a unique, otherwise valid target from undoing normally, and a number absent
 from the list still returns the ordinary unknown-batch error.
 
+Every record of the uniquely resolved target batch must name its sample in
+the exact identity spelling registration uses: a `sha256` of **exactly 64
+lowercase hexadecimal characters**. An empty string, any other length, an
+uppercase letter, a non-hexadecimal character, or whitespace before, after
+or inside the value makes the batch history corrupted. Such a value is
+never repaired — not by trimming the whitespace, folding it to lowercase,
+truncating or padding it to 64 characters — and the original identity is
+never inferred from the current sample list: even when the rewritten value
+would name a registered sample, the record as saved is refused. The whole
+record list is examined, including records that did not change a label and
+records standing behind otherwise valid ones, and the check finishes before
+any sample is restored or an `already-undone` answer is returned, so a
+restorable record at the front can never hide a malformed one further back.
+The command exits with a non-zero status, prints nothing on standard output
+and no traceback, and reports on standard error that the **batch history**
+is corrupted — naming the requested batch number, the record's 1-based
+position inside that batch, the raw `sha256` value and exactly what is
+wrong with its format (empty, wrong length, uppercase/non-hexadecimal
+characters, or whitespace). Sample labels and their revisions, the batch
+records, the undo marker and saved split plans all stay exactly as they
+were. This judges format only, on the one target batch: the same malformed
+value in a *different* batch does not stop an intact batch from undoing
+normally, a number absent from the history still returns the ordinary
+unknown-batch error, and a record whose `sha256` is well formed but names a
+sample that has since left the registration list is still handled by the
+ordinary missing-sample rule below.
+
 Every sample record stored for a successful batch carries a `rev`: the
 sample's label revision at the moment the batch finished, which an undo
 pins against. That `rev` is mandatory on **every** history record —

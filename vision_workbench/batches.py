@@ -16,10 +16,20 @@ taken literally (including Chinese text and a class named ``unlabeled``).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 BATCH_SCHEMA_VERSION = 1
+
+# A registered sample identity is a full SHA-256 digest: exactly 64
+# lowercase hexadecimal characters — the same spelling the registration
+# manifest enforces.  Undo requires every target-batch record to pin a
+# sample in that exact spelling, so a truncated or padded digest, an
+# uppercase spelling, surrounding or embedded whitespace or any other
+# non-hex character can never be accepted by stripping, lowercasing,
+# truncating or padding.
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -355,16 +365,16 @@ def describe_history_revision_problem(value: Any, *, present: bool) -> str | Non
 # pairs; ``_corruption_prefix`` and ``_record_ref`` assemble the common
 # "Batch history is corrupted: batch ..." message parts.  The checks
 # themselves stay separate passes and keep their original order on the
-# undo path — duplicate digests, then revisions, then labels, then
-# changed flags — each reporting its first problem in record order.
-# Re-submission (``resolve_re_submission``) reuses the two checks that
-# verdict needs, in the same order: duplicate digests, then labels, both
-# running before the same-content replay / different-content conflict
-# decision.  Those are per-entry checks; the coarser
-# ``require_unique_history_number`` check — that the submitted number
-# identifies one entry at all in the full history list — is shared with
-# undo and runs on the submit path even earlier, before the entry is
-# selected (see ``find_unique_history_entry`` below).
+# undo path — digest formats, then duplicate digests, then revisions,
+# then labels, then changed flags — each reporting its first problem in
+# record order.  Re-submission (``resolve_re_submission``) reuses only
+# the two checks that verdict needs, in the same order: duplicate
+# digests, then labels, both running before the same-content replay /
+# different-content conflict decision.  Those are per-entry checks; the
+# coarser ``require_unique_history_number`` check — that the submitted
+# number identifies one entry at all in the full history list — is
+# shared with undo and runs on the submit path even earlier, before the
+# entry is selected (see ``find_unique_history_entry`` below).
 # ---------------------------------------------------------------------------
 
 
@@ -399,6 +409,86 @@ def _iter_history_records(
         if not isinstance(record, dict):
             raise BatchError(f"{prefix}: malformed record")
         yield position, record
+
+
+def describe_history_digest_problem(value: Any) -> str | None:
+    """Describe why a history record's ``sha256`` is not a registered identity.
+
+    Every sample undo pins must be named in the exact spelling used at
+    registration: a string of exactly 64 lowercase hexadecimal
+    characters.  An empty string, any other length, uppercase letters,
+    non-hex characters and surrounding or embedded whitespace are all
+    rejected with a concrete reason; the value is never normalized into
+    acceptance by stripping whitespace, folding case, truncating or
+    padding, and no identity is inferred from the current sample list.
+    Returns ``None`` when the value is well formed.
+    """
+    if not isinstance(value, str):
+        # validate_history() already rules a missing or non-string
+        # digest out; defend direct callers just the same.
+        return (
+            "it is not a string; expected a string of 64 lowercase "
+            "hexadecimal characters"
+        )
+    if not value:
+        return "it is empty; expected 64 lowercase hexadecimal characters"
+    if value != value.strip() or any(char in " \t\r\n" for char in value):
+        return (
+            "it contains surrounding or embedded whitespace; expected 64 "
+            "lowercase hexadecimal characters without spaces"
+        )
+    if len(value) != 64:
+        return (
+            f"it has {len(value)} characters instead of 64; expected 64 "
+            "lowercase hexadecimal characters"
+        )
+    if _DIGEST_RE.fullmatch(value) is None:
+        # Length is exactly 64 here, so what remains is an uppercase
+        # letter or a non-hexadecimal character.
+        return (
+            "it must contain only lowercase hexadecimal characters "
+            "(digits 0-9 and letters a-f)"
+        )
+    return None
+
+
+def require_intact_history_digests(entry: Mapping[str, Any]) -> None:
+    """Reject a batch entry whose records do not pin registered identities.
+
+    Undo restores and counts samples purely from the target batch's
+    history rows, so every row's ``sha256`` must name a sample in the
+    exact spelling registration uses: a string of exactly 64 lowercase
+    hexadecimal characters.  An empty string, a digest of any other
+    length, an uppercase spelling, a non-hexadecimal character or
+    surrounding or embedded whitespace is batch-history corruption —
+    never a value to strip, lowercase, truncate or pad into acceptance,
+    and never an identity to guess from the samples currently
+    registered: even a spelling whose normalized form would name a known
+    sample is refused as saved.  Whether the record actually changed a
+    label is irrelevant; its position in the record list is irrelevant
+    too.  The error names the batch number, the record's 1-based
+    position inside the target batch, the raw saved ``sha256`` value and
+    the exact format problem; nothing is repaired, rewritten or restored.
+
+    The whole record list is scanned in order — unchanged rows and rows
+    behind restorable ones included — so a well-formed row at the front
+    can never mask a malformed one further back, and no sample is
+    restored before the damage is found.  This judges format only, not
+    registration: a well-formed digest of a sample that has since left
+    the manifest is left to undo's ordinary missing-sample rule.
+
+    Callers must run this before any success-shaped short-circuit (such
+    as an already-undone batch), so corruption can never be masked by a
+    repeated-undo success.
+    """
+    for position, record in _iter_history_records(entry):
+        problem = describe_history_digest_problem(record.get("sha256"))
+        if problem is not None:
+            raise BatchError(
+                f"{_corruption_prefix(entry)}, "
+                f"{_record_ref(record, position)}: invalid 'sha256' value "
+                f"{record.get('sha256')!r}: {problem}"
+            )
 
 
 def require_intact_history_records(entry: Mapping[str, Any]) -> None:
