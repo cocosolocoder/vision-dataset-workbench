@@ -288,6 +288,14 @@ python3 -m vision_workbench export ./workspace baseline ./baseline.zip
   the ZIP is published, so the target ZIP is never created and no
   incomplete export file remains. Only entries that are already
   symlinks the first time the walk meets them are skipped, as before.
+  The lookup walk and the copy-phase verification both walk an explicit
+  stack of directory frames rather than Python call frames, so a moved
+  tree whose directory chain is deeper than the interpreter's recursion
+  limit is still searched and verified in full — files at the root, at
+  the end of the long chain and on side branches are all matched — as
+  long as the paths, permissions and system resources allow; the export
+  never stops at some depth, exports only the shallower files, or fails a
+  deep directory check after the images were copied.
 
   Files unrelated to the
   plan are read (an unreadable file anywhere fails the export) but never
